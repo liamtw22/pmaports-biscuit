@@ -1,0 +1,233 @@
+diff --git a/drivers/misc/mt8163-consys.c b/drivers/misc/mt8163-consys.c
+index 15990ae..7d91558 100644
+--- a/drivers/misc/mt8163-consys.c
++++ b/drivers/misc/mt8163-consys.c
+@@ -110,6 +110,7 @@ MODULE_PARM_DESC(set_emi_mpu,
+ 
+ /* The block needs a moment after the domain comes up before it will answer. */
+ #define CONSYS_SETTLE_US		10
++#define CONSYS_VCN18_SETTLE_US		150
+ #define CONSYS_ID_RETRIES		20
+ #define CONSYS_ID_INTERVAL_MS		20
+ 
+@@ -118,7 +119,16 @@ module_param(release_cpu, bool, 0444);
+ MODULE_PARM_DESC(release_cpu,
+ 		 "Release the CONSYS processor from reset after bring-up. Only useful once firmware is being loaded; leaves the processor running its boot ROM otherwise.");
+ 
+-static const char * const consys_supply_names[] = { "vcn18", "vcn28", "vcn33" };
++enum mt8163_consys_supply {
++	MT8163_CONSYS_VCN18,
++	MT8163_CONSYS_VCN28,
++	MT8163_CONSYS_VCN33_BT,
++	MT8163_CONSYS_NUM_SUPPLIES,
++};
++
++static const char * const consys_supply_names[MT8163_CONSYS_NUM_SUPPLIES] = {
++	"vcn18", "vcn28", "vcn33"
++};
+ 
+ struct mt8163_consys {
+ 	struct device *dev;
+@@ -130,7 +140,8 @@ struct mt8163_consys {
+ 	struct pinctrl_state *pins_wifi_reset;
+ 	struct mutex state_lock;
+ 	spinlock_t mpu_lock;
+-	struct regulator_bulk_data supplies[ARRAY_SIZE(consys_supply_names)];
++	struct regulator_bulk_data supplies[MT8163_CONSYS_NUM_SUPPLIES];
++	bool supply_enabled[MT8163_CONSYS_NUM_SUPPLIES];
+ 	phys_addr_t emi_base;
+ 	phys_addr_t emi_size;
+ 	u32 emi_mapping;
+@@ -140,6 +151,53 @@ struct mt8163_consys {
+ 	bool powered;
+ };
+ 
++static int mt8163_consys_enable_supply(struct mt8163_consys *priv,
++					       enum mt8163_consys_supply supply,
++					       int microvolts)
++{
++	struct regulator *reg = priv->supplies[supply].consumer;
++	int ret;
++
++	if (priv->supply_enabled[supply])
++		return 0;
++
++	ret = regulator_set_voltage(reg, microvolts, microvolts);
++	if (ret)
++		return dev_err_probe(priv->dev, ret, "failed to set %s voltage\n",
++				     priv->supplies[supply].supply);
++
++	ret = regulator_enable(reg);
++	if (ret)
++		return dev_err_probe(priv->dev, ret, "failed to enable %s\n",
++				     priv->supplies[supply].supply);
++
++	priv->supply_enabled[supply] = true;
++	return 0;
++}
++
++static void mt8163_consys_disable_supply(struct mt8163_consys *priv,
++					  enum mt8163_consys_supply supply)
++{
++	int ret;
++
++	if (!priv->supply_enabled[supply])
++		return;
++
++	ret = regulator_disable(priv->supplies[supply].consumer);
++	if (ret)
++		dev_warn(priv->dev, "failed to disable %s: %d\n",
++			 priv->supplies[supply].supply, ret);
++	else
++		priv->supply_enabled[supply] = false;
++}
++
++static void mt8163_consys_disable_all_supplies(struct mt8163_consys *priv)
++{
++	mt8163_consys_disable_supply(priv, MT8163_CONSYS_VCN33_BT);
++	mt8163_consys_disable_supply(priv, MT8163_CONSYS_VCN28);
++	mt8163_consys_disable_supply(priv, MT8163_CONSYS_VCN18);
++}
++
+ static bool consys_id_is_known(u32 id)
+ {
+ 	unsigned int i;
+@@ -284,11 +342,10 @@ static int mt8163_consys_power_up(struct mt8163_consys *priv)
+ 	u32 id = 0;
+ 	int ret;
+ 
+-	ret = regulator_bulk_enable(ARRAY_SIZE(priv->supplies), priv->supplies);
+-	if (ret) {
+-		dev_err(dev, "failed to enable supplies: %d\n", ret);
++	/* The stock order is VCN18, pins, 150 us, then VCN28. */
++	ret = mt8163_consys_enable_supply(priv, MT8163_CONSYS_VCN18, 1800000);
++	if (ret)
+ 		return ret;
+-	}
+ 
+ 	/*
+ 	 * With 1.8 V present the vendor immediately drives the four wireless
+@@ -306,6 +363,14 @@ static int mt8163_consys_power_up(struct mt8163_consys *priv)
+ 		}
+ 	}
+ 
++	udelay(CONSYS_VCN18_SETTLE_US);
++
++	ret = mt8163_consys_enable_supply(priv, MT8163_CONSYS_VCN28, 2800000);
++	if (ret)
++		goto err_supplies;
++
++	/* VCN33 is the per-function BT PALDO, enabled by the HCI client. */
++
+ 	/* Hold the connectivity processor before its power arrives. */
+ 	ret = reset_control_assert(priv->cpu_reset);
+ 	if (ret) {
+@@ -334,8 +399,8 @@ static int mt8163_consys_power_up(struct mt8163_consys *priv)
+ 	}
+ 
+ 	priv->chip_id = id;
+-	priv->powered = true;
+ 
++	/* Leave a diagnosable powered domain even for an unexpected ID. */
+ 	if (!consys_id_is_known(id)) {
+ 		/*
+ 		 * Report rather than fail. The block is powered either way, and
+@@ -348,6 +413,7 @@ static int mt8163_consys_power_up(struct mt8163_consys *priv)
+ 			 readl(priv->mcu + CONSYS_MCU_CFG_ACR),
+ 			 readl(priv->mcu + CONSYS_ROM_RAM_DELSEL),
+ 			 readl(priv->mcu + CONSYS_CPUPCR));
++		priv->powered = true;
+ 		return 0;
+ 	}
+ 
+@@ -360,7 +426,7 @@ static int mt8163_consys_power_up(struct mt8163_consys *priv)
+ 		ret = reset_control_deassert(priv->cpu_reset);
+ 		if (ret) {
+ 			dev_err(dev, "failed to release CPU reset: %d\n", ret);
+-			return ret;
++			goto err_runtime;
+ 		}
+ 		priv->cpu_released = true;
+ 		msleep(20);
+@@ -368,10 +434,14 @@ static int mt8163_consys_power_up(struct mt8163_consys *priv)
+ 			 readl(priv->mcu + CONSYS_CPUPCR));
+ 	}
+ 
++	priv->powered = true;
+ 	return 0;
+ 
++err_runtime:
++	reset_control_assert(priv->cpu_reset);
++	pm_runtime_put_sync(priv->dev);
+ err_supplies:
+-	regulator_bulk_disable(ARRAY_SIZE(priv->supplies), priv->supplies);
++	mt8163_consys_disable_all_supplies(priv);
+ 	return ret;
+ }
+ 
+@@ -383,10 +453,35 @@ static void mt8163_consys_power_down(struct mt8163_consys *priv)
+ 	reset_control_assert(priv->cpu_reset);
+ 	priv->cpu_released = false;
+ 	pm_runtime_put_sync(priv->dev);
+-	regulator_bulk_disable(ARRAY_SIZE(priv->supplies), priv->supplies);
++	mt8163_consys_disable_all_supplies(priv);
+ 	priv->powered = false;
+ }
+ 
++int mt8163_consys_bt_paldo_set(struct device *dev, bool on)
++{
++	struct mt8163_consys *priv = dev_get_drvdata(dev);
++	int ret = 0;
++
++	if (!priv)
++		return -EPROBE_DEFER;
++
++	mutex_lock(&priv->state_lock);
++	if (!priv->powered) {
++		ret = -EHOSTDOWN;
++		goto out;
++	}
++
++	if (on)
++		ret = mt8163_consys_enable_supply(priv, MT8163_CONSYS_VCN33_BT,
++						  3300000);
++	else
++		mt8163_consys_disable_supply(priv, MT8163_CONSYS_VCN33_BT);
++out:
++	mutex_unlock(&priv->state_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt8163_consys_bt_paldo_set);
++
+ int mt8163_consys_acquire(struct device *dev)
+ {
+ 	struct mt8163_consys *priv = dev_get_drvdata(dev);
+@@ -552,7 +647,7 @@ static int mt8163_consys_probe(struct platform_device *pdev)
+ 	if (IS_ERR(priv->mcu))
+ 		return PTR_ERR(priv->mcu);
+ 
+-	for (i = 0; i < ARRAY_SIZE(consys_supply_names); i++)
++	for (i = 0; i < MT8163_CONSYS_NUM_SUPPLIES; i++)
+ 		priv->supplies[i].supply = consys_supply_names[i];
+ 
+ 	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(priv->supplies),
+diff --git a/include/linux/mt8163-consys.h b/include/linux/mt8163-consys.h
+index acee13e..a7629f6 100644
+--- a/include/linux/mt8163-consys.h
++++ b/include/linux/mt8163-consys.h
+@@ -2,6 +2,8 @@
+ #ifndef _LINUX_MT8163_CONSYS_H
+ #define _LINUX_MT8163_CONSYS_H
+ 
++#include <linux/types.h>
++
+ struct device;
+ 
+ /*
+@@ -11,5 +13,6 @@ struct device;
+  */
+ int mt8163_consys_acquire(struct device *dev);
+ void mt8163_consys_release(struct device *dev);
++int mt8163_consys_bt_paldo_set(struct device *dev, bool on);
+ 
+ #endif /* _LINUX_MT8163_CONSYS_H */

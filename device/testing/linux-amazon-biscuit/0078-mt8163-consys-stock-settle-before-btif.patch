@@ -1,0 +1,21 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index d87a182..c32f39c 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -931,6 +931,16 @@ static int mt8163_stp_probe(struct platform_device *pdev)
+ 	ret = mt8163_consys_acquire(stp->consys_dev);
+ 	if (ret)
+ 		goto err_consys_dev;
++
++	/*
++	 * Stock Biscuit leaves about 77 ms between CONSYS chip-ID readiness
++	 * and its first WMT transfer.  The current path reaches that transfer
++	 * in about 28 ms, so preserve the proven power sequence and add only
++	 * the missing measured settle interval before BTIF activation.
++	 */
++	dev_info(&pdev->dev, "settling CONSYS for 50 ms before BTIF activation\n");
++	msleep(50);
++	dev_info(&pdev->dev, "CONSYS settle complete; activating BTIF\n");
+ 
+ 	ret = mt8163_stp_get_phandle_device(&pdev->dev, "mediatek,btif",
+ 					    &btif_dev);

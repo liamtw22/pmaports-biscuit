@@ -1,0 +1,277 @@
+--- a/sound/soc/codecs/tlv320adc3xxx.c
++++ b/sound/soc/codecs/tlv320adc3xxx.c
+@@ -215,6 +215,17 @@
+ #define ADC3XXX_BCLK_MASTER		0x08
+ #define ADC3XXX_WCLK_MASTER		0x04
+ 
++/*
++ * Release the data line outside our own slots, so that several converters
++ * can share it. Its channel-enable field is active-low, and is derived from
++ * the TDM receive mask below so a partially populated final converter does
++ * not keep driving an unused bus slot.
++ */
++#define ADC3XXX_DOUT_3STATE		0x01
++#define ADC3XXX_TDM_EARLY_3STATE	0x02
++#define ADC3XXX_TDM_CHANNEL_EN_SHIFT	2
++#define ADC3XXX_TDM_CHANNEL_EN_MASK	(0x3 << ADC3XXX_TDM_CHANNEL_EN_SHIFT)
++
+ /* Interface register masks */
+ #define ADC3XXX_FORMAT_MASK		0xc0
+ #define ADC3XXX_FORMAT_SHIFT		6
+@@ -336,6 +344,11 @@
+ 	int master;
+ 	u8 page_no;
+ 	int use_pll;
++	/* Bit clocks by which DSP mode delays the frame: 1 for A, 0 for B. */
++	unsigned int dsp_delay;
++	/* Frame of a shared bus, zero when this device has one to itself. */
++	unsigned int tdm_slots;
++	unsigned int tdm_slot_width;
+ 	struct gpio_chip gpio_chip;
+ };
+ 
+@@ -526,6 +539,13 @@
+ 	 */
+ 	{ 3072000, 16000, 1, 1, 10, 2400, 1, 3, 64 },
+ 	{ 6144000, 16000, 5, 1, 48, 0000, 1, 3, 128 },
++	/*
++	 * The master of a shared bus runs its PLL from the 9.6 MHz MCLK and
++	 * generates the bit clock itself, so it cannot take the entries above.
++	 * 9.6 MHz * 48 / 5 = 92.16 MHz, and 92.16 MHz / (15 * 3 * 128) is
++	 * exactly 16 kHz.
++	 */
++	{ 9600000, 16000, 5, 1, 48, 0000, 15, 3, 128 },
+ };
+ 
+ static int adc3xxx_get_divs(struct device *dev, int mclk, int rate, int pll_mode)
+@@ -697,7 +717,12 @@
+ 	3, 3, TLV_DB_SCALE_ITEM(0, 0, 1)); /* disabled = mute */
+ static const DECLARE_TLV_DB_SCALE(agc_max_tlv, 0, 50, 0);
+ /* Input attenuation: -6 dB or 0 dB */
+-static const DECLARE_TLV_DB_SCALE(input_attenuation_tlv, -600, 600, 0);
++/*
++ * The input select fields are two bits wide: 00 connects the input at 0 dB,
++ * 01 and 10 attenuate it, and 11 detaches it altogether. The controls are
++ * inverted, so 0 detaches and 3 is 0 dB.
++ */
++static const DECLARE_TLV_DB_SCALE(input_attenuation_tlv, -1200, 600, 1);
+ 
+ static const struct snd_kcontrol_new adc3xxx_snd_controls[] = {
+ 	SOC_DOUBLE_R_TLV("PGA Capture Volume", ADC3XXX_LEFT_APGA_CTRL,
+@@ -745,33 +770,33 @@
+ 	SOC_ENUM("ADC Soft Stepping", adc_softstepping_enum),
+ 	/* Left/Right Input attenuation */
+ 	SOC_SINGLE_TLV("Left Input IN_1L Capture Volume",
+-		       ADC3XXX_LEFT_PGA_SEL_1, 0, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_LEFT_PGA_SEL_1, 0, 3, 1, input_attenuation_tlv),
+ 	SOC_SINGLE_TLV("Left Input IN_2L Capture Volume",
+-		       ADC3XXX_LEFT_PGA_SEL_1, 2, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_LEFT_PGA_SEL_1, 2, 3, 1, input_attenuation_tlv),
+ 	SOC_SINGLE_TLV("Left Input IN_3L Capture Volume",
+-		       ADC3XXX_LEFT_PGA_SEL_1, 4, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_LEFT_PGA_SEL_1, 4, 3, 1, input_attenuation_tlv),
+ 	SOC_SINGLE_TLV("Left Input IN_1R Capture Volume",
+-		       ADC3XXX_LEFT_PGA_SEL_2, 0, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_LEFT_PGA_SEL_2, 0, 3, 1, input_attenuation_tlv),
+ 	SOC_SINGLE_TLV("Left Input DIF_2L_3L Capture Volume",
+-		       ADC3XXX_LEFT_PGA_SEL_1, 6, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_LEFT_PGA_SEL_1, 6, 3, 1, input_attenuation_tlv),
+ 	SOC_SINGLE_TLV("Left Input DIF_1L_1R Capture Volume",
+-		       ADC3XXX_LEFT_PGA_SEL_2, 4, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_LEFT_PGA_SEL_2, 4, 3, 1, input_attenuation_tlv),
+ 	SOC_SINGLE_TLV("Left Input DIF_2R_3R Capture Volume",
+-		       ADC3XXX_LEFT_PGA_SEL_2, 2, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_LEFT_PGA_SEL_2, 2, 3, 1, input_attenuation_tlv),
+ 	SOC_SINGLE_TLV("Right Input IN_1R Capture Volume",
+-		       ADC3XXX_RIGHT_PGA_SEL_1, 0, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_RIGHT_PGA_SEL_1, 0, 3, 1, input_attenuation_tlv),
+ 	SOC_SINGLE_TLV("Right Input IN_2R Capture Volume",
+-		       ADC3XXX_RIGHT_PGA_SEL_1, 2, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_RIGHT_PGA_SEL_1, 2, 3, 1, input_attenuation_tlv),
+ 	SOC_SINGLE_TLV("Right Input IN_3R Capture Volume",
+-		       ADC3XXX_RIGHT_PGA_SEL_1, 4, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_RIGHT_PGA_SEL_1, 4, 3, 1, input_attenuation_tlv),
+ 	SOC_SINGLE_TLV("Right Input IN_1L Capture Volume",
+-		       ADC3XXX_RIGHT_PGA_SEL_2, 0, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_RIGHT_PGA_SEL_2, 0, 3, 1, input_attenuation_tlv),
+ 	SOC_SINGLE_TLV("Right Input DIF_2R_3R Capture Volume",
+-		       ADC3XXX_RIGHT_PGA_SEL_1, 6, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_RIGHT_PGA_SEL_1, 6, 3, 1, input_attenuation_tlv),
+ 	SOC_SINGLE_TLV("Right Input DIF_1L_1R Capture Volume",
+-		       ADC3XXX_RIGHT_PGA_SEL_2, 4, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_RIGHT_PGA_SEL_2, 4, 3, 1, input_attenuation_tlv),
+ 	SOC_SINGLE_TLV("Right Input DIF_2L_3L Capture Volume",
+-		       ADC3XXX_RIGHT_PGA_SEL_2, 2, 1, 1, input_attenuation_tlv),
++		       ADC3XXX_RIGHT_PGA_SEL_2, 2, 3, 1, input_attenuation_tlv),
+ 	SOC_DOUBLE_R_S_TLV("ADC Volume Control Capture Volume", ADC3XXX_LADC_VOL,
+ 			   ADC3XXX_RADC_VOL, 0, -24, 40, 6, 0, adc_tlv),
+ 	/* Empirically, the following doesn't work the way it's supposed
+@@ -1286,8 +1311,33 @@
+ 	 * be deriving its own clocks from it.
+ 	 */
++	/*
++	 * The serial word has to occupy the whole TDM slot.  The multi-codec
++	 * capture link can present a narrower logical sample width to each
++	 * stereo codec even though the aggregate FPGA PCM is packed 24 bit.
++	 * Leaving the converters at 16 bit makes their right words start eight
++	 * clocks early: even lanes remain recognisable while odd lanes become
++	 * near-full-scale garbage.  Stock programs the 24-bit value here too.
++	 */
++	if (adc3xxx->tdm_slot_width == 24) {
++		width = 24;
++		snd_soc_component_update_bits(component,
++					      ADC3XXX_INTERFACE_CTRL_1,
++					      ADC3XXX_WLENGTH_MASK,
++					      ADC3XXX_IFACE_24BITS);
++	}
++
+ 	if (adc3xxx->master) {
+-		bdiv = (adc3xxx_divs[i].aosr * adc3xxx_divs[i].madc) /
+-			(2 * width);
++		/*
++		 * The bit clock has to carry a whole frame. On a shared bus that
++		 * is every slot, not just the pair this device contributes.
++		 */
++		unsigned int frame_bits = adc3xxx->tdm_slots *
++					  adc3xxx->tdm_slot_width;
++
++		if (!frame_bits)
++			frame_bits = 2 * width;
++
++		bdiv = (adc3xxx_divs[i].aosr * adc3xxx_divs[i].madc) / frame_bits;
+ 		snd_soc_component_update_bits(component, ADC3XXX_BCLK_N_DIV,
+ 					      ADC3XXX_BDIV_MASK, bdiv);
+ 	}
+@@ -1335,6 +1369,7 @@
+ 	struct snd_soc_dapm_context *dapm = snd_soc_component_to_dapm(component);
+ 	struct adc3xxx *adc3xxx = snd_soc_component_get_drvdata(component);
+ 	u8 clkdir = 0, format = 0;
++	unsigned int dsp_delay = 0;
+ 	int master = 0;
+ 	int ret;
+ 
+@@ -1360,9 +1395,12 @@
+ 		format = ADC3XXX_FORMAT_I2S;
+ 		break;
+ 	case SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_IB_NF:
++	case SND_SOC_DAIFMT_DSP_A | SND_SOC_DAIFMT_NB_NF:
+ 		format = ADC3XXX_FORMAT_DSP;
++		dsp_delay = 1;
+ 		break;
+ 	case SND_SOC_DAIFMT_DSP_B | SND_SOC_DAIFMT_IB_NF:
++	case SND_SOC_DAIFMT_DSP_B | SND_SOC_DAIFMT_NB_NF:
+ 		format = ADC3XXX_FORMAT_DSP;
+ 		break;
+ 	case SND_SOC_DAIFMT_RIGHT_J | SND_SOC_DAIFMT_NB_NF:
+@@ -1384,21 +1422,110 @@
+ 		snd_soc_dapm_del_routes(dapm, adc3xxx_bclk_out_intercon,
+ 					ARRAY_SIZE(adc3xxx_bclk_out_intercon));
+ 	adc3xxx->master = master;
++	adc3xxx->dsp_delay = dsp_delay;
++
++	/*
++	 * DSP mode is the one that carries more than a single converter, so
++	 * that is where the data line has to be given up between slots.
++	 */
++	if (format == ADC3XXX_FORMAT_DSP)
++		clkdir |= ADC3XXX_DOUT_3STATE;
+ 
+ 	/* set clock direction and format */
+ 	ret = snd_soc_component_update_bits(component,
+ 					    ADC3XXX_INTERFACE_CTRL_1,
+-					    ADC3XXX_CLKDIR_MASK | ADC3XXX_FORMAT_MASK,
++					    ADC3XXX_CLKDIR_MASK | ADC3XXX_FORMAT_MASK |
++					    ADC3XXX_DOUT_3STATE,
+ 					    clkdir | format);
+ 	if (ret < 0)
+ 		return ret;
+ 	return 0;
+ }
+ 
++/*
++ * Where this converter's samples sit in a shared frame, counted in bit clocks
++ * from the frame sync. tx_mask selects the slots it drives; the first of them
++ * is where its left channel starts, and the right channel follows on its own.
++ * DSP_A delays the whole frame by one bit clock, which the same register has
++ * to absorb.
++ */
++static int adc3xxx_set_dai_tdm_slot(struct snd_soc_dai *dai,
++				    unsigned int tx_mask, unsigned int rx_mask,
++				    int slots, int slot_width)
++{
++	struct snd_soc_component *component = dai->component;
++	struct adc3xxx *adc3xxx = snd_soc_component_get_drvdata(component);
++	unsigned int offset, slot, disabled_channels;
++	u8 iface_len;
++	int ret;
++
++	if (!tx_mask || slots <= 0 || slot_width <= 0)
++		return -EINVAL;
++
++	switch (slot_width) {
++	case 16:
++		iface_len = ADC3XXX_IFACE_16BITS;
++		break;
++	case 20:
++		iface_len = ADC3XXX_IFACE_20BITS;
++		break;
++	case 24:
++		iface_len = ADC3XXX_IFACE_24BITS;
++		break;
++	case 32:
++		iface_len = ADC3XXX_IFACE_32BITS;
++		break;
++	default:
++		return -EINVAL;
++	}
++
++	slot = __ffs(tx_mask);
++	if (slot + 1 >= slots)
++		return -EINVAL;
++
++	offset = slot * slot_width + adc3xxx->dsp_delay;
++	if (offset > 255)
++		return -EINVAL;
++
++	ret = snd_soc_component_write(component, ADC3XXX_CH_OFFSET_1, offset);
++	if (ret < 0)
++		return ret;
++
++	/* Keep the serial word as wide as the physical shared-bus slot. */
++	ret = snd_soc_component_update_bits(component,
++					    ADC3XXX_INTERFACE_CTRL_1,
++					    ADC3XXX_WLENGTH_MASK, iface_len);
++	if (ret < 0)
++		return ret;
++
++	adc3xxx->tdm_slots = slots;
++	adc3xxx->tdm_slot_width = slot_width;
++
++	/*
++	 * The TLV320 field is active-low: a set bit disables the matching
++	 * converter channel.  rx_mask is expressed in frame slots, so select
++	 * the two slots owned by this converter.  This matches the vendor
++	 * driver's 0x7f seven-microphone configuration: ADCs A-C stay stereo
++	 * and ADC D receives 0x0a (only its populated slot is driven).
++	 */
++	disabled_channels = ~(rx_mask >> slot) & 0x3;
++
++	ret = snd_soc_component_update_bits(component, ADC3XXX_I2S_TDM_CTRL,
++					    ADC3XXX_TDM_EARLY_3STATE |
++					    ADC3XXX_TDM_CHANNEL_EN_MASK,
++					    ADC3XXX_TDM_EARLY_3STATE |
++					    (disabled_channels <<
++					     ADC3XXX_TDM_CHANNEL_EN_SHIFT));
++
++	/* update_bits returns one when it changed the register, not an error. */
++	return ret < 0 ? ret : 0;
++}
++
+ static const struct snd_soc_dai_ops adc3xxx_dai_ops = {
+ 	.hw_params	= adc3xxx_hw_params,
+ 	.set_sysclk	= adc3xxx_set_dai_sysclk,
+ 	.set_fmt	= adc3xxx_set_dai_fmt,
++	.set_tdm_slot	= adc3xxx_set_dai_tdm_slot,
+ };
+ 
+ static struct snd_soc_dai_driver adc3xxx_dai = {

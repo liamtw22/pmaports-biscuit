@@ -1,0 +1,366 @@
+{
+  "_comment": [
+    "The optional apps, for the setup portal and the settings page's Apps page.",
+    "Installed to /usr/share/biscuit/apps.json. One file for both, so the two",
+    "cannot describe the same app differently. Sizes are installed sizes with",
+    "dependencies, measured with `apk del --simulate` on r287; the Apps page",
+    "measures them live, this is for the setup portal, which is offline.",
+    "`changes` lists every file in this repository that alters the upstream",
+    "code, so the Apps page can link each one.",
+    "`functions` says which services make up each thing the device does, for the Processes page; what those services need, which processes they run and which packages own them are all read from the device."
+  ],
+  "source": {
+    "repo": "https://github.com/liamtw22/pmaports-biscuit",
+    "path": "device/testing/device-amazon-biscuit",
+    "tag_prefix": "r"
+  },
+  "core": {
+    "label": "Device software",
+    "package": "device-amazon-biscuit",
+    "summary": "Everything that makes this Echo work: Wi-Fi and its setup hotspot, Bluetooth speaker, casting and calls, the speaker and microphones, the light ring and buttons, timekeeping, and this settings page.",
+    "license": "MIT",
+    "firmware": "Wi-Fi, Bluetooth and microphone firmware is this Echo's own, taken from its backup when postmarketOS was installed. None is downloaded.",
+    "name": "device-amazon-biscuit"
+  },
+  "apps": [
+    {
+      "id": "voice",
+      "label": "Voice assistant",
+      "summary": "Wake word and voice control through Home Assistant.",
+      "description": "Listens for the wake word on this device and passes your request to Home Assistant's Assist. Nothing leaves the device until the wake word is heard.",
+      "packages": [
+        "device-amazon-biscuit-voice"
+      ],
+      "size_mb": 120,
+      "services": [
+        "biscuit-voice-assistant",
+        "biscuit-va-leds"
+      ],
+      "venv": "/usr/lib/linux-voice-assistant",
+      "ports": [
+        {
+          "port": 6053,
+          "what": "Home Assistant connects here (ESPHome API)"
+        }
+      ],
+      "connects_to": [
+        "Home Assistant, which connects in and sends back spoken replies"
+      ],
+      "data": [
+        "/opt/persist/voice-assistant-prefs.json"
+      ],
+      "upstream": [
+        {
+          "name": "Linux Voice Assistant",
+          "url": "https://github.com/OHF-Voice/linux-voice-assistant",
+          "version": "commit b0c53c4",
+          "license": "Apache-2.0"
+        },
+        {
+          "name": "microWakeWord (pymicro-wakeword)",
+          "url": "https://github.com/OHF-Voice/pymicro-wakeword",
+          "version": "2.4.1",
+          "license": "Apache-2.0"
+        },
+        {
+          "name": "TensorFlow Lite",
+          "url": "https://github.com/tensorflow/tensorflow",
+          "version": "2.17, built for aarch64 musl",
+          "license": "Apache-2.0"
+        }
+      ],
+      "changes": [
+        {
+          "file": "biscuit-lva-processed-mic-profile.patch.txt",
+          "why": "Uses the device's own microphone processing instead of adding LVA's on top"
+        },
+        {
+          "file": "biscuit-lva-wake-agc-direct-input.patch.txt",
+          "why": "Level control for the wake word only"
+        },
+        {
+          "file": "biscuit-lva-entity-master-volume.patch.txt",
+          "why": "One master volume: the device's, with the players left at full"
+        },
+        {
+          "file": "biscuit-lva-quiet-broadcast-warning.patch.txt",
+          "why": "Quietens a warning that fills the log"
+        },
+        {
+          "file": "lva-src/peripheral_api.py",
+          "why": "Light ring, buttons and settings for Home Assistant"
+        },
+        {
+          "file": "lva-src/peripheral_transport.py",
+          "why": "Keeps that interface on a root-only local socket"
+        },
+        {
+          "file": "lva-src/__main__.py",
+          "why": "Our options, and no network-facing control port"
+        },
+        {
+          "file": "lva-src/satellite.py",
+          "why": "Barge-in, ducking and timers on this hardware"
+        },
+        {
+          "file": "lva-src/entity.py",
+          "why": "Home Assistant entities for the device"
+        },
+        {
+          "file": "lva-src/qualification_v1.py",
+          "why": "Voice quality measurements"
+        },
+        {
+          "file": "lva-src/mpv_player.py",
+          "why": "Plays to the device's speaker, with its volume curve"
+        },
+        {
+          "file": "lva-src/libmpv.py",
+          "why": "The same, for spoken replies"
+        }
+      ],
+      "lockfile": "/usr/share/doc/device-amazon-biscuit/voice-bundle/requirements.lock",
+      "name": "linux-voice-assistant"
+    },
+    {
+      "id": "sendspin",
+      "label": "Music speaker",
+      "summary": "Play to this device from Music Assistant, alone or grouped with other speakers.",
+      "description": "Joins Music Assistant as a Sendspin speaker. Music Assistant finds it on the network, and it plays in step with other Sendspin speakers.",
+      "packages": [
+        "device-amazon-biscuit-sendspin"
+      ],
+      "size_mb": 65,
+      "services": [
+        "biscuit-sendspin",
+        "biscuit-sendspin-watchdog"
+      ],
+      "venv": "/usr/lib/sendspin",
+      "ports": [],
+      "connects_to": [
+        "Music Assistant, found on the network"
+      ],
+      "data": [
+        "/opt/persist/sendspin"
+      ],
+      "upstream": [
+        {
+          "name": "sendspin-cli",
+          "url": "https://github.com/Sendspin/sendspin-cli",
+          "version": "commit 22b9ff3",
+          "license": "Apache-2.0"
+        },
+        {
+          "name": "aiosendspin",
+          "url": "https://pypi.org/project/aiosendspin/",
+          "version": "6.0.5",
+          "license": "Apache-2.0"
+        }
+      ],
+      "changes": [
+        {
+          "file": "biscuit_sendspin_viz.py",
+          "why": "Drives the light ring from the music"
+        },
+        {
+          "file": "sendspin-visualizer-roles.diff",
+          "why": "Asks Music Assistant for the spectrum and track colours"
+        },
+        {
+          "file": "sendspin-media-commands.diff",
+          "why": "Accepts the seek commands Music Assistant sends; without it every status message was rejected"
+        },
+        {
+          "file": "sendspin-client-visualizer.diff",
+          "why": "Starts the visualiser when the speaker connects out to Music Assistant"
+        }
+      ],
+      "name": "sendspin"
+    }
+  ],
+  "functions": [
+    {
+      "id": "voice",
+      "label": "Voice assistant",
+      "app": "voice",
+      "route": "mic",
+      "summary": "Hears the wake word and talks to Home Assistant.",
+      "services": [
+        "biscuit-voice-assistant",
+        "biscuit-va-leds",
+        "biscuit-mic-hub"
+      ]
+    },
+    {
+      "id": "music",
+      "label": "Music Assistant speaker",
+      "app": "sendspin",
+      "route": "sound",
+      "summary": "Plays what Music Assistant sends it.",
+      "services": [
+        "biscuit-sendspin",
+        "biscuit-sendspin-watchdog"
+      ]
+    },
+    {
+      "id": "speaker",
+      "label": "Speaker",
+      "route": "sound",
+      "summary": "Everything that plays: the speaker's correction, volume and the shared audio system.",
+      "services": [
+        "biscuit-dsp",
+        "biscuit-pipewire",
+        "biscuit-audio",
+        "biscuit-audio-clock"
+      ]
+    },
+    {
+      "id": "mic",
+      "label": "Microphones",
+      "route": "mic",
+      "summary": "The seven microphones, their calibration and processing, and the mute button.",
+      "services": [
+        "biscuit-mic-hub",
+        "biscuit-mic-coeff",
+        "biscuit-audio"
+      ]
+    },
+    {
+      "id": "bt-speaker",
+      "label": "Bluetooth speaker",
+      "route": "bluetooth",
+      "summary": "Phones and computers play to this Echo.",
+      "services": [
+        "bluetooth",
+        "bluealsa",
+        "biscuit-btaudio",
+        "biscuit-btid",
+        "biscuit-btring"
+      ],
+      "processes": [
+        "bluealsa-aplay"
+      ]
+    },
+    {
+      "id": "bt-calls",
+      "label": "Bluetooth calls",
+      "route": "bluetooth",
+      "summary": "Takes calls from a paired phone, using the microphones.",
+      "services": [
+        "biscuit-btcall",
+        "biscuit-mic-pump",
+        "bluealsa",
+        "bluetooth"
+      ]
+    },
+    {
+      "id": "cast",
+      "label": "Play through a Bluetooth speaker",
+      "route": "bluetooth",
+      "summary": "Sends this Echo's sound to a paired speaker or headphones.",
+      "services": [
+        "biscuit-btcast",
+        "bluealsa",
+        "bluetooth"
+      ]
+    },
+    {
+      "id": "btproxy",
+      "label": "Bluetooth proxy",
+      "route": "homeassistant",
+      "summary": "Passes nearby Bluetooth sensors to Home Assistant.",
+      "services": [
+        "biscuit-btproxy",
+        "bluetooth"
+      ]
+    },
+    {
+      "id": "ring",
+      "label": "Light ring",
+      "route": "ring",
+      "summary": "Animations, and dimming with the room.",
+      "services": [
+        "biscuit-ring",
+        "biscuit-als"
+      ]
+    },
+    {
+      "id": "direction",
+      "label": "Direction light",
+      "route": "ring",
+      "summary": "Points the ring at whoever is speaking.",
+      "services": [
+        "biscuit-direction"
+      ]
+    },
+    {
+      "id": "network",
+      "label": "Wi-Fi and network",
+      "route": "wifi",
+      "summary": "Joins Wi-Fi and makes this Echo findable by name.",
+      "services": [
+        "avahi-daemon"
+      ],
+      "processes": [
+        "wpa_supplicant",
+        "udhcpc",
+        "hostapd",
+        "dnsmasq"
+      ]
+    },
+    {
+      "id": "time",
+      "label": "Clock",
+      "route": "about",
+      "summary": "Keeps the time, including where NTP is blocked.",
+      "services": [
+        "chronyd",
+        "biscuit-timesync"
+      ]
+    },
+    {
+      "id": "usb",
+      "label": "USB",
+      "route": "usb",
+      "summary": "What a computer sees when this Echo is plugged in.",
+      "services": [
+        "usb-rndis",
+        "unudhcpd.usb0",
+        "biscuit-usbaudio"
+      ]
+    },
+    {
+      "id": "ssh",
+      "label": "SSH",
+      "route": "security",
+      "summary": "Command-line access over the network.",
+      "services": [
+        "sshd"
+      ]
+    },
+    {
+      "id": "settings",
+      "label": "This settings page",
+      "route": "",
+      "summary": "What you are using now.",
+      "services": [
+        "biscuit-settings"
+      ]
+    },
+    {
+      "id": "system",
+      "label": "System",
+      "route": "about",
+      "summary": "Plumbing everything else relies on: messages between programs, devices, logs and swap.",
+      "services": [
+        "dbus",
+        "udev",
+        "logbookd",
+        "swapfile",
+        "postmarketos-zram-swap",
+        "udev-postmount",
+        "local"
+      ]
+    }
+  ]
+}

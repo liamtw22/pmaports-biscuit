@@ -1,0 +1,85 @@
+From 4b6bfb8565933818dd1e9df3c9e18b10f07cedc5 Mon Sep 17 00:00:00 2001
+From: Claude <claude@localhost>
+Date: Mon, 10 Aug 2026 14:25:34 -0400
+Subject: [PATCH] bluetooth: apply the stock antenna selection after RF
+ calibration
+
+r179 added stock's RF calibration script and the controller accepted it,
+but LE scanning still returned zero advertising reports with a known
+advertiser a foot away. hci0 reaches UP RUNNING, every scan command is
+acknowledged, and rfkill is clear: the receiver is deaf, not idle.
+
+Stock closes mtk_wcn_soc_init() with an unconditional antenna-selection
+register write that this driver never made:
+
+	wmt_core_reg_rw_raw(1, ANTENNA_SELECTION_REG, &val, 0x1);
+
+with ANTENNA_SELECTION_REG 0x81060010 and val DEFAULT_ANT (0x1), guarded by
+CONFIG_MTK_WIFI_ANTENNA_SWITCH, which Biscuit's archived stock kernel
+config sets to y. An unselected antenna switch disconnects the receive path
+while leaving the controller fully responsive, which is exactly the
+observed behaviour.
+
+wmt_core_reg_rw_raw() emits the same 20-byte masked register write already
+used here for the DLM power table and the MCU-clock commands, so send it
+verbatim and expect the standard register-write event. Place it where stock
+does: after RF calibration, with the PALDO dropped, before the per-function
+Bluetooth enable.
+
+No firmware, patch address, fragmentation, STP, BTIF, CONSYS power, EMI,
+quirk or boot packaging behaviour changed.
+---
+ drivers/bluetooth/hci_mt8163_stp.c | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index e82eadf..b46faa6 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -149,6 +149,21 @@ static const u8 wmt_rf_calibration_evt[] =
+  */
+ static const u8 wmt_rf_calibration_evt_mask[] =
+ 	{ 0xff, 0xff, 0x00, 0x00, 0x00, 0x00 };
++/*
++ * Stock closes mtk_wcn_soc_init() with wmt_core_reg_rw_raw(1,
++ * ANTENNA_SELECTION_REG, &val, 0x1) where ANTENNA_SELECTION_REG is 0x81060010
++ * and val is DEFAULT_ANT (0x1). Biscuit's archived stock kernel config sets
++ * CONFIG_MTK_WIFI_ANTENNA_SWITCH=y, so the write really is performed on this
++ * hardware. It is the same 20-byte masked register write as the DLM power and
++ * MCU-clock commands above.
++ */
++static const u8 wmt_antenna_select_cmd[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x10, 0x00, 0x06, 0x81, 0x01, 0x00, 0x00, 0x00,
++	0x01, 0x00, 0x00, 0x00,
++};
++static const u8 wmt_antenna_select_evt[] =
++	{ 0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01 };
+ static const u8 wmt_bt_on_cmd[] = { 0x01, 0x06, 0x02, 0x00, 0x00, 0x01 };
+ static const u8 wmt_bt_on_evt[] = { 0x02, 0x06, 0x01, 0x00, 0x00 };
+ 
+@@ -1077,6 +1092,21 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 	mt8163_consys_bt_paldo_set(stp->consys_dev, false);
+ 	stp->bt_paldo_enabled = false;
+ 
++	/*
++	 * Stock performs the antenna selection last in mtk_wcn_soc_init(), with
++	 * the PALDO already dropped, and before the per-function Bluetooth
++	 * enable that wmt_func_bt_on() drives separately. Without it the RF
++	 * switch never routes the antenna to the controller, which leaves every
++	 * command acknowledged and the receiver deaf.
++	 */
++	ret = mt8163_stp_wmt_xfer(stp, wmt_antenna_select_cmd,
++				  sizeof(wmt_antenna_select_cmd),
++				  wmt_antenna_select_evt,
++				  sizeof(wmt_antenna_select_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret, "WMT antenna selection failed\n");
++	dev_warn(stp->dev, "WMT antenna selection applied\n");
++
+ 	ret = mt8163_consys_bt_paldo_set(stp->consys_dev, true);
+ 	if (ret)
+ 		return dev_err_probe(stp->dev, ret, "failed to enable BT PALDO\n");
+-- 
+2.55.0.windows.3
+

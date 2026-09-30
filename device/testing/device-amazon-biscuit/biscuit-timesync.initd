@@ -1,0 +1,29 @@
+#!/sbin/openrc-run
+
+description="Feed chrony a time source that works where NTP does not"
+command="/usr/bin/python3"
+command_args="/usr/bin/biscuit-timesync.py"
+command_background=true
+pidfile="/run/biscuit-timesync.pid"
+output_log="/var/log/biscuit-timesync.log"
+error_log="/var/log/biscuit-timesync.log"
+
+# A genuine long-running loop, so supervising it is correct - unlike a one-shot,
+# where supervise-daemon breaks every re-entry path.
+supervisor=supervise-daemon
+respawn_delay=10
+respawn_max=0
+
+depend() {
+	# chronyd owns the socket this writes to. Started after, not needed: this
+	# service retries, and a device with no chronyd should still bootstrap its
+	# clock out of a bogus year rather than refuse to run.
+	after chronyd
+	# The source is whichever Home Assistant is connected to the ESPHome API,
+	# over wlan0 or the USB gadget; with none connected it sends nothing.
+	# `local` is where /etc/local.d/wifi.start brings wlan0 up. Not a need on
+	# either, nor on the voice assistant: Home Assistant connects when it
+	# connects, and each round looks again.
+	after local usb-rndis
+	need localmount
+}

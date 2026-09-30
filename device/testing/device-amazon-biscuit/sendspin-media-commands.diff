@@ -1,0 +1,50 @@
+Accept the commands Music Assistant actually advertises.
+
+The server lists `seek` and `seek_relative` in a controller's
+supported_commands, and the vendored MediaCommand enum has neither. One
+unknown member invalidates ControllerStatePayload, which invalidates
+ServerStatePayload, which discards the whole ServerStateMessage - 606 of
+them on this device. The session's volume, mute, repeat, shuffle and
+capability list go with each one.
+
+Colour and metadata are NOT lost with them, which is worth knowing before
+treating this as urgent: the server sends those in their own state
+messages, and measurement during Spotify Connect playback showed palettes
+arriving normally while these failures continued.
+
+seek_max_ms rides in the same object and has no field on the model.
+
+--- a/aiosendspin/models/types.py
++++ b/aiosendspin/models/types.py
+@@ -175,6 +175,11 @@
+     SHUFFLE = "shuffle"
+     UNSHUFFLE = "unshuffle"
+     SWITCH = "switch"
++    # Music Assistant advertises both of these in supported_commands.
++    # Without them one unknown member invalidates the whole
++    # ControllerStatePayload, and with it every server/state message.
++    SEEK = "seek"
++    SEEK_RELATIVE = "seek_relative"
+ 
+ 
+ class PictureFormat(Enum):
+--- a/aiosendspin/models/controller.py
++++ b/aiosendspin/models/controller.py
+@@ -61,7 +61,7 @@
+     supported_commands: list[MediaCommand]
+     """
+     Subset of: play, pause, stop, next, previous, volume, mute, repeat_off, repeat_one,
+-    repeat_all, shuffle, unshuffle, switch.
++    repeat_all, shuffle, unshuffle, switch, seek, seek_relative.
+     """
+     volume: int
+     """Volume of the whole group, range 0-100."""
+@@ -71,6 +71,8 @@
+     """Repeat mode: 'off' = no repeat, 'one' = repeat current track, 'all' = repeat all."""
+     shuffle: bool
+     """Whether shuffle is enabled."""
++    seek_max_ms: int | None = None
++    """Furthest position the session can seek to, in milliseconds."""
+ 
+     def __post_init__(self) -> None:
+         """Validate field values."""

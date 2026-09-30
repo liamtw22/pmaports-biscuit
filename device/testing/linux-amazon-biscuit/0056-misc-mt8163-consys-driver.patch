@@ -1,0 +1,367 @@
+--- /dev/null
++++ b/drivers/misc/mt8163-consys.c
+@@ -0,0 +1,333 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT8163 CONSYS connectivity subsystem: power up and identify
++ *
++ * The MT8163 carries its Wi-Fi and Bluetooth radios on the die rather than on
++ * a chip at the end of a bus, in a block MediaTek calls CONSYS. There is
++ * nothing to enumerate and nothing to scan for. The block answers at a fixed
++ * address once its supplies, power domain and reset have been arranged in the
++ * right order, and is silent otherwise, which makes "is the radio alive" a
++ * question that cannot be answered by looking.
++ *
++ * So this driver answers it directly. It performs the bring-up and reads the
++ * identification register, and that is all it does. It is not a radio driver:
++ * the only in-tree driver family for MediaTek Wi-Fi is mt76, which does not
++ * cover this generation, and the vendor's own stack is two hundred thousand
++ * lines written against a kernel from 2014.
++ *
++ * What it does have to get right is the order, which comes from the vendor's
++ * mtk_wcn_consys_hw.c. Supplies first, then the connectivity processor is held
++ * in reset, then the power domain comes up carrying the bus-protection
++ * handshake with it, and only then does the identification register mean
++ * anything. Reading it too early returns zero whether the radio works or not.
++ *
++ * The processor is deliberately left in reset. Releasing it without firmware
++ * would set it running on its boot ROM with nothing to talk to and a watchdog
++ * of its own; there is no reason to allow that before there is something to
++ * load. Pass release_cpu=1 if you are the one loading it.
++ *
++ * Copyright (c) 2026
++ */
++
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/io.h>
++#include <linux/kstrtox.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++#include <linux/pm_runtime.h>
++#include <linux/regulator/consumer.h>
++#include <linux/reset.h>
++
++/* Registers within the CONN_MCU_CONFIG window at 0x18070000. */
++#define CONSYS_CHIP_ID			0x008
++#define CONSYS_MCU_CFG_ACR		0x110
++#define CONSYS_ROM_RAM_DELSEL		0x114
++#define CONSYS_CPUPCR			0x160
++
++/*
++ * Memory built-in self test runs at the CPU's low frequency unless this is
++ * set, and the vendor sets it unconditionally before the processor starts.
++ */
++#define CONSYS_ACR_MBIST		BIT(18)
++
++/*
++ * Identifiers the vendor driver accepts. 0x8163 is what this SoC reports;
++ * the three MT66xx values are carried over from the shared code path and are
++ * accepted so that an unexpected-but-plausible answer is not mistaken for a
++ * dead block.
++ */
++static const u32 consys_known_ids[] = { 0x8163, 0x0321, 0x0335, 0x0337 };
++
++/* The block needs a moment after the domain comes up before it will answer. */
++#define CONSYS_SETTLE_US		10
++#define CONSYS_ID_RETRIES		20
++#define CONSYS_ID_INTERVAL_MS		20
++
++static bool release_cpu;
++module_param(release_cpu, bool, 0444);
++MODULE_PARM_DESC(release_cpu,
++		 "Release the CONSYS processor from reset after bring-up. Only useful once firmware is being loaded; leaves the processor running its boot ROM otherwise.");
++
++static const char * const consys_supply_names[] = { "vcn18", "vcn28", "vcn33" };
++
++struct mt8163_consys {
++	struct device *dev;
++	void __iomem *mcu;
++	struct reset_control *cpu_reset;
++	struct regulator_bulk_data supplies[ARRAY_SIZE(consys_supply_names)];
++	u32 chip_id;
++	bool powered;
++};
++
++static bool consys_id_is_known(u32 id)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(consys_known_ids); i++)
++		if (id == consys_known_ids[i])
++			return true;
++
++	return false;
++}
++
++/*
++ * Bring the block up far enough to be identified. The caller gets the
++ * identifier back even when it is not one we recognise, because an
++ * unrecognised value still tells us the block is powered and decoding reads,
++ * which is a different failure from silence.
++ */
++static int mt8163_consys_power_up(struct mt8163_consys *priv)
++{
++	struct device *dev = priv->dev;
++	int retries = CONSYS_ID_RETRIES;
++	u32 id = 0;
++	int ret;
++
++	ret = regulator_bulk_enable(ARRAY_SIZE(priv->supplies), priv->supplies);
++	if (ret) {
++		dev_err(dev, "failed to enable supplies: %d\n", ret);
++		return ret;
++	}
++
++	/* Hold the connectivity processor before its power arrives. */
++	ret = reset_control_assert(priv->cpu_reset);
++	if (ret) {
++		dev_err(dev, "failed to assert CPU reset: %d\n", ret);
++		goto err_supplies;
++	}
++
++	/*
++	 * The domain carries the SPM power sequencing and the CCI/EMI/PERI bus
++	 * protection handshake with it, which is the part the vendor driver
++	 * open-codes against SPM registers on platforms without a real domain.
++	 */
++	ret = pm_runtime_resume_and_get(dev);
++	if (ret) {
++		dev_err(dev, "failed to power on CONN domain: %d\n", ret);
++		goto err_supplies;
++	}
++
++	udelay(CONSYS_SETTLE_US);
++
++	while (retries--) {
++		id = readl(priv->mcu + CONSYS_CHIP_ID);
++		if (consys_id_is_known(id))
++			break;
++		msleep(CONSYS_ID_INTERVAL_MS);
++	}
++
++	priv->chip_id = id;
++	priv->powered = true;
++
++	if (!consys_id_is_known(id)) {
++		/*
++		 * Report rather than fail. The block is powered either way, and
++		 * leaving it up lets the registers be read from sysfs, which is
++		 * the whole point of this driver.
++		 */
++		dev_warn(dev, "unrecognised chip id 0x%08x after %d attempts\n",
++			 id, CONSYS_ID_RETRIES);
++		dev_warn(dev, "ACR 0x%08x, DELSEL 0x%08x, CPUPCR 0x%08x\n",
++			 readl(priv->mcu + CONSYS_MCU_CFG_ACR),
++			 readl(priv->mcu + CONSYS_ROM_RAM_DELSEL),
++			 readl(priv->mcu + CONSYS_CPUPCR));
++		return 0;
++	}
++
++	dev_info(dev, "CONSYS alive, chip id 0x%08x\n", id);
++
++	writel(readl(priv->mcu + CONSYS_MCU_CFG_ACR) | CONSYS_ACR_MBIST,
++	       priv->mcu + CONSYS_MCU_CFG_ACR);
++
++	if (release_cpu) {
++		ret = reset_control_deassert(priv->cpu_reset);
++		if (ret) {
++			dev_err(dev, "failed to release CPU reset: %d\n", ret);
++			return ret;
++		}
++		msleep(20);
++		dev_info(dev, "CONSYS processor released, PC 0x%08x\n",
++			 readl(priv->mcu + CONSYS_CPUPCR));
++	}
++
++	return 0;
++
++err_supplies:
++	regulator_bulk_disable(ARRAY_SIZE(priv->supplies), priv->supplies);
++	return ret;
++}
++
++static void mt8163_consys_power_down(struct mt8163_consys *priv)
++{
++	if (!priv->powered)
++		return;
++
++	reset_control_assert(priv->cpu_reset);
++	pm_runtime_put_sync(priv->dev);
++	regulator_bulk_disable(ARRAY_SIZE(priv->supplies), priv->supplies);
++	priv->powered = false;
++}
++
++static ssize_t chip_id_show(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	struct mt8163_consys *priv = dev_get_drvdata(dev);
++
++	/* Re-read while powered so the file reflects the block, not a cache. */
++	if (priv->powered)
++		priv->chip_id = readl(priv->mcu + CONSYS_CHIP_ID);
++
++	return sysfs_emit(buf, "0x%08x\n", priv->chip_id);
++}
++static DEVICE_ATTR_RO(chip_id);
++
++static ssize_t registers_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct mt8163_consys *priv = dev_get_drvdata(dev);
++
++	if (!priv->powered)
++		return sysfs_emit(buf, "powered down\n");
++
++	return sysfs_emit(buf,
++			  "chip_id 0x%08x\nacr     0x%08x\ndelsel  0x%08x\ncpupcr  0x%08x\n",
++			  readl(priv->mcu + CONSYS_CHIP_ID),
++			  readl(priv->mcu + CONSYS_MCU_CFG_ACR),
++			  readl(priv->mcu + CONSYS_ROM_RAM_DELSEL),
++			  readl(priv->mcu + CONSYS_CPUPCR));
++}
++static DEVICE_ATTR_RO(registers);
++
++static ssize_t powered_show(struct device *dev,
++			    struct device_attribute *attr, char *buf)
++{
++	struct mt8163_consys *priv = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%d\n", priv->powered);
++}
++
++static ssize_t powered_store(struct device *dev, struct device_attribute *attr,
++			     const char *buf, size_t count)
++{
++	struct mt8163_consys *priv = dev_get_drvdata(dev);
++	bool on;
++	int ret;
++
++	ret = kstrtobool(buf, &on);
++	if (ret)
++		return ret;
++
++	if (on == priv->powered)
++		return count;
++
++	if (on) {
++		ret = mt8163_consys_power_up(priv);
++		if (ret)
++			return ret;
++	} else {
++		mt8163_consys_power_down(priv);
++	}
++
++	return count;
++}
++static DEVICE_ATTR_RW(powered);
++
++static struct attribute *mt8163_consys_attrs[] = {
++	&dev_attr_chip_id.attr,
++	&dev_attr_registers.attr,
++	&dev_attr_powered.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(mt8163_consys);
++
++static int mt8163_consys_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mt8163_consys *priv;
++	unsigned int i;
++	int ret;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->dev = dev;
++	platform_set_drvdata(pdev, priv);
++
++	priv->mcu = devm_platform_ioremap_resource(pdev, 0);
++	if (IS_ERR(priv->mcu))
++		return PTR_ERR(priv->mcu);
++
++	for (i = 0; i < ARRAY_SIZE(consys_supply_names); i++)
++		priv->supplies[i].supply = consys_supply_names[i];
++
++	ret = devm_regulator_bulk_get(dev, ARRAY_SIZE(priv->supplies),
++				      priv->supplies);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to get supplies\n");
++
++	priv->cpu_reset = devm_reset_control_get_exclusive(dev, "connsys-cpu");
++	if (IS_ERR(priv->cpu_reset))
++		return dev_err_probe(dev, PTR_ERR(priv->cpu_reset),
++				     "failed to get CPU reset\n");
++
++	pm_runtime_enable(dev);
++
++	ret = mt8163_consys_power_up(priv);
++	if (ret) {
++		pm_runtime_disable(dev);
++		return ret;
++	}
++
++	return 0;
++}
++
++static void mt8163_consys_remove(struct platform_device *pdev)
++{
++	struct mt8163_consys *priv = platform_get_drvdata(pdev);
++
++	mt8163_consys_power_down(priv);
++	pm_runtime_disable(&pdev->dev);
++}
++
++static const struct of_device_id mt8163_consys_of_match[] = {
++	{ .compatible = "mediatek,mt8163-consys" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt8163_consys_of_match);
++
++static struct platform_driver mt8163_consys_driver = {
++	.probe = mt8163_consys_probe,
++	.remove = mt8163_consys_remove,
++	.driver = {
++		.name = "mt8163-consys",
++		.of_match_table = mt8163_consys_of_match,
++		.dev_groups = mt8163_consys_groups,
++	},
++};
++module_platform_driver(mt8163_consys_driver);
++
++MODULE_DESCRIPTION("MediaTek MT8163 CONSYS power-up and identification");
++MODULE_LICENSE("GPL");
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -673,4 +673,21 @@
+ 	  speaker stays silent.
+ 
+ 	  If unsure, say N.
++
++config MT8163_CONSYS
++	tristate "MediaTek MT8163 CONSYS bring-up and identification"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on REGULATOR && RESET_CONTROLLER
++	help
++	  The MT8163 carries its Wi-Fi and Bluetooth radios on the die, in a
++	  block MediaTek calls CONSYS. There is no bus to enumerate it on, so
++	  whether the radio is alive cannot be established by looking: the
++	  block only answers once its supplies, power domain and reset have
++	  been arranged in the right order.
++
++	  This driver performs that bring-up and reports the identification
++	  register through sysfs. It is a diagnostic, not a radio driver, and
++	  provides no networking of any kind.
++
++	  If unsure, say N.
+ endmenu
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -76,3 +76,4 @@
+ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
+ obj-$(CONFIG_DOUGH_FPGA)		+= dough-fpga.o
++obj-$(CONFIG_MT8163_CONSYS)	+= mt8163-consys.o

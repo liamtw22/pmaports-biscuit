@@ -1,0 +1,890 @@
+--- a/drivers/bluetooth/Kconfig
++++ b/drivers/bluetooth/Kconfig
+@@ -512,4 +512,18 @@
+ 
+ 	  Say Y here to compiler support for Intel Bluetooth PCIe device into
+ 	  the kernel or say M to compile it as module (btintel_pcie)
++config BT_HCI_MT8163_STP
++	tristate "MediaTek MT8163 BTIF/STP HCI driver"
++	depends on OF
++	depends on MT8163_BTIF
++	select FW_LOADER
++	help
++	  The MT8163 connectivity firmware multiplexes Bluetooth and WMT
++	  control traffic over the BTIF DMA virtual FIFOs using MediaTek STP.
++	  This driver performs the small WMT bootstrap, downloads the two
++	  board firmware patches, and exposes the resulting controller to
++	  BlueZ as an HCI device.
++
++	  Say Y here for the Amazon Echo Dot 2nd generation (biscuit).
++
+ endmenu
+--- a/drivers/bluetooth/Makefile
++++ b/drivers/bluetooth/Makefile
+@@ -31,6 +31,7 @@
+ 
+ obj-$(CONFIG_BT_VIRTIO)		+= virtio_bt.o
+ obj-$(CONFIG_BT_NXPUART)	+= btnxpuart.o
++obj-$(CONFIG_BT_HCI_MT8163_STP)	+= hci_mt8163_stp.o
+ 
+ obj-$(CONFIG_BT_HCIUART_NOKIA)	+= hci_nokia.o
+ 
+--- a/drivers/misc/mt8163-consys.c
++++ b/drivers/misc/mt8163-consys.c
+@@ -34,6 +34,7 @@
+ #include <linux/io.h>
+ #include <linux/kstrtox.h>
+ #include <linux/mfd/syscon.h>
++#include <linux/mutex.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -47,6 +48,8 @@
+ #include <linux/sizes.h>
+ #include <linux/spinlock.h>
+ 
++#include <linux/mt8163-consys.h>
++
+ /* Registers within the CONN_MCU_CONFIG window at 0x18070000. */
+ #define CONSYS_CHIP_ID			0x008
+ #define CONSYS_MCU_CFG_ACR		0x110
+@@ -125,12 +128,15 @@
+ 	struct regmap *emi;
+ 	struct pinctrl *pinctrl;
+ 	struct pinctrl_state *pins_wifi_reset;
++	struct mutex state_lock;
+ 	spinlock_t mpu_lock;
+ 	struct regulator_bulk_data supplies[ARRAY_SIZE(consys_supply_names)];
+ 	phys_addr_t emi_base;
+ 	phys_addr_t emi_size;
+ 	u32 emi_mapping;
+ 	u32 chip_id;
++	unsigned int users;
++	bool cpu_released;
+ 	bool powered;
+ };
+ 
+@@ -356,6 +362,7 @@
+ 			dev_err(dev, "failed to release CPU reset: %d\n", ret);
+ 			return ret;
+ 		}
++		priv->cpu_released = true;
+ 		msleep(20);
+ 		dev_info(dev, "CONSYS processor released, PC 0x%08x\n",
+ 			 readl(priv->mcu + CONSYS_CPUPCR));
+@@ -374,11 +381,61 @@
+ 		return;
+ 
+ 	reset_control_assert(priv->cpu_reset);
++	priv->cpu_released = false;
+ 	pm_runtime_put_sync(priv->dev);
+ 	regulator_bulk_disable(ARRAY_SIZE(priv->supplies), priv->supplies);
+ 	priv->powered = false;
+ }
+ 
++int mt8163_consys_acquire(struct device *dev)
++{
++	struct mt8163_consys *priv = dev_get_drvdata(dev);
++	int ret = 0;
++
++	if (!priv)
++		return -EPROBE_DEFER;
++
++	mutex_lock(&priv->state_lock);
++	if (!priv->powered) {
++		ret = mt8163_consys_power_up(priv);
++		if (ret)
++			goto out;
++	}
++
++	if (!priv->cpu_released) {
++		ret = reset_control_deassert(priv->cpu_reset);
++		if (ret) {
++			dev_err(priv->dev, "failed to release CPU for radio client: %d\n",
++				ret);
++			goto out;
++		}
++		priv->cpu_released = true;
++		msleep(20);
++	}
++
++	priv->users++;
++out:
++	mutex_unlock(&priv->state_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt8163_consys_acquire);
++
++void mt8163_consys_release(struct device *dev)
++{
++	struct mt8163_consys *priv = dev_get_drvdata(dev);
++
++	if (!priv)
++		return;
++
++	mutex_lock(&priv->state_lock);
++	if (WARN_ON(!priv->users))
++		goto out;
++	priv->users--;
++out:
++	mutex_unlock(&priv->state_lock);
++}
++EXPORT_SYMBOL_GPL(mt8163_consys_release);
++
+ static ssize_t chip_id_show(struct device *dev,
+ 			    struct device_attribute *attr, char *buf)
+ {
+@@ -428,16 +485,27 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	if (on == priv->powered)
++	mutex_lock(&priv->state_lock);
++	if (on == priv->powered) {
++		mutex_unlock(&priv->state_lock);
+ 		return count;
++	}
++
++	if (!on && priv->users) {
++		mutex_unlock(&priv->state_lock);
++		return -EBUSY;
++	}
+ 
+ 	if (on) {
+ 		ret = mt8163_consys_power_up(priv);
+-		if (ret)
++		if (ret) {
++			mutex_unlock(&priv->state_lock);
+ 			return ret;
++		}
+ 	} else {
+ 		mt8163_consys_power_down(priv);
+ 	}
++	mutex_unlock(&priv->state_lock);
+ 
+ 	return count;
+ }
+@@ -477,6 +545,7 @@
+ 		return -ENOMEM;
+ 
+ 	priv->dev = dev;
++	mutex_init(&priv->state_lock);
+ 	platform_set_drvdata(pdev, priv);
+ 
+ 	priv->mcu = devm_platform_ioremap_resource(pdev, 0);
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -485,6 +485,12 @@
+ 		compatible = "mediatek,mt8163-emi", "syscon";
+ 		reg = <0 0x10203000 0 0x1000>;
+ 	};
++
++	bluetooth {
++		compatible = "mediatek,mt8163-stp-bt";
++		mediatek,btif = <&btif>;
++		mediatek,consys = <&consys>;
++	};
+ };
+ 
+ &consys {
+--- /dev/null
++++ b/include/linux/mt8163-consys.h
+@@ -0,0 +1,15 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_MT8163_CONSYS_H
++#define _LINUX_MT8163_CONSYS_H
++
++struct device;
++
++/*
++ * Hold the connectivity domain and release its processor exactly once for a
++ * radio client. A successful acquire means the existing regulator/domain
++ * sequence completed and the processor can accept WMT traffic over BTIF.
++ */
++int mt8163_consys_acquire(struct device *dev);
++void mt8163_consys_release(struct device *dev);
++
++#endif /* _LINUX_MT8163_CONSYS_H */
+--- /dev/null
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -0,0 +1,680 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT8163 BTIF/STP Bluetooth transport.
++ *
++ * The MT8163 does not carry Bluetooth HCI over a UART. BTIF exposes two DMA
++ * virtual FIFOs to the connectivity processor; STP then multiplexes WMT and
++ * HCI packets over that link. Keep this driver deliberately small: it owns
++ * only the framing, WMT bootstrap, firmware transfer and HCI adaptation.
++ */
++
++#include <linux/completion.h>
++#include <linux/delay.h>
++#include <linux/device.h>
++#include <linux/firmware.h>
++#include <linux/kfifo.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/of_platform.h>
++#include <linux/platform_device.h>
++#include <linux/skbuff.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++#include <linux/workqueue.h>
++
++#include <linux/mt8163-btif.h>
++#include <linux/mt8163-consys.h>
++
++#include <net/bluetooth/bluetooth.h>
++#include <net/bluetooth/hci_core.h>
++
++#define MT8163_STP_TASK_BT		0
++#define MT8163_STP_TASK_WMT		4
++#define MT8163_STP_HEADER_LEN		4
++#define MT8163_STP_TRAILER_LEN		2
++#define MT8163_STP_MAX_PAYLOAD		2014
++#define MT8163_STP_RX_FIFO_SIZE	SZ_16K
++#define MT8163_STP_WMT_TIMEOUT		msecs_to_jiffies(1500)
++#define MT8163_WMT_PATCH_HEADER_LEN	28
++#define MT8163_WMT_PATCH_FRAGMENT	1000
++
++/* WMT starts raw, then uses STP task 4 after the SET_STP exchange. */
++static const u8 wmt_query_stp_cmd[] =
++	{ 0x01, 0x04, 0x01, 0x00, 0x04 };
++static const u8 wmt_query_stp_default_evt[] =
++	{ 0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0x11, 0x00, 0x00, 0x00 };
++static const u8 wmt_set_stp_cmd[] =
++	{ 0x01, 0x04, 0x05, 0x00, 0x03, 0xdf, 0x0e, 0x68, 0x01 };
++static const u8 wmt_set_stp_evt[] =
++	{ 0x02, 0x04, 0x02, 0x00, 0x00, 0x03 };
++static const u8 wmt_query_stp_evt[] =
++	{ 0x02, 0x04, 0x06, 0x00, 0x00, 0x04, 0xdf, 0x0e, 0x68, 0x01 };
++static const u8 wmt_patch_address_cmd[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x40, 0x02, 0x09, 0x02, 0x00, 0x00, 0x00, 0x00,
++	0xff, 0xff, 0xff, 0xff,
++};
++static const u8 wmt_patch_address_evt[] =
++	{ 0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01 };
++static const u8 wmt_patch_evt[] = { 0x02, 0x01, 0x01, 0x00, 0x00 };
++static const u8 wmt_reset_cmd[] = { 0x01, 0x07, 0x01, 0x00, 0x04 };
++static const u8 wmt_reset_evt[] = { 0x02, 0x07, 0x01, 0x00, 0x00 };
++static const u8 wmt_bt_on_cmd[] = { 0x01, 0x06, 0x02, 0x00, 0x00, 0x01 };
++static const u8 wmt_bt_on_evt[] = { 0x02, 0x06, 0x01, 0x00, 0x00 };
++
++enum mt8163_stp_rx_state {
++	MT8163_STP_RX_SYNC,
++	MT8163_STP_RX_HEADER,
++	MT8163_STP_RX_BODY,
++};
++
++struct mt8163_stp {
++	struct device *dev;
++	struct device *consys_dev;
++	struct mt8163_btif *btif;
++	struct mt8163_btif_client btif_client;
++	struct hci_dev *hdev;
++
++	struct kfifo rx_fifo;
++	spinlock_t rx_lock;
++	struct work_struct rx_work;
++	struct work_struct tx_work;
++	struct sk_buff_head txq;
++	struct mutex tx_lock;
++
++	spinlock_t wmt_lock;
++	struct completion wmt_done;
++	const u8 *wmt_expected;
++	size_t wmt_expected_len;
++	u8 wmt_rx[32];
++	size_t wmt_rx_len;
++	int wmt_result;
++	bool wmt_waiting;
++
++	enum mt8163_stp_rx_state rx_state;
++	u8 header[MT8163_STP_HEADER_LEN];
++	size_t header_len;
++	u8 payload[MT8163_STP_MAX_PAYLOAD + MT8163_STP_TRAILER_LEN];
++	size_t payload_len;
++	size_t payload_need;
++	u8 payload_type;
++	bool framed;
++	bool hci_registered;
++};
++
++static int mt8163_stp_btif_write(struct mt8163_stp *stp, const u8 *buf,
++					 size_t len)
++{
++	int ret;
++	unsigned int tries = 100;
++
++	do {
++		ret = mt8163_btif_write(stp->btif, buf, len);
++		if (ret != -EAGAIN)
++			return ret;
++		usleep_range(1000, 2000);
++	} while (--tries);
++
++	return -ETIMEDOUT;
++}
++
++static int mt8163_stp_send(struct mt8163_stp *stp, u8 type,
++			   const u8 *payload, size_t len)
++{
++	u8 frame[MT8163_STP_HEADER_LEN + MT8163_STP_MAX_PAYLOAD +
++		 MT8163_STP_TRAILER_LEN];
++	int ret;
++
++	if (len > MT8163_STP_MAX_PAYLOAD)
++		return -EMSGSIZE;
++
++	/* BTIF mandatory mode: fixed STP header and a zero two-byte trailer. */
++	frame[0] = 0x80;
++	frame[1] = (type << 4) | ((len >> 8) & 0x0f);
++	frame[2] = len & 0xff;
++	frame[3] = 0;
++	memcpy(frame + MT8163_STP_HEADER_LEN, payload, len);
++	frame[MT8163_STP_HEADER_LEN + len] = 0;
++	frame[MT8163_STP_HEADER_LEN + len + 1] = 0;
++
++	mutex_lock(&stp->tx_lock);
++	ret = mt8163_stp_btif_write(stp, frame, len + MT8163_STP_HEADER_LEN +
++					 MT8163_STP_TRAILER_LEN);
++	mutex_unlock(&stp->tx_lock);
++	return ret;
++}
++
++static int mt8163_stp_send_raw(struct mt8163_stp *stp, const u8 *buf,
++				       size_t len)
++{
++	int ret;
++
++	mutex_lock(&stp->tx_lock);
++	ret = mt8163_stp_btif_write(stp, buf, len);
++	mutex_unlock(&stp->tx_lock);
++	return ret;
++}
++
++static void mt8163_stp_wmt_byte(struct mt8163_stp *stp, u8 byte)
++{
++	unsigned long flags;
++	bool done = false;
++
++	spin_lock_irqsave(&stp->wmt_lock, flags);
++	if (!stp->wmt_waiting)
++		goto out;
++	if (stp->wmt_rx_len >= sizeof(stp->wmt_rx)) {
++		stp->wmt_result = -EMSGSIZE;
++		stp->wmt_waiting = false;
++		done = true;
++		goto out;
++	}
++
++	stp->wmt_rx[stp->wmt_rx_len++] = byte;
++	if (stp->wmt_rx_len != stp->wmt_expected_len)
++		goto out;
++
++	stp->wmt_result = memcmp(stp->wmt_rx, stp->wmt_expected,
++				 stp->wmt_expected_len) ? -EPROTO : 0;
++	stp->wmt_waiting = false;
++	done = true;
++out:
++	spin_unlock_irqrestore(&stp->wmt_lock, flags);
++	if (done)
++		complete(&stp->wmt_done);
++}
++
++static void mt8163_stp_hci_rx(struct mt8163_stp *stp, const u8 *data,
++				      size_t len)
++{
++	struct sk_buff *skb;
++	u8 pkt_type;
++
++	if (!stp->hci_registered || len < 1)
++		return;
++
++	pkt_type = data[0];
++	switch (pkt_type) {
++	case HCI_EVENT_PKT:
++	case HCI_ACLDATA_PKT:
++	case HCI_SCODATA_PKT:
++	case HCI_ISODATA_PKT:
++		break;
++	default:
++		dev_warn_ratelimited(stp->dev, "unexpected HCI packet type 0x%02x\n",
++					pkt_type);
++		return;
++	}
++
++	skb = bt_skb_alloc(len - 1, GFP_KERNEL);
++	if (!skb)
++		return;
++	skb_put_data(skb, data + 1, len - 1);
++	hci_skb_pkt_type(skb) = pkt_type;
++	hci_recv_frame(stp->hdev, skb);
++}
++
++static void mt8163_stp_finish_frame(struct mt8163_stp *stp)
++{
++	if (stp->payload_type == MT8163_STP_TASK_WMT) {
++		size_t i;
++
++		for (i = 0; i < stp->payload_need; i++)
++			mt8163_stp_wmt_byte(stp, stp->payload[i]);
++	} else if (stp->payload_type == MT8163_STP_TASK_BT) {
++		mt8163_stp_hci_rx(stp, stp->payload, stp->payload_need);
++	}
++}
++
++static void mt8163_stp_rx_byte(struct mt8163_stp *stp, u8 byte)
++{
++	switch (stp->rx_state) {
++	case MT8163_STP_RX_SYNC:
++		if (byte != 0x80)
++			return;
++		stp->header[0] = byte;
++		stp->header_len = 1;
++		stp->rx_state = MT8163_STP_RX_HEADER;
++		break;
++	case MT8163_STP_RX_HEADER:
++		stp->header[stp->header_len++] = byte;
++		if (stp->header_len != MT8163_STP_HEADER_LEN)
++			break;
++		stp->payload_type = (stp->header[1] >> 4) & 0x7;
++		stp->payload_need = ((stp->header[1] & 0x0f) << 8) |
++					stp->header[2];
++		if (stp->payload_need > MT8163_STP_MAX_PAYLOAD) {
++			dev_warn_ratelimited(stp->dev, "oversize STP payload %zu\n",
++						stp->payload_need);
++			stp->rx_state = MT8163_STP_RX_SYNC;
++			break;
++		}
++		stp->payload_len = 0;
++		stp->rx_state = MT8163_STP_RX_BODY;
++		break;
++	case MT8163_STP_RX_BODY:
++		stp->payload[stp->payload_len++] = byte;
++		if (stp->payload_len != stp->payload_need + MT8163_STP_TRAILER_LEN)
++			break;
++		mt8163_stp_finish_frame(stp);
++		stp->rx_state = MT8163_STP_RX_SYNC;
++		break;
++	}
++}
++
++static void mt8163_stp_rx_work(struct work_struct *work)
++{
++	struct mt8163_stp *stp = container_of(work, struct mt8163_stp, rx_work);
++	u8 buf[256];
++	unsigned long flags;
++	unsigned int len, i;
++
++	for (;;) {
++		spin_lock_irqsave(&stp->rx_lock, flags);
++		len = kfifo_out(&stp->rx_fifo, buf, sizeof(buf));
++		spin_unlock_irqrestore(&stp->rx_lock, flags);
++		if (!len)
++			return;
++
++		for (i = 0; i < len; i++) {
++			if (stp->framed)
++				mt8163_stp_rx_byte(stp, buf[i]);
++			else
++				mt8163_stp_wmt_byte(stp, buf[i]);
++		}
++	}
++}
++
++static void mt8163_stp_receive(void *data, const u8 *buf, size_t len)
++{
++	struct mt8163_stp *stp = data;
++	unsigned long flags;
++
++	spin_lock_irqsave(&stp->rx_lock, flags);
++	if (kfifo_avail(&stp->rx_fifo) < len)
++		kfifo_reset(&stp->rx_fifo);
++	if (kfifo_avail(&stp->rx_fifo) >= len)
++		kfifo_in(&stp->rx_fifo, buf, len);
++	spin_unlock_irqrestore(&stp->rx_lock, flags);
++	schedule_work(&stp->rx_work);
++}
++
++static int mt8163_stp_wmt_xfer(struct mt8163_stp *stp, bool framed,
++				const u8 *cmd, size_t cmd_len,
++				const u8 *event, size_t event_len)
++{
++	unsigned long flags;
++	int ret;
++
++	if (event_len > sizeof(stp->wmt_rx))
++		return -EMSGSIZE;
++
++	reinit_completion(&stp->wmt_done);
++	spin_lock_irqsave(&stp->wmt_lock, flags);
++	stp->wmt_expected = event;
++	stp->wmt_expected_len = event_len;
++	stp->wmt_rx_len = 0;
++	stp->wmt_result = -ETIMEDOUT;
++	stp->wmt_waiting = true;
++	spin_unlock_irqrestore(&stp->wmt_lock, flags);
++
++	if (framed)
++		ret = mt8163_stp_send(stp, MT8163_STP_TASK_WMT, cmd, cmd_len);
++	else
++		ret = mt8163_stp_send_raw(stp, cmd, cmd_len);
++	if (ret)
++		goto cancel;
++
++	if (!wait_for_completion_timeout(&stp->wmt_done, MT8163_STP_WMT_TIMEOUT))
++		ret = -ETIMEDOUT;
++	else
++		ret = READ_ONCE(stp->wmt_result);
++	if (!ret)
++		return 0;
++
++cancel:
++	spin_lock_irqsave(&stp->wmt_lock, flags);
++	stp->wmt_waiting = false;
++	spin_unlock_irqrestore(&stp->wmt_lock, flags);
++	return ret;
++}
++
++static int mt8163_stp_download_patch(struct mt8163_stp *stp,
++				     const char *name, const u8 address[4])
++{
++	const struct firmware *fw;
++	const u8 *data;
++	size_t remaining, len;
++	u8 cmd[5 + MT8163_WMT_PATCH_FRAGMENT];
++	u8 partial_address_cmd[20] = {
++		0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++		0xc8, 0x04, 0x09, 0x02, 0x00, 0x00, 0x00, 0x00,
++		0xff, 0xff, 0xff, 0xff,
++	};
++	unsigned int fragment = 0;
++	int ret;
++
++	ret = request_firmware_direct(&fw, name, stp->dev);
++	if (ret)
++		return dev_err_probe(stp->dev, ret, "missing %s\n", name);
++	if (fw->size <= MT8163_WMT_PATCH_HEADER_LEN) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	/* The stock multi-patch loader programs both MT8163 patch RAM windows. */
++	ret = mt8163_stp_wmt_xfer(stp, true, wmt_patch_address_cmd,
++				  sizeof(wmt_patch_address_cmd), wmt_patch_address_evt,
++				  sizeof(wmt_patch_address_evt));
++	if (ret)
++		goto out;
++	memcpy(partial_address_cmd + 12, address, 4);
++	ret = mt8163_stp_wmt_xfer(stp, true, partial_address_cmd,
++				  sizeof(partial_address_cmd), wmt_patch_address_evt,
++				  sizeof(wmt_patch_address_evt));
++	if (ret)
++		goto out;
++
++	data = fw->data + MT8163_WMT_PATCH_HEADER_LEN;
++	remaining = fw->size - MT8163_WMT_PATCH_HEADER_LEN;
++	while (remaining) {
++		len = min_t(size_t, remaining, MT8163_WMT_PATCH_FRAGMENT);
++		cmd[0] = 0x01;
++		cmd[1] = 0x01;
++		cmd[2] = (len + 1) & 0xff;
++		cmd[3] = (len + 1) >> 8;
++		cmd[4] = remaining == len ? 0x03 : fragment ? 0x02 : 0x01;
++		memcpy(cmd + 5, data, len);
++
++		ret = mt8163_stp_wmt_xfer(stp, true, cmd, len + 5,
++					  wmt_patch_evt, sizeof(wmt_patch_evt));
++		if (ret)
++			goto out;
++		data += len;
++		remaining -= len;
++		fragment++;
++	}
++
++	dev_info(stp->dev, "WMT patch %s downloaded (%zu bytes)\n", name,
++		 fw->size - MT8163_WMT_PATCH_HEADER_LEN);
++out:
++	release_firmware(fw);
++	return ret;
++}
++
++static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
++{
++	static const struct {
++		const char *name;
++		u8 address[4];
++	} patches[] = {
++		/* Stock launcher runs download sequence 1 before sequence 2. */
++		{ "mediatek/ROMv2_lm_patch_1_1_hdr.bin", { 0x21, 0x00, 0x0e, 0xf0 } },
++		{ "mediatek/ROMv2_lm_patch_1_0_hdr.bin", { 0x22, 0x00, 0x06, 0x00 } },
++	};
++	unsigned int i;
++	int ret;
++
++	ret = mt8163_stp_wmt_xfer(stp, false, wmt_query_stp_cmd,
++				  sizeof(wmt_query_stp_cmd), wmt_query_stp_default_evt,
++				  sizeof(wmt_query_stp_default_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret, "raw WMT STP query failed\n");
++
++	ret = mt8163_stp_wmt_xfer(stp, false, wmt_set_stp_cmd,
++				  sizeof(wmt_set_stp_cmd), wmt_set_stp_evt,
++				  sizeof(wmt_set_stp_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret, "raw WMT STP setup failed\n");
++
++	msleep(10);
++	stp->framed = true;
++	ret = mt8163_stp_wmt_xfer(stp, true, wmt_query_stp_cmd,
++				  sizeof(wmt_query_stp_cmd), wmt_query_stp_evt,
++				  sizeof(wmt_query_stp_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret, "framed WMT STP query failed\n");
++
++	for (i = 0; i < ARRAY_SIZE(patches); i++) {
++		ret = mt8163_stp_download_patch(stp, patches[i].name,
++						patches[i].address);
++		if (ret)
++			return ret;
++		ret = mt8163_stp_wmt_xfer(stp, true, wmt_reset_cmd,
++					  sizeof(wmt_reset_cmd), wmt_reset_evt,
++					  sizeof(wmt_reset_evt));
++		if (ret)
++			return dev_err_probe(stp->dev, ret, "WMT patch reset failed\n");
++	}
++
++	ret = mt8163_stp_wmt_xfer(stp, true, wmt_bt_on_cmd,
++				  sizeof(wmt_bt_on_cmd), wmt_bt_on_evt,
++				  sizeof(wmt_bt_on_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret, "WMT Bluetooth enable failed\n");
++
++	dev_info(stp->dev, "WMT/STP bootstrap complete\n");
++	return 0;
++}
++
++static void mt8163_stp_tx_work(struct work_struct *work)
++{
++	struct mt8163_stp *stp = container_of(work, struct mt8163_stp, tx_work);
++	struct sk_buff *skb;
++	u8 *buf;
++	u8 type;
++	int ret;
++
++	while ((skb = skb_dequeue(&stp->txq))) {
++		type = hci_skb_pkt_type(skb);
++		buf = kmalloc(skb->len + 1, GFP_KERNEL);
++		if (!buf)
++			goto free;
++		buf[0] = type;
++		memcpy(buf + 1, skb->data, skb->len);
++		ret = mt8163_stp_send(stp, MT8163_STP_TASK_BT, buf, skb->len + 1);
++		kfree(buf);
++		if (ret) {
++			bt_dev_err(stp->hdev, "STP transmit failed: %d", ret);
++			goto free;
++		}
++
++		stp->hdev->stat.byte_tx += skb->len;
++		switch (type) {
++		case HCI_COMMAND_PKT:
++			stp->hdev->stat.cmd_tx++;
++			break;
++		case HCI_ACLDATA_PKT:
++			stp->hdev->stat.acl_tx++;
++			break;
++		case HCI_SCODATA_PKT:
++			stp->hdev->stat.sco_tx++;
++			break;
++		}
++free:
++		kfree_skb(skb);
++	}
++}
++
++static int mt8163_stp_hci_open(struct hci_dev *hdev)
++{
++	return 0;
++}
++
++static int mt8163_stp_hci_close(struct hci_dev *hdev)
++{
++	struct mt8163_stp *stp = hci_get_drvdata(hdev);
++
++	skb_queue_purge(&stp->txq);
++	return 0;
++}
++
++static int mt8163_stp_hci_flush(struct hci_dev *hdev)
++{
++	struct mt8163_stp *stp = hci_get_drvdata(hdev);
++
++	skb_queue_purge(&stp->txq);
++	return 0;
++}
++
++static int mt8163_stp_hci_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
++{
++	struct mt8163_stp *stp = hci_get_drvdata(hdev);
++
++	skb_queue_tail(&stp->txq, skb);
++	schedule_work(&stp->tx_work);
++	return 0;
++}
++
++static int mt8163_stp_hci_register(struct mt8163_stp *stp)
++{
++	struct hci_dev *hdev;
++	int ret;
++
++	hdev = hci_alloc_dev();
++	if (!hdev)
++		return -ENOMEM;
++
++	hdev->bus = HCI_VIRTUAL;
++	hdev->open = mt8163_stp_hci_open;
++	hdev->close = mt8163_stp_hci_close;
++	hdev->flush = mt8163_stp_hci_flush;
++	hdev->send = mt8163_stp_hci_send_frame;
++	SET_HCIDEV_DEV(hdev, stp->dev);
++	hci_set_drvdata(hdev, stp);
++
++	ret = hci_register_dev(hdev);
++	if (ret) {
++		hci_free_dev(hdev);
++		return ret;
++	}
++
++	stp->hdev = hdev;
++	stp->hci_registered = true;
++	return 0;
++}
++
++static int mt8163_stp_get_phandle_device(struct device *dev, const char *name,
++					  struct device **out)
++{
++	struct device_node *np;
++	struct platform_device *pdev;
++
++	np = of_parse_phandle(dev->of_node, name, 0);
++	if (!np)
++		return dev_err_probe(dev, -EINVAL, "missing %s phandle\n", name);
++	pdev = of_find_device_by_node(np);
++	of_node_put(np);
++	if (!pdev)
++		return -EPROBE_DEFER;
++	*out = &pdev->dev;
++	return 0;
++}
++
++static int mt8163_stp_probe(struct platform_device *pdev)
++{
++	struct mt8163_stp *stp;
++	struct device *btif_dev;
++	int ret;
++
++	stp = devm_kzalloc(&pdev->dev, sizeof(*stp), GFP_KERNEL);
++	if (!stp)
++		return -ENOMEM;
++	stp->dev = &pdev->dev;
++	spin_lock_init(&stp->rx_lock);
++	spin_lock_init(&stp->wmt_lock);
++	mutex_init(&stp->tx_lock);
++	init_completion(&stp->wmt_done);
++	INIT_WORK(&stp->rx_work, mt8163_stp_rx_work);
++	INIT_WORK(&stp->tx_work, mt8163_stp_tx_work);
++	skb_queue_head_init(&stp->txq);
++
++	ret = kfifo_alloc(&stp->rx_fifo, MT8163_STP_RX_FIFO_SIZE, GFP_KERNEL);
++	if (ret)
++		return ret;
++
++	ret = mt8163_stp_get_phandle_device(&pdev->dev, "mediatek,consys",
++					    &stp->consys_dev);
++	if (ret)
++		goto err_fifo;
++	ret = mt8163_consys_acquire(stp->consys_dev);
++	if (ret)
++		goto err_consys_dev;
++
++	ret = mt8163_stp_get_phandle_device(&pdev->dev, "mediatek,btif",
++					    &btif_dev);
++	if (ret)
++		goto err_consys;
++	stp->btif = mt8163_btif_get(btif_dev);
++	put_device(btif_dev);
++	if (!stp->btif) {
++		ret = -EPROBE_DEFER;
++		goto err_consys;
++	}
++
++	stp->btif_client.receive = mt8163_stp_receive;
++	stp->btif_client.data = stp;
++	ret = mt8163_btif_register_client(stp->btif, &stp->btif_client);
++	if (ret)
++		goto err_consys;
++
++	ret = mt8163_stp_bootstrap(stp);
++	if (ret)
++		goto err_client;
++	ret = mt8163_stp_hci_register(stp);
++	if (ret)
++		goto err_client;
++
++	platform_set_drvdata(pdev, stp);
++	dev_info(&pdev->dev, "Bluetooth HCI registered after WMT bootstrap\n");
++	return 0;
++
++err_client:
++	mt8163_btif_unregister_client(stp->btif, &stp->btif_client);
++err_consys:
++	mt8163_consys_release(stp->consys_dev);
++err_consys_dev:
++	put_device(stp->consys_dev);
++err_fifo:
++	cancel_work_sync(&stp->rx_work);
++	cancel_work_sync(&stp->tx_work);
++	kfifo_free(&stp->rx_fifo);
++	return ret;
++}
++
++static void mt8163_stp_remove(struct platform_device *pdev)
++{
++	struct mt8163_stp *stp = platform_get_drvdata(pdev);
++
++	if (stp->hci_registered) {
++		hci_unregister_dev(stp->hdev);
++		hci_free_dev(stp->hdev);
++	}
++	cancel_work_sync(&stp->tx_work);
++	skb_queue_purge(&stp->txq);
++	mt8163_btif_unregister_client(stp->btif, &stp->btif_client);
++	cancel_work_sync(&stp->rx_work);
++	kfifo_free(&stp->rx_fifo);
++	mt8163_consys_release(stp->consys_dev);
++	put_device(stp->consys_dev);
++}
++
++static const struct of_device_id mt8163_stp_of_match[] = {
++	{ .compatible = "mediatek,mt8163-stp-bt" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt8163_stp_of_match);
++
++static struct platform_driver mt8163_stp_driver = {
++	.probe = mt8163_stp_probe,
++	.remove = mt8163_stp_remove,
++	.driver = {
++		.name = "mt8163-stp-bt",
++		.of_match_table = mt8163_stp_of_match,
++	},
++};
++module_platform_driver(mt8163_stp_driver);
++
++MODULE_DESCRIPTION("MediaTek MT8163 BTIF/STP Bluetooth HCI driver");
++MODULE_LICENSE("GPL");

@@ -1,0 +1,86 @@
+#!/bin/sh
+# Keep the speaker's correction curve across the upgrade that stops shipping it.
+#
+# Up to r293 the package carried the curve as /usr/share/biscuit/eq/speaker.fir.
+# It is Amazon's EQ_50.cfg with a comment header and the trailing commas taken
+# off, so from r294 it is not shipped: each owner imports their own EQ_50.cfg,
+# which biscuit-dsp reads from the owner-asset store below. A device upgrading
+# from r293 or older would otherwise lose its speaker correction the moment apk
+# removes the old file, and its owner would hear the Stock equaliser go flat.
+#
+# PRE-upgrade, not post-upgrade: apk runs this before it replaces the package's
+# files, which is the last moment the old curve is on disk. (apk never runs
+# post-install on an upgrade, and post-upgrade runs after the file is gone.)
+#
+# The old file is turned back into EQ_50.cfg exactly - comments dropped, a comma
+# put back on each line - and stored only if the result is byte-identical to
+# the file the manifest expects (the "speaker" profile's SHA-256), so the store
+# never holds anything the importer would not have accepted. An imported curve
+# already in the store is left alone. Never fails the upgrade: the worst case
+# is a flat speaker until the owner imports the curve from Files from stock.
+#
+# apk's output reaches only the update log, so a failure also leaves a marker
+# for the settings page to show. The contract:
+#   /var/lib/biscuit/speaker-curve-not-kept (on the root filesystem: persist
+#   may be what is missing), mode 644, three key=value lines:
+#     reason=not-mounted|no-store|mismatch|write-failed
+#       not-mounted   persist was not mounted at /opt
+#       no-store      the store folder could not be made or the file converted
+#       mismatch      the converted file is not the manifest's EQ_50.cfg
+#       write-failed  it could not be moved into the store
+#     time=<seconds since the epoch, by the device clock>
+#     import=EQ_50.cfg
+#   It is written only when this script had a curve to keep and could not keep
+#   it. It is stale once /opt/persist/biscuit/assets/speaker/EQ_50.cfg exists:
+#   a reader ignores it then and may delete it, and this script deletes it
+#   whenever it finds the curve in the store.
+
+old=/usr/share/biscuit/eq/speaker.fir
+store=/opt/persist/biscuit/assets/speaker
+dest=$store/EQ_50.cfg
+want=8b0c40484c037f6a7e740721c7a5232b37fda603eedc1eec7c483666d852e763
+marker=/var/lib/biscuit/speaker-curve-not-kept
+
+[ -f "$dest" ] && { rm -f "$marker" 2>/dev/null; exit 0; }
+[ -f "$old" ] || exit 0
+
+# Only onto the persist partition itself (mounted at /opt). Written to the
+# root filesystem underneath an absent mount, the copy would be hidden the
+# moment persist is mounted, and the curve lost with no word said.
+persist_mounted() {
+	d=/opt/persist
+	while [ ! -d "$d" ] && [ "$d" != / ]; do d=${d%/*}; [ -n "$d" ] || d=/; done
+	[ "$(stat -c %d "$d" 2>/dev/null)" != "$(stat -c %d / 2>/dev/null)" ]
+}
+
+tmp=$store/.EQ_50.cfg.pre-upgrade
+why=not-mounted
+if persist_mounted; then
+	why=no-store
+	if mkdir -p "$store" 2>/dev/null &&
+	   grep -v '^#' "$old" | sed -e '/^$/d' -e 's/$/,/' > "$tmp" 2>/dev/null; then
+		why=mismatch
+		got=$(sha256sum "$tmp" 2>/dev/null | cut -d' ' -f1)
+		if [ "$got" = "$want" ]; then
+			why=write-failed
+			chmod 644 "$tmp"
+			if mv -f "$tmp" "$dest"; then
+				sync
+				rm -f "$marker" 2>/dev/null
+				echo "device-amazon-biscuit: kept the speaker correction curve as $dest"
+				exit 0
+			fi
+		fi
+	fi
+fi
+rm -f "$tmp" 2>/dev/null
+if mkdir -p "${marker%/*}" 2>/dev/null; then
+	{
+		echo "reason=$why"
+		echo "time=$(date +%s)"
+		echo "import=EQ_50.cfg"
+	} > "$marker" 2>/dev/null && chmod 644 "$marker" 2>/dev/null
+fi
+echo "device-amazon-biscuit: could not keep the speaker correction curve ($why);" \
+     "import EQ_50.cfg under Settings > Storage > Files from stock" >&2
+exit 0

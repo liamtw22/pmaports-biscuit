@@ -1,0 +1,26 @@
+--- a/sound/soc/mediatek/mt8163/mt8163-dai-i2s.c
++++ b/sound/soc/mediatek/mt8163/mt8163-dai-i2s.c
+@@ -636,6 +636,23 @@
+ 		ret = mt8163_enable_dl_src(afe, rate);
+ 		if (ret)
+ 			return ret;
++
++		/*
++		 * Stock keeps the second output serialiser running alongside
++		 * CON1 and drives O03/O04 as 16-bit. Program both here, before
++		 * the CON1 enable edge below, since the block latches its
++		 * configuration when it is enabled.
++		 */
++		ret = regmap_update_bits(afe->regmap, AFE_CONN_24BIT,
++					 GENMASK(4, 3), 0);
++		if (ret)
++			return ret;
++
++		ret = regmap_write(afe->regmap, AFE_I2S_CON3,
++				   val | BIT(AFE_I2S_M_I2S_EN_SHIFT) |
++				   AFE_I2S_M_I2S_WLEN);
++		if (ret)
++			return ret;
+ 	}
+ 
+ 	ret = regmap_update_bits(afe->regmap, i2s_priv->con_reg, mask, val);

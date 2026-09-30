@@ -1,0 +1,44 @@
+#!/sbin/openrc-run
+
+name="biscuit-va-leds"
+description="Light ring feedback for the voice assistant"
+
+# Bridges linux-voice-assistant's peripheral API (a root-only websocket at
+# /run/biscuit-peripheral/control.sock) onto biscuit-ring's control FIFO, and
+# registers the device's settings as Home Assistant entities. The assistant
+# holds Home Assistant off until this has registered, for at most 20 s, so a
+# boot without this service costs HA those seconds and these entities.
+#
+# Runs under the voice assistant's venv python because it needs `websockets`,
+# which is not installed system-wide.
+#
+# This service is deliberately TOLERANT of both of its dependencies being
+# absent: it reconnects to the peripheral API forever, and every FIFO write is
+# non-blocking and survives biscuit-ring not running. A light ring is cosmetic;
+# it must never wedge or delay anything.
+
+command="/usr/lib/linux-voice-assistant/bin/python"
+command_args="/usr/bin/biscuit-va-leds.py"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/biscuit-va-leds.log"
+error_log="/var/log/biscuit-va-leds.log"
+
+depend() {
+	# biscuit-ring owns the LEDs and the control FIFO.
+	need biscuit-ring
+	# The assistant provides the events. `after` rather than `need` so the ring
+	# service is not torn down when the assistant restarts - the bridge simply
+	# reconnects.
+	after biscuit-voice-assistant
+}
+
+start_pre() {
+	checkpath -f -m 0644 -o root:root "$output_log"
+}
+
+stop_post() {
+	# Never leave the ring lit showing a state that is no longer true.
+	[ -p /run/biscuit-ring/control ] && echo clear > /run/biscuit-ring/control 2>/dev/null
+	return 0
+}

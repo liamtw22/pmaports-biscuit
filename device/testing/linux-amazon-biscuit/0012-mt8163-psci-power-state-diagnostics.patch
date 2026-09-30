@@ -1,0 +1,59 @@
+--- a/arch/arm64/kernel/psci.c
++++ b/arch/arm64/kernel/psci.c
+@@ -61,8 +61,41 @@
+                 before, requested, after, res.a0);
+         iounmap(mcucfg);
+ }
+ 
++#define MT8163_SPM_BASE             0x10006000
++#define MT8163_INFRACFG_AO_BASE     0x10001000
++#define MT8163_SPM_PWR_STATUS       0x060c
++#define MT8163_SPM_PWR_STATUS_2ND   0x0610
++#define MT8163_CPU_BOOT_ADDR        0x0800
++
++static void mt8163_log_secondary_state(unsigned int cpu, const char *phase)
++{
++        void __iomem *spm = NULL, *infracfg = NULL;
++        u32 status, status2, bootaddr;
++
++        if (!cpu || !of_machine_is_compatible("mediatek,mt8163"))
++                return;
++
++        spm = ioremap(MT8163_SPM_BASE, 0x1000);
++        infracfg = ioremap(MT8163_INFRACFG_AO_BASE, 0x1000);
++        if (!spm || !infracfg) {
++                pr_warn("MT8163-SMP: CPU%u %s map failed\n", cpu, phase);
++                goto out;
++        }
++
++        status = readl_relaxed(spm + MT8163_SPM_PWR_STATUS);
++        status2 = readl_relaxed(spm + MT8163_SPM_PWR_STATUS_2ND);
++        bootaddr = readl_relaxed(infracfg + MT8163_CPU_BOOT_ADDR);
++        pr_info("MT8163-SMP: CPU%u %s pwr=%#x pwr2=%#x bootaddr=%#x\n",
++                cpu, phase, status, status2, bootaddr);
++out:
++        if (infracfg)
++                iounmap(infracfg);
++        if (spm)
++                iounmap(spm);
++}
++
+ static int __init cpu_psci_cpu_init(unsigned int cpu)
+ {
+ 	return 0;
+ }
+@@ -81,12 +114,14 @@
+ 
+ static int cpu_psci_cpu_boot(unsigned int cpu)
+ {
+ 	phys_addr_t pa_secondary_entry = __pa_symbol(secondary_entry);
++	mt8163_log_secondary_state(cpu, "before PSCI_CPU_ON");
+ 	int err = psci_ops.cpu_on(cpu_logical_map(cpu), pa_secondary_entry);
+ 	pr_info("MT8163-DIAG: PSCI CPU_ON cpu=%u mpidr=%llx entry=%pa ret=%d\n",
+ 	        cpu, (unsigned long long)cpu_logical_map(cpu),
+ 	        &pa_secondary_entry, err);
++	mt8163_log_secondary_state(cpu, "after PSCI_CPU_ON");
+ 	if (err && err != -EPERM)
+ 		pr_err("failed to boot CPU%d (%d)\n", cpu, err);
+ 
+ 	return err;

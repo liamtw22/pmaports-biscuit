@@ -1,0 +1,16 @@
+#!/sbin/openrc-run
+
+name="biscuit-sendspin-watchdog"
+description="Re-announces sendspin when Music Assistant stops connecting"
+command="/usr/bin/biscuit-sendspin-watchdog"
+supervisor="supervise-daemon"
+output_log="/var/log/biscuit-sendspin-watchdog.log"
+error_log="/var/log/biscuit-sendspin-watchdog.log"
+
+# `after`, deliberately not `need`. Restarting a service also restarts the
+# services that need it, so with `need` the watchdog's own
+# `rc-service biscuit-sendspin restart` would stop the watchdog halfway
+# through the restart it was performing.
+depend() {
+	after biscuit-sendspin
+}

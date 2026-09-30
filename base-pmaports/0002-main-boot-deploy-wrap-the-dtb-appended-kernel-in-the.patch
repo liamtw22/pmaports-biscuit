@@ -1,0 +1,81 @@
+From 49d7b172a18ba11262da6d7fc0a00f3d22141cd7 Mon Sep 17 00:00:00 2001
+From: liamtw22 <31185529+liamtw22@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 12:00:00 +0000
+Subject: [PATCH 2/3] main/boot-deploy: wrap the dtb-appended kernel in the
+ MediaTek header
+
+add_mtk_header() wraps the bare kernel (vmlinuz-mtk), while create_bootimg()
+looks for the wrapper on the dtb-appended kernel (vmlinuz-dtb-mtk) whenever
+deviceinfo_append_dtb=true. The two never meet, so the boot image ships a
+kernel with no MediaTek header. MediaTek's LK then treats it as a 32-bit
+kernel and takes a data abort about eleven seconds into every boot.
+
+Wrap the dtb-appended file when append_dtb is set. Also moves the package
+to 0.24.0 and bumps pkgrel to 1 so that it outranks upstream's 0.24.0-r0;
+an older local version would be silently replaced by the binary repo's
+unpatched build.
+
+Needed by amazon-biscuit (MT8163): check that the first four bytes of the
+boot.img kernel are 88 16 88 58.
+---
+ main/boot-deploy/APKBUILD                     |  8 +++++---
+ .../fix-append-dtb-mtk-header.patch           | 20 +++++++++++++++++++
+ 2 files changed, 25 insertions(+), 3 deletions(-)
+ create mode 100644 main/boot-deploy/fix-append-dtb-mtk-header.patch
+
+diff --git a/main/boot-deploy/APKBUILD b/main/boot-deploy/APKBUILD
+index 128d4c52f..010fa5ae0 100644
+--- a/main/boot-deploy/APKBUILD
++++ b/main/boot-deploy/APKBUILD
+@@ -1,13 +1,14 @@
+ maintainer="Clayton Craft <clayton@craftyguy.net>"
+ pkgname=boot-deploy
+-pkgver=0.23.0
+-pkgrel=0
++pkgver=0.24.0
++pkgrel=1
+ pkgdesc="tool for finalizing and deploying boot related files"
+ url="https://gitlab.postmarketos.org/postmarketOS/boot-deploy"
+ arch="noarch"
+ license="GPL-2.0-or-later"
+ source="
+ 	https://gitlab.postmarketos.org/postmarketOS/boot-deploy/-/archive/$pkgver/boot-deploy-$pkgver.tar.gz
++	fix-append-dtb-mtk-header.patch
+ 
+ 	os-customization
+ 	"
+@@ -29,6 +30,7 @@ package() {
+ 		"$pkgdir"/usr/share/mkinitfs-triggers/boot-deploy
+ }
+ sha512sums="
+-f5b2bb096207944b5821065506ed1123be2b70dfabe91572cfa44e986f9f71d712ae0863bd845d9c120623bc0ce5963fb3f278d072b5525b12399592f129277c  boot-deploy-0.23.0.tar.gz
++a1cb647508a3ce63b5579ad085b5f4d92b2992a3060ce02896cc77c65866fddb321c96fcc21e8ef9a5c1131c56c8a8163c732400d85d4d506f38310d52f845f5  boot-deploy-0.24.0.tar.gz
++e530065ad784827b16c931d8b72b4903109f63a2b645ba775066e122064bdfc7af11134921cbea2f7281d827d1703a5095acf8bdfe2e8554c42827588df30625  fix-append-dtb-mtk-header.patch
+ a243975b9850d9933e0f917f7eb38fc4a76ea658c3dcc56f035f60ee6c62d6740c1107143b8210bdc0231d4c9b6b2003e458120985604eb09649322d359ae89f  os-customization
+ "
+diff --git a/main/boot-deploy/fix-append-dtb-mtk-header.patch b/main/boot-deploy/fix-append-dtb-mtk-header.patch
+new file mode 100644
+index 000000000..0e9bf91e5
+--- /dev/null
++++ b/main/boot-deploy/fix-append-dtb-mtk-header.patch
+@@ -0,0 +1,20 @@
++Fix add_mtk_header() to wrap the DTB-appended kernel file (vmlinuz-dtb)
++instead of the plain kernel when deviceinfo_append_dtb=true, so the
++resulting vmlinuz-dtb-mtk matches what create_bootimg() already looks
++for. Without this, the MTK-wrapped file never includes the appended
++DTB, and create_bootimg() silently falls back to an unwrapped
++vmlinuz-dtb that MediaTek's legacy LK can't parse.
++
++--- a/boot-deploy-functions.sh
+++++ b/boot-deploy-functions.sh
++@@ -467,6 +467,9 @@ add_mtk_header() {
++	if [ -n "${_kernel_label}" ]; then
++		log_arrow "kernel: adding MediaTek header"
++		# shellcheck disable=SC3060
++		local _kernel="$work_dir/$kernel_filename"
+++		if [ "${deviceinfo_append_dtb}" = "true" ] && [ -f "${_kernel}-dtb" ]; then
+++			_kernel="${_kernel}-dtb"
+++		fi
++		rm -f "${_kernel}-mtk"
++		mtk-mkimage "${_kernel_label}" "$_kernel" "${_kernel}-mtk"
++		additional_files="$additional_files $(basename "${_kernel}"-mtk)"

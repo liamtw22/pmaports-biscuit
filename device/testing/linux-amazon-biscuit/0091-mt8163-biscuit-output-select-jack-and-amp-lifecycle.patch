@@ -1,0 +1,391 @@
+Make the speaker amplifier follow output selection, not stream lifecycle,
+add 3.5 mm jack detection, and drive the DAC mux on route change.
+
+Measured on Device #1 on 2026-08-11:
+
+  - The two pops reproduce on pure digital silence, so they are made by the
+    enable/disable sequence and not by audio content.
+  - They appear as an identical doublet at BOTH amplifier enable and disable.
+    The AW8736 "Mode 3" pulse train runs on only one of those two transitions,
+    so it cannot be what makes them sound alike. The pulse train is removed
+    here for fidelity with the vendor, not as the fix.
+  - Toggling the codec's MFP2 mute mid-stream is completely silent, so neither
+    half of the doublet is the codec mute.
+
+What is left is the amplifier transition itself. The vendor never power-cycles
+the amplifier per stream: mt_soc_codec_63xx.c guards the enable behind the
+codec device power state, so a second stream start touches nothing. This driver
+enabled it in .startup and disabled it in .shutdown, so every play/stop cycle
+produced a doublet at each end.
+
+Amplifier state becomes (output == Speaker) AND (a stream is running, or one
+stopped less than MT8163_BISCUIT_AMP_IDLE_MS ago). The idle grace period is
+what removes the pops between tracks while still letting the amplifier power
+down when nothing is playing, so the device does not sit amplifying its own
+noise floor. An amp_on flag makes the transition idempotent, mirroring the
+vendor's device-power guard.
+
+Transitions use a single clean level change with the vendor's timings:
+msleep(25) warm-up after enable (stock SPK_WARM_UP_TIME) and udelay(500) after
+disable. Biscuit takes its amplifier gain from hardware, not from a pulse
+train - the four aud_pins_extamp_gain0..3 states exist in the vendor DTS but
+are bound by nothing, in the source drop and in all three shipped DTBs alike,
+so AudDrv_GPIO_EXTAMP_Gain_Set() fails on every call.
+
+The DAC mux (GPIO124) is now driven on route change. It was acquired at probe
+and never referenced again, so it stayed latched to the speaker path and the
+amplifier kept being fed whichever output the UCM selected - the reason muting
+MFP2 never cured the whine on the jack.
+
+Jack detection matches the vendor: GPIO26, high means inserted, which
+accdet_amzn.c reads as a plain GPIO level rather than through the MT6323
+accessory comparator. Insertion switches the output automatically. The
+userspace half of the archived port (99-biscuit-hp-switch.rules) cannot work
+on mainline, because it keys on the Android switch class, which was never
+upstreamed.
+
+diff -urN '--exclude=.git' r184work/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts r184new/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -207,6 +207,9 @@
+ 
+ 		/* EVT: GPIO122 enables the amplifier; GPIO124 selects speaker DAC. */
+ 		speaker-amp-gpios = <&pio 122 0>;
++
++		/* Vendor accdet pin: high means a jack is inserted. */
++		hp-det-gpios = <&pio 26 0>;
+ 		mic-codec = <&mic_adc_a>, <&mic_adc_b>,
+ 					      <&mic_adc_c>, <&mic_adc_d>;
+ 		audio-fpga = <&dough_fpga>;
+diff -urN '--exclude=.git' r184work/sound/soc/mediatek/mt8163/mt8163-biscuit.c r184new/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -12,15 +12,43 @@
+ #include <linux/pm_runtime.h>
+ #include <linux/gpio/consumer.h>
+ #include <linux/delay.h>
++#include <linux/mutex.h>
++#include <linux/workqueue.h>
+ #include <linux/platform_device.h>
+ #include <sound/soc.h>
++#include <sound/jack.h>
+ 
+ #define MT8163_BISCUIT_AIC32X4_DOUTCTL          0x35
+ #define MT8163_BISCUIT_AIC32X4_MFP2_GPIO_UNMUTE 0x04
++#define MT8163_BISCUIT_AIC32X4_MFP2_GPIO_MUTE   0x05
++
++/* Vendor timings: SPK_WARM_UP_TIME, and the settle after a disable. */
++#define MT8163_BISCUIT_AMP_WARMUP_MS	25
++#define MT8163_BISCUIT_AMP_SETTLE_US	500
++
++/*
++ * How long the amplifier stays up after the last stream closes. Long enough to
++ * cover the gap between tracks - which is what stops the pops - but short
++ * enough that an idle device is not left amplifying its own noise floor.
++ */
++#define MT8163_BISCUIT_AMP_IDLE_MS	10000
++
++enum mt8163_biscuit_output {
++	MT8163_BISCUIT_OUT_SPEAKER = 0,
++	MT8163_BISCUIT_OUT_HEADPHONES,
++};
+ 
+ struct mt8163_biscuit_priv {
+ 	struct gpio_desc *speaker_amp;
+ 	struct gpio_desc *dacmux;
++	struct gpio_desc *hp_det;
++	struct snd_soc_jack jack;
++	struct notifier_block jack_nb;
++	struct delayed_work amp_off_work;
++	struct mutex lock;
++	enum mt8163_biscuit_output output;
++	unsigned int streams;
++	bool amp_on;
+ 	struct snd_soc_card card;
+ 	struct snd_soc_dai_link links[3];
+ 	struct snd_soc_dai_link_component cpus[3];
+@@ -48,34 +76,131 @@
+ };
+ 
+ /*
+- * Biscuit's vendor non-legacy path enables the external amplifier directly.
+- * AW8736 timed mode is optional there and is not enabled for Biscuit.
++ * A single clean level change, which is what the vendor's device-tree path
++ * does (AudDrv_GPIO_EXTAMP_Select -> one pinctrl_select_state). The AW8736
++ * pulse train only ever existed on the CONFIG_MTK_LEGACY branch, which Biscuit
++ * does not build, and measurement showed it is not what makes the pops: the
++ * artefact is an identical doublet at both enable and disable, and the train
++ * runs on only one of those. Caller must hold priv->lock.
+  */
+-static void mt8163_biscuit_speaker_amp(struct mt8163_biscuit_priv *priv, bool on)
++static void mt8163_biscuit_amp_set(struct mt8163_biscuit_priv *priv, bool on)
++{
++	if (!priv->speaker_amp || priv->amp_on == on)
++		return;
++
++	if (on) {
++		gpiod_set_value_cansleep(priv->speaker_amp, 1);
++		msleep(MT8163_BISCUIT_AMP_WARMUP_MS);
++	} else {
++		gpiod_set_value_cansleep(priv->speaker_amp, 0);
++		udelay(MT8163_BISCUIT_AMP_SETTLE_US);
++	}
++
++	priv->amp_on = on;
++}
++
++static void mt8163_biscuit_amp_off_work(struct work_struct *work)
++{
++	struct mt8163_biscuit_priv *priv =
++		container_of(to_delayed_work(work), struct mt8163_biscuit_priv,
++			     amp_off_work);
++
++	mutex_lock(&priv->lock);
++	if (!priv->streams)
++		mt8163_biscuit_amp_set(priv, false);
++	mutex_unlock(&priv->lock);
++}
++
++/* Caller must hold priv->lock. */
++static void mt8163_biscuit_apply_output(struct mt8163_biscuit_priv *priv)
+ {
+-       if (!priv->speaker_amp)
+-               return;
++	if (priv->output == MT8163_BISCUIT_OUT_HEADPHONES) {
++		/*
++		 * Amplifier down first, then move the mux, so it is never live
++		 * across the mux transition.
++		 */
++		mt8163_biscuit_amp_set(priv, false);
++		if (priv->dacmux)
++			gpiod_set_value_cansleep(priv->dacmux, 1);
++		return;
++	}
+ 
+-       if (!on) {
+-               gpiod_set_value_cansleep(priv->speaker_amp, 0);
+-               udelay(500);
+-               return;
+-       }
+-
+-       /* Vendor AW8736 Mode 3: three rising edges after a low reset. */
+-       gpiod_set_value_cansleep(priv->speaker_amp, 0);
+-       usleep_range(1000, 1200);
+-       gpiod_set_value_cansleep(priv->speaker_amp, 1);
+-       udelay(2);
+-       gpiod_set_value_cansleep(priv->speaker_amp, 0);
+-       udelay(2);
+-       gpiod_set_value_cansleep(priv->speaker_amp, 1);
+-       udelay(2);
+-       gpiod_set_value_cansleep(priv->speaker_amp, 0);
+-       udelay(2);
+-       gpiod_set_value_cansleep(priv->speaker_amp, 1);
+-       usleep_range(25000, 26000);
+-       dev_info(priv->card.dev, "BISCUIT: AW8736 Mode 3 selected\n");
++	if (priv->dacmux)
++		gpiod_set_value_cansleep(priv->dacmux, 0);
++	if (priv->streams)
++		mt8163_biscuit_amp_set(priv, true);
++}
++
++static const char * const mt8163_biscuit_output_text[] = {
++	"Speaker", "Headphones",
++};
++
++static SOC_ENUM_SINGLE_EXT_DECL(mt8163_biscuit_output_enum,
++				mt8163_biscuit_output_text);
++
++static int mt8163_biscuit_output_get(struct snd_kcontrol *kcontrol,
++				     struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
++	struct mt8163_biscuit_priv *priv = snd_soc_card_get_drvdata(card);
++
++	ucontrol->value.enumerated.item[0] = priv->output;
++	return 0;
++}
++
++static int mt8163_biscuit_output_put(struct snd_kcontrol *kcontrol,
++				     struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_card *card = snd_kcontrol_chip(kcontrol);
++	struct mt8163_biscuit_priv *priv = snd_soc_card_get_drvdata(card);
++	unsigned int item = ucontrol->value.enumerated.item[0];
++	int changed = 0;
++
++	if (item >= ARRAY_SIZE(mt8163_biscuit_output_text))
++		return -EINVAL;
++
++	mutex_lock(&priv->lock);
++	if (priv->output != item) {
++		priv->output = item;
++		mt8163_biscuit_apply_output(priv);
++		changed = 1;
++	}
++	mutex_unlock(&priv->lock);
++
++	return changed;
++}
++
++static const struct snd_kcontrol_new mt8163_biscuit_controls[] = {
++	SOC_ENUM_EXT("Output Select", mt8163_biscuit_output_enum,
++		     mt8163_biscuit_output_get, mt8163_biscuit_output_put),
++};
++
++/*
++ * Vendor jack sensing: accdet_amzn.c reads GPIO26 as a plain level, high means
++ * inserted, rather than using the MT6323 accessory comparator.
++ */
++static struct snd_soc_jack_gpio mt8163_biscuit_jack_gpio = {
++	.name		= "hp-det",
++	.report		= SND_JACK_HEADPHONE,
++	.debounce_time	= 200,
++};
++
++static int mt8163_biscuit_jack_notify(struct notifier_block *nb,
++				      unsigned long status, void *data)
++{
++	struct mt8163_biscuit_priv *priv =
++		container_of(nb, struct mt8163_biscuit_priv, jack_nb);
++	enum mt8163_biscuit_output want = (status & SND_JACK_HEADPHONE) ?
++		MT8163_BISCUIT_OUT_HEADPHONES : MT8163_BISCUIT_OUT_SPEAKER;
++
++	mutex_lock(&priv->lock);
++	if (priv->output != want) {
++		priv->output = want;
++		mt8163_biscuit_apply_output(priv);
++	}
++	mutex_unlock(&priv->lock);
++
++	return NOTIFY_OK;
+ }
+ 
+ static int mt8163_biscuit_be_startup(struct snd_pcm_substream *substream)
+@@ -83,23 +208,28 @@
+ 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+ 	struct mt8163_biscuit_priv *priv = snd_soc_card_get_drvdata(rtd->card);
+ 
+-	mt8163_biscuit_speaker_amp(priv, true);
++	unsigned int mfp2;
++	int ret;
++
++	mutex_lock(&priv->lock);
++	priv->streams++;
++	cancel_delayed_work(&priv->amp_off_work);
++	if (priv->output == MT8163_BISCUIT_OUT_SPEAKER)
++		mt8163_biscuit_amp_set(priv, true);
++	mfp2 = priv->output == MT8163_BISCUIT_OUT_HEADPHONES ?
++		MT8163_BISCUIT_AIC32X4_MFP2_GPIO_MUTE :
++		MT8163_BISCUIT_AIC32X4_MFP2_GPIO_UNMUTE;
++	mutex_unlock(&priv->lock);
+ 
+ 	/*
+ 	 * EVT routes the external amplifier mute through TLV320 MFP2.
+ 	 * Vendor audio programs DOUTCTL=0x04: GPIO output enabled, low = unmute.
+ 	 */
+-	{
+-		int ret = snd_soc_component_write(
+-			snd_soc_rtd_to_codec(rtd, 0)->component,
+-			MT8163_BISCUIT_AIC32X4_DOUTCTL,
+-			MT8163_BISCUIT_AIC32X4_MFP2_GPIO_UNMUTE);
+-
+-		if (ret < 0)
+-			dev_warn(rtd->card->dev, "MFP2 amplifier unmute failed: %d\n", ret);
+-		else
+-			dev_info(rtd->card->dev, "MFP2 amplifier unmuted\n");
+-	}
++	ret = snd_soc_component_write(snd_soc_rtd_to_codec(rtd, 0)->component,
++				      MT8163_BISCUIT_AIC32X4_DOUTCTL, mfp2);
++	if (ret < 0)
++		dev_warn(rtd->card->dev, "MFP2 write failed: %d\n", ret);
++
+ 	return 0;
+ }
+ 
+@@ -108,7 +238,44 @@
+ 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
+ 	struct mt8163_biscuit_priv *priv = snd_soc_card_get_drvdata(rtd->card);
+ 
+-	mt8163_biscuit_speaker_amp(priv, false);
++	mutex_lock(&priv->lock);
++	if (priv->streams)
++		priv->streams--;
++	if (!priv->streams)
++		schedule_delayed_work(&priv->amp_off_work,
++				      msecs_to_jiffies(MT8163_BISCUIT_AMP_IDLE_MS));
++	mutex_unlock(&priv->lock);
++}
++
++static void mt8163_biscuit_amp_cleanup(void *data)
++{
++	struct mt8163_biscuit_priv *priv = data;
++
++	cancel_delayed_work_sync(&priv->amp_off_work);
++	mutex_lock(&priv->lock);
++	mt8163_biscuit_amp_set(priv, false);
++	mutex_unlock(&priv->lock);
++}
++
++static int mt8163_biscuit_late_probe(struct snd_soc_card *card)
++{
++	struct mt8163_biscuit_priv *priv = snd_soc_card_get_drvdata(card);
++	int ret;
++
++	if (!priv->hp_det)
++		return 0;
++
++	ret = snd_soc_card_jack_new(card, "Headphone Jack", SND_JACK_HEADPHONE,
++				    &priv->jack);
++	if (ret)
++		return ret;
++
++	priv->jack_nb.notifier_call = mt8163_biscuit_jack_notify;
++	snd_soc_jack_notifier_register(&priv->jack, &priv->jack_nb);
++
++	mt8163_biscuit_jack_gpio.gpiod_dev = card->dev;
++	return snd_soc_jack_add_gpios(&priv->jack, 1,
++				      &mt8163_biscuit_jack_gpio);
+ }
+ 
+ 
+@@ -444,14 +611,25 @@
+ 
+ 	pm_runtime_enable(&pdev->dev);
+ 
+-	/* r104: GPIO124 low selects the physical speaker route. */
+-
++	/* GPIO124 low selects the amplifier, high selects the 3.5 mm jack. */
+ 	priv->dacmux = devm_gpiod_get_optional(dev, "dacmux", GPIOD_OUT_LOW);
+-
+ 	if (IS_ERR(priv->dacmux))
++		return dev_err_probe(dev, PTR_ERR(priv->dacmux),
++				     "failed to get DAC mux GPIO\n");
+ 
+-	    return PTR_ERR(priv->dacmux);
+-
++	/* Vendor accdet: GPIO26, high means a jack is inserted. */
++	priv->hp_det = devm_gpiod_get_optional(dev, "hp-det", GPIOD_IN);
++	if (IS_ERR(priv->hp_det))
++		return dev_err_probe(dev, PTR_ERR(priv->hp_det),
++				     "failed to get headphone detect GPIO\n");
++
++	mutex_init(&priv->lock);
++	INIT_DELAYED_WORK(&priv->amp_off_work, mt8163_biscuit_amp_off_work);
++	priv->output = MT8163_BISCUIT_OUT_SPEAKER;
++
++	ret = devm_add_action_or_reset(dev, mt8163_biscuit_amp_cleanup, priv);
++	if (ret)
++		return ret;
+ 
+ 	priv->speaker_amp = devm_gpiod_get_optional(dev, "speaker-amp", GPIOD_OUT_LOW);
+ 	if (IS_ERR(priv->speaker_amp))
+@@ -550,6 +728,9 @@
+ 	snd_soc_card_set_drvdata(&priv->card, priv);
+ 	priv->card.dapm_routes = mt8163_biscuit_routes;
+ 	priv->card.num_dapm_routes = ARRAY_SIZE(mt8163_biscuit_routes);
++	priv->card.controls = mt8163_biscuit_controls;
++	priv->card.num_controls = ARRAY_SIZE(mt8163_biscuit_controls);
++	priv->card.late_probe = mt8163_biscuit_late_probe;
+ 
+ 
+ 	/*

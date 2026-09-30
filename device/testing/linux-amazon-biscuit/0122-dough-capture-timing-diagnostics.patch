@@ -1,0 +1,167 @@
+--- a/drivers/misc/dough-fpga.c
++++ b/drivers/misc/dough-fpga.c
+@@ -23,6 +23,7 @@
+ #include <linux/mutex.h>
+ #include <linux/slab.h>
+ #include <linux/kthread.h>
++#include <linux/timekeeping.h>
+ #include <linux/sched.h>
+ #include <linux/spi/spi.h>
+ #include <sound/pcm.h>
+@@ -79,6 +80,29 @@
+  */
+ #define DOUGH_POLL_US		6000
+ #define DOUGH_POLL_MAX_US	7000
++/* Root-only runtime trial knob; retain the shipped 6--7 ms policy by default. */
++static unsigned int capture_poll_us = DOUGH_POLL_US;
++
++static int dough_poll_set(const char *val, const struct kernel_param *kp)
++{
++	unsigned int candidate;
++	int ret = kstrtouint(val, 0, &candidate);
++
++	if (ret)
++		return ret;
++	if (candidate < 500 || candidate > DOUGH_POLL_US)
++		return -ERANGE;
++	WRITE_ONCE(*(unsigned int *)kp->arg, candidate);
++	return 0;
++}
++
++static const struct kernel_param_ops dough_poll_ops = {
++	.set = dough_poll_set,
++	.get = param_get_uint,
++};
++module_param_cb(capture_poll_us, &dough_poll_ops, &capture_poll_us, 0644);
++MODULE_PARM_DESC(capture_poll_us, "Capture poll minimum (500..6000 us; upper slack 1000 us)");
++
+ #define DOUGH_PERIOD_BYTES	(DOUGH_FRAMES_PER_READ * DOUGH_CHANNELS * DOUGH_SAMPLE_BYTES)
+ 
+ struct dough_priv {
+@@ -98,6 +122,16 @@
+ 	unsigned long read_errors;
+ 	unsigned int last_nonzero;
+ 	unsigned int last_nframes;
++	/* Cached metadata only: reading capture_timing never clocks the FPGA. */
++	u64 timing_last_start_ns;
++	u64 timing_max_gap_ns;
++	u64 timing_max_transfer_ns;
++	u64 timing_reads;
++	u64 timing_gap_over_16ms;
++	u64 timing_transfer_over_8ms;
++	u64 timing_full_reads;
++	u64 timing_excess_frames;
++	u64 timing_overrun_flags;
+ 	/* Result of the last one-shot raw read, for raw_read. */
+ 	char raw_result[400];
+ 	u8 *xfer_buf;
+@@ -459,6 +493,17 @@
+ 		}
+ 
+ 		mutex_lock(&priv->lock);
++		{
++			u64 now = ktime_get_raw_ns();
++			u64 gap = priv->timing_last_start_ns ?
++				now - priv->timing_last_start_ns : 0;
++
++			priv->timing_max_gap_ns = max(priv->timing_max_gap_ns, gap);
++			if (gap > 16000000)
++				priv->timing_gap_over_16ms++;
++			priv->timing_last_start_ns = now;
++			priv->timing_reads++;
++		}
+ 		priv->reads++;
+ 		if (dough_read_block(priv)) {
+ 			priv->read_errors++;
+@@ -473,6 +518,13 @@
+ 			priv->last_nonzero = nz;
+ 			priv->last_nframes = priv->xfer_buf[19] |
+ 					    (priv->xfer_buf[20] << 8);
++			if (priv->last_nframes >= DOUGH_FRAMES_PER_READ)
++				priv->timing_full_reads++;
++			if (priv->last_nframes > DOUGH_FRAMES_PER_READ)
++				priv->timing_excess_frames += priv->last_nframes - DOUGH_FRAMES_PER_READ;
++			if (priv->xfer_buf[25])
++				priv->timing_overrun_flags++;
++
+ 
+ 			/*
+ 			 * The device latches its framing when the I2S mode
+@@ -491,9 +543,21 @@
+ 			if (READ_ONCE(priv->substream))
+ 				dough_deliver(priv);
+ 		}
++		{
++			u64 transfer = ktime_get_raw_ns() - priv->timing_last_start_ns;
++
++			priv->timing_max_transfer_ns = max(priv->timing_max_transfer_ns, transfer);
++			if (transfer > 8000000)
++				priv->timing_transfer_over_8ms++;
++		}
+ 		mutex_unlock(&priv->lock);
+ 
+-		usleep_range(DOUGH_POLL_US, DOUGH_POLL_MAX_US);
++		/* Sample once so a concurrent parameter write cannot invert the range. */
++		{
++			unsigned int poll = READ_ONCE(capture_poll_us);
++
++			usleep_range(poll, poll + 1000);
++		}
+ 	}
+ 
+ 	return 0;
+@@ -535,6 +599,15 @@
+ 	priv->written = 0;
+ 	priv->period_pos = 0;
+ 	priv->armed = false;
++	priv->timing_last_start_ns = 0;
++	priv->timing_max_gap_ns = 0;
++	priv->timing_max_transfer_ns = 0;
++	priv->timing_reads = 0;
++	priv->timing_gap_over_16ms = 0;
++	priv->timing_transfer_over_8ms = 0;
++	priv->timing_full_reads = 0;
++	priv->timing_excess_frames = 0;
++	priv->timing_overrun_flags = 0;
+ 
+ 	/*
+ 	 * Start the thread here rather than in trigger, which runs with a
+@@ -654,6 +727,30 @@
+ }
+ static DEVICE_ATTR_RO(capture_debug);
+ 
++/* Cached per-stream counters. No raw_read/fpga_status SPI transaction here. */
++static ssize_t capture_timing_show(struct device *dev,
++				  struct device_attribute *attr, char *buf)
++{
++	struct dough_priv *priv = dev_get_drvdata(dev);
++	ssize_t len;
++
++	mutex_lock(&priv->lock);
++	len = sysfs_emit(buf,
++		"reads %llu max_gap_us %llu max_read_deliver_us %llu gap_over_16ms %llu read_deliver_over_8ms %llu full_reads %llu reported_excess_frames %llu overrun_flags %llu poll_us %u\n",
++		(unsigned long long)priv->timing_reads,
++		(unsigned long long)(priv->timing_max_gap_ns / 1000),
++		(unsigned long long)(priv->timing_max_transfer_ns / 1000),
++		(unsigned long long)priv->timing_gap_over_16ms,
++		(unsigned long long)priv->timing_transfer_over_8ms,
++		(unsigned long long)priv->timing_full_reads,
++		(unsigned long long)priv->timing_excess_frames,
++		(unsigned long long)priv->timing_overrun_flags,
++		READ_ONCE(capture_poll_us));
++	mutex_unlock(&priv->lock);
++	return len;
++}
++static DEVICE_ATTR_RO(capture_timing);
++
+ static ssize_t fpga_mode_store(struct device *dev,
+ 				       struct device_attribute *attr,
+ 				       const char *buf, size_t count)
+@@ -807,6 +904,7 @@
+ static struct attribute *dough_attrs[] = {
+ 	&dev_attr_fpga_status.attr,
+ 	&dev_attr_capture_debug.attr,
++	&dev_attr_capture_timing.attr,
+ 	&dev_attr_capture_dump.attr,
+ 	&dev_attr_raw_read.attr,
+ 	&dev_attr_fpga_mode.attr,

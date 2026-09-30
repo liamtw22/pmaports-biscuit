@@ -1,0 +1,124 @@
+{
+ "_comment": [
+  "Expected content of the owner-imported stock audio assets. HASHES ONLY - no vendor",
+  "content is shipped here or anywhere else in this package, and the device runs the pmOS",
+  "chain when these files are absent.",
+  "",
+  "This replaces the size checks that biscuit-mic-stream.sh and the settings layer used to",
+  "make. A size check passes a truncated-to-the-right-length file and, worse, passes a file",
+  "from the WRONG GENERATION that happens to match - which is the failure this exists to",
+  "catch, because the two chains are disjoint and a wrong-generation file would be loaded as",
+  "coefficients and produce silence or noise rather than an error.",
+  "",
+  "Cost, measured on this hardware: 5 ms to hash all four Fire OS 6 files in process, 31 ms",
+  "through one busybox sha256sum fork. A branch restart already costs about ten seconds, so",
+  "the earlier reasoning that hashing would be wasted work was wrong by three orders of",
+  "magnitude.",
+  "",
+  "required=false means the chain runs without the file - vad_lite.tflite is the stock DNN",
+  "voice detector, and the energy prototype is a working alternative, qualified separately.",
+  "An optional file that is PRESENT is still verified: a corrupt model would be loaded and",
+  "would gate adaptation on nonsense rather than refusing.",
+  "",
+  "The firmware profile is MediaTek's MT6625L WLAN firmware, which the driver requests by the bare name WIFI_RAM_CODE. It is owner-imported for the same reason the audio assets are: it is not ours to redistribute. Unlike the Bluetooth ROM patches and the FPGA bitstream it CAN be imported, because wlan_mt6625l is a loadable module that comes up around t=35 s - the others are requested by built-in drivers at t=0.6-1.2 s, seconds before any filesystem exists, which is why they are still compiled into the kernel."
+ ],
+ "_source": "release-work-20260916/profiles/assets-fireos{5,6}.json, schema biscuit-profile-asset-contract-v2",
+ "profiles": {
+  "fireos5": {
+   "directory": "/usr/share/biscuit",
+   "files": [
+    {
+     "name": "biscuit-stock-fbf.cfg",
+     "bytes": 460701,
+     "sha256": "0160b5a6d2d925e001959966dd4fc7d45c7bbc7f9a3b7cc17a7a24f9071ced7b",
+     "required": true
+    },
+    {
+     "name": "biscuit-stock-filterbank-640.cfg",
+     "bytes": 12513,
+     "sha256": "6a79256741c25ebcd0c4fad23c0ea817ea8d51c70c6ba80d060e29e86709d3d3",
+     "required": true
+    }
+   ]
+  },
+  "fireos6": {
+   "directory": "/usr/share/biscuit/fireos6",
+   "files": [
+    {
+     "name": "AFE.cfg",
+     "bytes": 56965,
+     "sha256": "72a335225fb03f3210ea9dfea740164a8cafae51e5363ddc76f14f19397225fe",
+     "required": true
+    },
+    {
+     "name": "coefs_FBFV2_LowLatency_8beams.cfg",
+     "bytes": 573372,
+     "sha256": "b28ec42ab80fb92a6ce5a01e9dc01db2d001a629c9dda9dbc5248779b7cc01f6",
+     "required": true
+    },
+    {
+     "name": "coefs_FilterBank_AnalysisSynthesis_768cvxGLow.cfg",
+     "bytes": 15708,
+     "sha256": "19f3daf3c4de8ab33b7f2ec1807a5e6ea017c57c454d842c597a6f905c70e953",
+     "required": true
+    },
+    {
+     "name": "vad_lite.tflite",
+     "bytes": 50704,
+     "sha256": "eb5025b9f5b00a66c690968835bf46ebdd27143a8e5edb7e6dc87e2a48097012",
+     "required": false
+    }
+   ]
+  },
+  "firmware": {
+   "directory": "/lib/firmware",
+   "activation": "copy",
+   "files": [
+    {
+     "name": "WIFI_RAM_CODE",
+     "bytes": 373840,
+     "sha256": "9669cc9b03cfdc5e8fd4fd6e14c4c4050e8c196738ca4707eea12f14a6a8e64c",
+     "required": true
+    },
+    {
+     "name": "mediatek/ROMv2_lm_patch_1_0_hdr.bin",
+     "required": true,
+     "variants": [
+      {
+       "bytes": 127640,
+       "sha256": "eb54a744348ead1b7d6e4fb497c947bf07fb911d07f117990788c4594a717a5b",
+       "note": "Fire OS 5"
+      },
+      {
+       "bytes": 128744,
+       "sha256": "6642cfd4fd67accf27b0f9615e4cd0941417ddbc3b5bef1004fe1eb59235146f",
+       "note": "Fire OS 6"
+      }
+     ]
+    },
+    {
+     "name": "mediatek/ROMv2_lm_patch_1_1_hdr.bin",
+     "required": true,
+     "variants": [
+      {
+       "bytes": 52320,
+       "sha256": "8728c89a6ff464a83e29e981d0b4538de19d8adc333246246fcb80d85dc84e19",
+       "note": "Fire OS 5"
+      },
+      {
+       "bytes": 52160,
+       "sha256": "c4aa6dfc54b82f496d97be8eb3979232730f51a3fdfad34192b91d0b87b06a56",
+       "note": "Fire OS 6"
+      }
+     ]
+    },
+    {
+     "name": "i2s_to_spi_v34.bin",
+     "bytes": 30964,
+     "sha256": "77a558bacdaaf9e343f02f2d74f27a5f2bb2dc8b6d66cc2499b60ed14ef62fe6",
+     "required": true
+    }
+   ]
+  }
+ }
+}

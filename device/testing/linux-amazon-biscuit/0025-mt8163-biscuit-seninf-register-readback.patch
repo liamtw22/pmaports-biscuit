@@ -1,0 +1,42 @@
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -97,8 +97,29 @@
+ 
+     reg &= ~mask;
+     reg |= value & mask;
+     writel(reg, priv->mclk_base + offset);
++}
++
++static void mt8163_biscuit_log_mclk_registers(
++        struct mt8163_biscuit_priv *priv)
++{
++    u32 top = readl(priv->mclk_base + MT8163_MCLK_TOP_CTRL);
++    u32 ctrl = readl(priv->mclk_base + MT8163_MCLK_SENINF1_CTRL);
++    u32 mux = readl(priv->mclk_base + MT8163_MCLK_SENINF1_MUX_CTRL);
++    u32 ph = readl(priv->mclk_base + MT8163_MCLK_TG1_PH_CNT);
++    u32 senck = readl(priv->mclk_base + MT8163_MCLK_TG1_SEN_CK);
++    u32 div = (senck >> 16) & 0x3f;
++
++    dev_info(priv->dev,
++             "CMMCLK: regs top=%08x ctrl=%08x mux=%08x ph=%08x senck=%08x\n",
++             top, ctrl, mux, ph, senck);
++    dev_info(priv->dev,
++             "CMMCLK: decoded ctrl0=%u ctrl31=%u mux_en=%u mclk_en=%u "
++             "pcen=%u tgsel=%u clkcnt=%u implied_hz=%u\n",
++             ctrl & 1, (ctrl >> 31) & 1, (mux >> 31) & 1,
++             (ph >> 29) & 1, (ph >> 31) & 1, ph & 3, div,
++             48000000 / (div + 1));
+ }
+ 
+ static int mt8163_biscuit_enable_mclk(struct mt8163_biscuit_priv *priv)
+ {
+@@ -145,8 +166,9 @@
+                             0x80000000, 0x80000000);
+     mt8163_biscuit_mclk_rmw(priv, MT8163_MCLK_SENINF1_CTRL,
+                             0x00000001, 0x00000001);
+ 
++    mt8163_biscuit_log_mclk_registers(priv);
+     priv->mclk_enabled = true;
+     dev_info(priv->dev, "CMMCLK: sensor timing programmed\n");
+     return 0;
+ 

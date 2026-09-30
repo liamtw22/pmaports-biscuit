@@ -1,0 +1,24 @@
+# The wireless regulatory database, put into the INITRAMFS rather than left on
+# the rootfs where wireless-regdb installs it.
+#
+# WHY IT HAS TO BE HERE. cfg80211 is built into this kernel (CONFIG_CFG80211=y)
+# and asks the firmware loader for regulatory.db during its own init. Measured
+# on the device:
+#
+#     [1.622] faux_driver regulatory: Direct firmware load for regulatory.db
+#             failed with error -2
+#     [1.625] Freeing unused kernel memory
+#     [7.141] EXT4-fs (loop0p2): mounted filesystem ... r/w
+#
+# The request happens five and a half seconds before the real rootfs exists, so
+# it can only ever be satisfied from the initramfs. cfg80211 does not retry and
+# cannot be reloaded, so a copy that arrives later is never seen - installing
+# wireless-regdb alone changes nothing, and neither does a reboot.
+#
+# WHAT IT UNLOCKS. Without the database the kernel falls back to its built-in
+# world domain, which marks every 5 GHz rule PASSIVE-SCAN and refuses `iw reg
+# set` outright - the domain stays "country 00" no matter what is asked for.
+# That is what limits this device on 5 GHz, and it is a software gap rather
+# than anything about the radio, which advertises Band 2 with 68 frequencies.
+/lib/firmware/regulatory.db
+/lib/firmware/regulatory.db.p7s

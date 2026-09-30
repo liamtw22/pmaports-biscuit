@@ -1,0 +1,35 @@
+Hand the already-held headphone-detect descriptor to snd_soc_jack_add_gpios().
+
+r184 failed to register the sound card on Device #1:
+
+  ASoC: Cannot get gpio at index 0: -16
+  ASoC error (-16): at snd_soc_card_late_probe() on mt8163-biscuit
+  error -EBUSY: failed to register sound card
+
+probe acquires hp-det with devm_gpiod_get_optional(), and then
+snd_soc_jack_add_gpios() requested the same GPIO a second time through its
+gpiod_dev/name lookup. The second request returns -EBUSY, and because it runs
+from late_probe the whole card goes down with it - so r184 had no audio at all.
+
+struct snd_soc_jack_gpio carries a .desc field for exactly this case: when it
+is set, the helper skips the lookup and adopts the descriptor. Set it and drop
+the gpiod_dev assignment.
+
+diff -urN '--exclude=.git' r184new/sound/soc/mediatek/mt8163/mt8163-biscuit.c r185new/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -273,7 +273,13 @@
+ 	priv->jack_nb.notifier_call = mt8163_biscuit_jack_notify;
+ 	snd_soc_jack_notifier_register(&priv->jack, &priv->jack_nb);
+ 
+-	mt8163_biscuit_jack_gpio.gpiod_dev = card->dev;
++	/*
++	 * Hand over the descriptor already held from probe. Letting
++	 * snd_soc_jack_add_gpios() look it up requests the same GPIO a second
++	 * time, which fails with -EBUSY and, because this runs from
++	 * late_probe, takes the whole card down with it.
++	 */
++	mt8163_biscuit_jack_gpio.desc = priv->hp_det;
+ 	return snd_soc_jack_add_gpios(&priv->jack, 1,
+ 				      &mt8163_biscuit_jack_gpio);
+ }

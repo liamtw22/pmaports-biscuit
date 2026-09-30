@@ -1,0 +1,17 @@
+#!/sbin/openrc-run
+description="Best-effort microphone direction for the light ring"
+supervisor="supervise-daemon"
+command="/usr/bin/nice"
+command_args="-n 15 /usr/bin/python3 /usr/bin/biscuit-direction.py"
+output_log="/var/log/biscuit-direction.log"
+error_log="/var/log/biscuit-direction.log"
+respawn_delay=3
+respawn_max=0
+respawn_period=1800
+depend() {
+    need biscuit-mic-hub
+}
+
+start_pre() {
+	/usr/bin/python3 /usr/bin/biscuit_services.py direction || { eerror "Direction light is off or paused (Settings: Light ring, Direction)"; return 1; }
+}

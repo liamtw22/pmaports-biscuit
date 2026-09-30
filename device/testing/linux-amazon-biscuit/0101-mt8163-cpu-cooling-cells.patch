@@ -1,0 +1,78 @@
+Give the CPU nodes #cooling-cells, so the cpu-thermal cooling map can bind.
+
+The other half of r193 makes the sensor read. This makes the reading do
+something.
+
+cpu-thermal declares a passive trip at 80C with a cooling map onto all four
+CPUs:
+
+	map0 {
+		trip = <&target>;
+		cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>,
+				 <&cpu1 ...>, <&cpu2 ...>, <&cpu3 ...>;
+	};
+
+but none of cpu@0..cpu@3 declares #cooling-cells, and
+of_cpufreq_cooling_register() requires it: it looks the property up on the CPU's
+device node and registers nothing at all when it is absent. So cpufreq-dt never
+created a cooling device, the map had nothing to bind to, and
+/sys/class/thermal contained zero cooling_deviceN entries - which is exactly
+what was observed after r191 and written off as a side effect of the sensor
+returning -ENODATA. It was not; it is independent, and it would have survived
+the auxadc fix.
+
+dtc had been saying so the whole time, on every build:
+
+	Warning (cooling_device_property):
+	/thermal-zones/cpu-thermal/cooling-maps/map0:
+	Missing property '#cooling-cells' in node /cpus/cpu@0 or bad phandle
+	(referred from cooling-device[0])
+
+Without this the device still reads temperatures, and the 115C critical trip
+still works - that one is handled by the thermal core directly rather than by a
+cooling device, so there was always a backstop - but nothing throttles at the
+80C passive trip, which is the entire point of a passive trip. Upstream
+mt8173.dtsi carries #cooling-cells = <2> on its CPU nodes for this reason.
+
+The GPU zone's maps reference &gpu, which already has #cooling-cells = <2> but
+is status = "disabled", so those maps stay unbound. Separate question, left
+alone here.
+
+This goes in mt8163.dtsi rather than in the board dts because it describes the
+SoC, not the board.
+
+diff -urN '--exclude=.git' r193new/arch/arm64/boot/dts/mediatek/mt8163.dtsi r193cool/arch/arm64/boot/dts/mediatek/mt8163.dtsi
+--- a/arch/arm64/boot/dts/mediatek/mt8163.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt8163.dtsi
+@@ -136,6 +136,7 @@
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+ 			next-level-cache = <&l2_0>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		cpu1: cpu@1 {
+@@ -156,6 +157,7 @@
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+ 			next-level-cache = <&l2_0>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		cpu2: cpu@2 {
+@@ -176,6 +178,7 @@
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+ 			next-level-cache = <&l2_0>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		cpu3: cpu@3 {
+@@ -196,6 +199,7 @@
+ 			d-cache-line-size = <64>;
+ 			d-cache-sets = <128>;
+ 			next-level-cache = <&l2_0>;
++			#cooling-cells = <2>;
+ 		};
+ 
+ 		cpu-map {

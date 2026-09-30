@@ -1,0 +1,65 @@
+--- linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/peripheral_api.py
++++ linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/peripheral_api.py
+@@ -185,7 +185,9 @@
+     """
+ 
+     DEFAULT_VOLUME_STEP: float = 0.05
+-    LATE_ENTITY_RECONNECT_DEBOUNCE_S: float = 1.5
++    # Registrations arrive as a burst from a peripheral. Give the burst time
++    # to finish, then reconnect once so ESPHome enumerates the complete set.
++    LATE_ENTITY_RECONNECT_DEBOUNCE_S: float = 2.0
+     LATE_ENTITY_RECONNECT_COOLDOWN_S: float = 60.0
+ 
+     def __init__(
+@@ -535,6 +537,8 @@
+         if satellite is not None:
+             satellite.register_pending_sensors()
+ 
++        self._schedule_ha_reconnect_for_late_entity("sensor", object_id)
++
+     def _register_number(self, data: Dict[str, Any], satellite: Any) -> None:
+         """Register a Number declared by a peripheral. BISCUIT addition.
+ 
+@@ -574,6 +578,8 @@
+         if satellite is not None:
+             satellite.register_pending_numbers()
+ 
++        self._schedule_ha_reconnect_for_late_entity("number", object_id)
++
+     def _register_switch(self, data: Dict[str, Any], satellite: Any) -> None:
+         """Register a Switch declared by a peripheral. BISCUIT addition.
+ 
+@@ -607,6 +613,8 @@
+         if satellite is not None:
+             satellite.register_pending_switches()
+ 
++        self._schedule_ha_reconnect_for_late_entity("switch", object_id)
++
+     def _register_light(self, data: Dict[str, Any], satellite: Any) -> None:
+         """Register a Light declared by a peripheral.
+ 
+@@ -694,11 +702,11 @@
+ 
+         if self._pending_entity_reconnect_task is not None and not self._pending_entity_reconnect_task.done():
+             _LOGGER.debug(
+-                "Coalescing late %s registration for '%s' into pending HA reconnect",
++                "Delaying HA reconnect until late %s '%s' finishes the registration burst",
+                 entity_kind,
+                 entity_id,
+             )
+-            return
++            self._pending_entity_reconnect_task.cancel()
+ 
+         async def _trigger() -> None:
+             try:
+--- linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/satellite.py
++++ linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/satellite.py
+@@ -477,7 +477,7 @@
+             def _set(val, oid=object_id):
+                 value = bool(val)
+                 self.state.peripheral_switch_values[oid] = value
+-                self._emit("switch_command", {"object_id": oid, "value": value})
++                self._emit("switch_command", {"object_id": oid, "state": value})
+ 
+             entity = PeripheralSwitchEntity(
+                 server=self,

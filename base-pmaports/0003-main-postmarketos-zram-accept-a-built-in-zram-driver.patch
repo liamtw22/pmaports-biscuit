@@ -1,0 +1,56 @@
+From e3defc5cde649c2901036ae0a39af6cd11bc6029 Mon Sep 17 00:00:00 2001
+From: liamtw22 <31185529+liamtw22@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 12:00:00 +0000
+Subject: [PATCH 3/3] main/postmarketos-zram: accept a built-in zram driver
+
+modprobe fails when zram is built into the kernel rather than a module,
+and zramstart then gave up. Treat an existing /dev/zram0 as proof that
+the driver is present.
+
+Note: upstream has since moved to postmarketos-zram 4-r0, which outranks
+this 3-r1, so current images install upstream's package and this patch is
+not in them. It is kept so the base matches the tree r294 was built from.
+---
+ main/postmarketos-zram/APKBUILD  | 4 ++--
+ main/postmarketos-zram/zramstart | 7 ++++++-
+ 2 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/main/postmarketos-zram/APKBUILD b/main/postmarketos-zram/APKBUILD
+index d70ca11a3..127f4aeff 100644
+--- a/main/postmarketos-zram/APKBUILD
++++ b/main/postmarketos-zram/APKBUILD
+@@ -1,7 +1,7 @@
+ maintainer="Clayton Craft <clayton@craftyguy.net>"
+ pkgname=postmarketos-zram
+ pkgver=3
+-pkgrel=0
++pkgrel=1
+ pkgdesc="zram swap configuration for postmarketOS"
+ url="https://postmarketos.org"
+ arch="noarch"
+@@ -27,6 +27,6 @@ package() {
+ sha512sums="
+ ca91be78a47c00f40f3e645f79a72b2cd7ba3f080e2feb256998bb121f64c0394041f2ed822ad307ac36e86398b8175b3284dc5097a7017947e520a304b0a37d  postmarketos-zram-swap.initd
+ 5c1787bc2d597726113aaf3ea59229b5a56b8fc3446c78406a202e163a0b37ac564a87b2acc1c1f1a7dcdc18ff863c45e13aa687b93fa537c5ef000b9e8d6d19  postmarketos-zram-swap.service
+-b08a59a624e4b56f2f88987ce4e246b86effea31bb9a3f8d1581c1bf3444bc0f9ed96a17bf64b5942bd9cc1eca5ab8a295f8220d86d52ed6ac95f9362ba587ac  zramstart
++9f2782256e1d3b7fbba7323e874e39ef6309764a2708b067d12d8851b49c6fe40d5f0cedac6532e74cf9fc0055331e49cc4664503778aa8ccdbc3ec2840237d0  zramstart
+ a70d2bcb26c1af42a71811a1c1cd2984808f5ce09d7af52b26824cf5c15c8a9c819691fc6290cf3028226fca39f6e7a495546c5573c582a14d5a8c7c65dbfe3e  zramstop
+ "
+diff --git a/main/postmarketos-zram/zramstart b/main/postmarketos-zram/zramstart
+index 529c21ec8..ed7812446 100644
+--- a/main/postmarketos-zram/zramstart
++++ b/main/postmarketos-zram/zramstart
+@@ -74,7 +74,12 @@ if swapon --show=NAME --noheadings | grep -q '^/dev/zram'; then
+ 	exit 0
+ fi
+ 
+-modprobe -q zram num_devices=1
++# modprobe returns failure when ZRAM is built into the kernel. In that case,
++# a pre-created /dev/zram0 proves that the driver is already available.
++if ! modprobe -q zram num_devices=1 && [ ! -b /dev/zram0 ]; then
++        echo "ZRAM driver is unavailable" >&2
++        exit 1
++fi
+ dev="$(zramctl -f -a "$algo" -s "${size}"M)"
+ mkswap "$dev" >/dev/null
+ swapon "$dev" >/dev/null

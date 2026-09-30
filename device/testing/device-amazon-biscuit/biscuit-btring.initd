@@ -1,0 +1,32 @@
+#!/sbin/openrc-run
+# Bluetooth connect/disconnect animations on the light ring.
+#
+# Separate from biscuit-audio because it needs D-Bus and bluetoothd, and the
+# mute button and jack switching must keep working without them.
+
+name="biscuit-btring"
+description="Play stock's Bluetooth animations on connect and disconnect"
+
+command="/usr/bin/python3"
+command_args="/usr/bin/biscuit-btring.py"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/biscuit-btring.log"
+error_log="/var/log/biscuit-btring.log"
+
+depend() {
+	need localmount dbus
+	after bluetooth biscuit-ring
+}
+
+start_pre() {
+	if [ ! -r /usr/bin/biscuit-btring.py ]; then
+		eerror "biscuit-btring.py is not installed"
+		return 1
+	fi
+	if ! command -v gdbus >/dev/null 2>&1; then
+		eerror "gdbus is not installed"
+		return 1
+	fi
+	return 0
+}

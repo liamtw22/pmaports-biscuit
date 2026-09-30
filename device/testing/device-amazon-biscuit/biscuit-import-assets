@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+"""Import the owner's own stock DSP assets, on the device, with no developer tooling.
+
+The files named here are unmodified Amazon vendor files. They are NOT
+redistributable, so the package ships only hashes and this importer, and the
+owner supplies the content from their own device or their own copy of the
+firmware. Nothing here downloads anything, and nothing here reaches off the
+device: the previous importer ran on a developer's laptop and copied in over SSH
+with a hard-coded key path and IP, which no owner can use.
+
+Four things this has to get right, each with a failure mode that is silent
+rather than loud:
+
+  * **Verify before installing anything.** Every file is checked by exact size
+    and SHA-256, and a single mismatch installs nothing. A partially correct set
+    would be loaded as coefficients and produce silence or noise rather than an
+    error.
+
+  * **Survive a flash and an upgrade.** The chain reads its assets from
+    /usr/share/biscuit, which belongs to the package and is replaced wholesale by
+    both. The durable copy therefore lives on the persist partition and is linked
+    into place; `activate` re-links after an upgrade and is safe to run always.
+    A profile marked activation=none (the speaker curve) is read by its
+    consumer straight from the store, so there is nothing to link.
+
+  * **Name the generation.** Fire OS 6 cannot supply the Fire OS 5 profile at all
+    - neither coefs_FBF.cfg nor coefs_FilterBank_640.cfg exists there - and most
+    units in the field are Fire OS 6. An owner must learn that BEFORE conversion
+    destroys system_a, not after, which is what `detect` is for.
+
+  * **Say which kind of wrong.** Absent is not an error: the device runs the pmOS
+    chain and is fully functional. A wrong hash is corruption. A hash matching a
+    DIFFERENT profile's file is a generation mismatch, and that deserves its own
+    message because the two chains are disjoint and the symptom is identical.
+
+Files are matched by CONTENT, not by name. The manifest carries our names
+(biscuit-stock-fbf.cfg) while a firmware tree carries Amazon's (coefs_FBF.cfg),
+and paths moved between generations - firmware is /system/etc/firmware on Fire
+OS 5 and /system/vendor/firmware on Fire OS 6. Hashing what is there and matching
+it against the manifest sidesteps every one of those differences. Size is a
+pre-filter so a large tree costs a stat per file rather than a read.
+
+Exit codes, because a settings agent and an installer both call this:
+  0  did what was asked
+  1  usage or I/O error
+  2  the source cannot supply the requested profile
+  3  installed assets are corrupt or from the wrong generation
+"""
+from __future__ import annotations
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import sys
+
+MANIFEST = "/usr/share/biscuit/biscuit-profile-assets.json"
+STORE = "/opt/persist/biscuit/assets"
+READ_CHUNK = 1 << 20
+
+
+def log(message):
+    print("biscuit-import-assets: " + message, file=sys.stderr)
+
+
+def digest(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as handle:
+        while True:
+            block = handle.read(READ_CHUNK)
+            if not block:
+                break
+            h.update(block)
+    return h.hexdigest()
+
+
+def load_manifest(path):
+    try:
+        with open(path) as handle:
+            doc = json.load(handle)
+    except (OSError, ValueError) as err:
+        log("cannot read the manifest at %s: %s" % (path, err))
+        return None
+    profiles = doc.get("profiles")
+    if not isinstance(profiles, dict) or not profiles:
+        log("the manifest at %s names no profiles" % path)
+        return None
+    return profiles
+
+
+def variants(item):
+    """Every (bytes, sha256) this file is allowed to be.
+
+    A file can legitimately have more than one correct content. The Bluetooth
+    ROM patches differ between Fire OS 5 and Fire OS 6 - 127,640 vs 128,744 bytes
+    for patch_1_0 - and most units in the field are Fire OS 6, so a manifest
+    naming one generation's hash would refuse the firmware most owners actually
+    have. WIFI_RAM_CODE, by contrast, is byte-identical on both.
+
+    Sizes differ between variants too, so size and hash travel together and a
+    variant is matched as a pair.
+    """
+    if item.get("variants"):
+        return item["variants"]
+    return [{"bytes": item["bytes"], "sha256": item["sha256"]}]
+
+
+def expected_index(profiles):
+    """sha256 -> (profile, name), across every profile.
+
+    Built over all profiles on purpose: it is what turns "this file is wrong"
+    into "this file is the other generation's", which is a different problem
+    with a different fix.
+    """
+    index = {}
+    for profile, spec in profiles.items():
+        for item in spec.get("files", []):
+            for v in variants(item):
+                index[v["sha256"]] = (profile, item["name"])
+    return index
+
+
+def scan_source(root, profiles):
+    """Find manifest files anywhere under root, by content.
+
+    Returns sha256 -> path. Only files whose size matches something the manifest
+    expects are hashed, so pointing this at a whole system tree is cheap.
+    """
+    wanted_sizes = set()
+    for spec in profiles.values():
+        for item in spec.get("files", []):
+            for v in variants(item):
+                wanted_sizes.add(v["bytes"])
+    found = {}
+    for dirpath, _dirnames, filenames in os.walk(root, onerror=lambda e: None):
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            try:
+                if os.path.islink(path) or not os.path.isfile(path):
+                    continue
+                if os.path.getsize(path) not in wanted_sizes:
+                    continue
+                found.setdefault(digest(path), path)
+            except OSError:
+                continue
+    return found
+
+
+def profile_status(spec, found):
+    """Which of a profile's files the source has, split required/optional."""
+    have, missing_required, missing_optional = [], [], []
+    for item in spec.get("files", []):
+        if any(v["sha256"] in found for v in variants(item)):
+            have.append(item)
+        elif item.get("required", True):
+            missing_required.append(item)
+        else:
+            missing_optional.append(item)
+    return have, missing_required, missing_optional
+
+
+def cmd_detect(args, profiles):
+    root = pathlib.Path(args.source)
+    if not root.is_dir():
+        log("%s is not a directory" % root)
+        return 1
+    found = scan_source(str(root), profiles)
+    supplied = []
+    for profile in sorted(profiles):
+        have, need, optional = profile_status(profiles[profile], found)
+        total = len(profiles[profile].get("files", []))
+        if not need:
+            supplied.append(profile)
+            extra = ""
+            if optional:
+                extra = " (%d optional file(s) absent; the chain runs without them)" % len(optional)
+            print("%-9s CAN be supplied - %d/%d files present%s"
+                  % (profile, len(have), total, extra))
+        else:
+            print("%-9s cannot be supplied - missing %s"
+                  % (profile, ", ".join(i["name"] for i in need)))
+    if not supplied:
+        print("")
+        print("This source supplies no complete profile. That is not a fault: the device")
+        print("runs its own chain, which needs none of these files.")
+        return 2
+    return 0
+
+
+def cmd_import(args, profiles):
+    if args.profile not in profiles:
+        log("unknown profile %s; the manifest has %s"
+            % (args.profile, ", ".join(sorted(profiles))))
+        return 1
+    root = pathlib.Path(args.source)
+    if not root.is_dir():
+        log("%s is not a directory" % root)
+        return 1
+
+    spec = profiles[args.profile]
+    found = scan_source(str(root), profiles)
+    have, need, optional = profile_status(spec, found)
+    if need:
+        log("%s cannot be supplied from %s - missing %s"
+            % (args.profile, root, ", ".join(i["name"] for i in need)))
+        log("run 'detect' to see what this source can supply")
+        return 2
+    for item in optional:
+        log("optional file absent, the chain runs without it: %s" % item["name"])
+
+    # Refuse up front if it will not fit. The persist partition is 16 MiB and
+    # already holds settings, Wi-Fi credentials and any imported earcons, so a
+    # full one is a realistic outcome rather than a theoretical one. Staging
+    # catches it either way, but ENOSPC halfway through a copy is a worse thing
+    # to hand an owner than a sentence naming the shortfall. Doubled because
+    # the previous store is kept until the swap succeeds.
+    # Largest variant, since which one a source supplies is not known yet.
+    need = sum(max(v["bytes"] for v in variants(item)) for item in have) * 2
+    try:
+        root_for_space = pathlib.Path(args.store)
+        while not root_for_space.exists() and root_for_space.parent != root_for_space:
+            root_for_space = root_for_space.parent
+        free = shutil.disk_usage(root_for_space).free
+        if free < need:
+            log("not enough room on %s: %d KiB free, %d KiB needed"
+                % (root_for_space, free // 1024, need // 1024))
+            return 1
+    except (OSError, ValueError):
+        pass          # If free space cannot be read, staging still protects us.
+
+    # Stage the whole set, then move it into place. A half-written store is the
+    # outcome worth engineering against: the chain would load some of one
+    # generation's coefficients beside none of the other's.
+    store = pathlib.Path(args.store) / args.profile
+    staging = pathlib.Path(args.store) / ("." + args.profile + ".incoming")
+    previous = pathlib.Path(args.store) / ("." + args.profile + ".previous")
+    try:
+        shutil.rmtree(staging, ignore_errors=True)
+        staging.mkdir(parents=True)
+        for item in have:
+            chosen = next(v for v in variants(item) if v["sha256"] in found)
+            source = found[chosen["sha256"]]
+            target = staging / item["name"]
+            # A name may carry a subdirectory: the Bluetooth driver asks for
+            # "mediatek/ROMv2_lm_patch_1_0_hdr.bin", not a bare filename.
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+            # Re-verify what LANDED, not what was read. A short write or a full
+            # filesystem is exactly the corruption this exists to refuse.
+            if digest(target) != chosen["sha256"] or target.stat().st_size != chosen["bytes"]:
+                log("verification failed AFTER copying %s - nothing installed" % item["name"])
+                shutil.rmtree(staging, ignore_errors=True)
+                return 3
+            print("verified %s (%d bytes%s)"
+                  % (item["name"], chosen["bytes"],
+                     ", " + chosen["note"] if chosen.get("note") else ""))
+        shutil.rmtree(previous, ignore_errors=True)
+        if store.exists():
+            store.rename(previous)
+        staging.rename(store)
+        shutil.rmtree(previous, ignore_errors=True)
+    except OSError as err:
+        log("could not write the store at %s: %s" % (args.store, err))
+        shutil.rmtree(staging, ignore_errors=True)
+        return 1
+
+    print("imported %d file(s) for %s into %s" % (len(have), args.profile, store))
+    return cmd_activate(args, profiles)
+
+
+def link_atomically(target, link_path):
+    """Replace link_path with a symlink to target, atomically.
+
+    os.symlink cannot overwrite, and unlink-then-symlink leaves a window in which
+    the chain sees no file at all. Build it under a temporary name in the same
+    directory and rename over.
+    """
+    tmp = link_path.with_name("." + link_path.name + ".new")
+    if tmp.is_symlink() or tmp.exists():
+        tmp.unlink()
+    os.symlink(target, tmp)
+    os.replace(tmp, link_path)
+
+
+def copy_atomically(source, target):
+    """Place a real copy at target, atomically.
+
+    Used where a symlink would not survive the trip. Firmware listed in
+    /usr/share/mkinitfs/files is copied into the initramfs cpio, and an initramfs
+    has no /opt - a symlink into the persist store would arrive dangling, and the
+    FPGA and Bluetooth drivers would find nothing at t=0.6 s. Copying costs about
+    584 KB on the root filesystem and removes the question entirely.
+    """
+    tmp = target.with_name("." + target.name + ".new")
+    shutil.copyfile(source, tmp)
+    os.replace(tmp, target)
+
+
+def cmd_activate(args, profiles):
+    """Put the store's contents where the consumer reads them.
+
+    Safe to run at any time, including with nothing imported, which is why the
+    post-upgrade hook calls it unconditionally.
+    """
+    wanted = [args.profile] if getattr(args, "profile", None) else sorted(profiles)
+    linked = 0
+    for profile in wanted:
+        spec = profiles.get(profile)
+        if not spec:
+            continue
+        # A profile its consumer reads straight from the store (the speaker
+        # curve: biscuit-dsp opens it there) has nothing to put in place.
+        if spec.get("activation") == "none":
+            continue
+        store = pathlib.Path(args.store) / profile
+        directory = pathlib.Path(spec.get("directory", "/usr/share/biscuit"))
+        for item in spec.get("files", []):
+            source = store / item["name"]
+            if not source.is_file():
+                continue
+            try:
+                link_path = directory / item["name"]
+                # Never over the stored file itself: a link to itself would
+                # replace the owner's only copy with a dangling name.
+                if os.path.realpath(str(link_path)) == os.path.realpath(str(source)):
+                    continue
+                link_path.parent.mkdir(parents=True, exist_ok=True)
+                if spec.get("activation") == "copy":
+                    if link_path.is_symlink():
+                        link_path.unlink()
+                    copy_atomically(str(source), link_path)
+                else:
+                    link_atomically(str(source), link_path)
+                linked += 1
+            except OSError as err:
+                log("could not activate %s: %s" % (item["name"], err))
+                return 1
+    if linked:
+        print("activated %d file(s)" % linked)
+    else:
+        print("nothing imported to activate; the device runs its own chain")
+    return 0
+
+
+def cmd_deactivate(args, profiles):
+    spec = profiles.get(args.profile)
+    if not spec:
+        log("unknown profile %s" % args.profile)
+        return 1
+    directory = pathlib.Path(spec.get("directory", "/usr/share/biscuit"))
+    removed = 0
+    if spec.get("activation") == "none":
+        # Read from the store, never placed anywhere: nothing to take away.
+        # Removing the store copy is the caller's job, as for every profile.
+        print("deactivated 0 file(s) for %s" % args.profile)
+        return 0
+    for item in spec.get("files", []):
+        path = directory / item["name"]
+        # Only ever remove what we put there. A real file we did not write is
+        # not ours to delete, so a copied profile is matched by CONTENT against
+        # the store before removing anything.
+        if spec.get("activation") == "copy":
+            stored = pathlib.Path(args.store) / args.profile / item["name"]
+            try:
+                if path.is_file() and stored.is_file() and digest(path) == digest(stored):
+                    path.unlink()
+                    removed += 1
+            except OSError as err:
+                log("could not remove %s: %s" % (path, err))
+            continue
+        if path.is_symlink() and args.store in os.readlink(path):
+            try:
+                path.unlink()
+                removed += 1
+            except OSError as err:
+                log("could not remove %s: %s" % (path, err))
+    print("deactivated %d file(s) for %s" % (removed, args.profile))
+    return 0
+
+
+def cmd_verify(args, profiles):
+    index = expected_index(profiles)
+    worst = 0
+    for profile in sorted(profiles):
+        spec = profiles[profile]
+        directory = pathlib.Path(spec.get("directory", "/usr/share/biscuit"))
+        if spec.get("activation") == "none":
+            # Its consumer reads the store; check the store --store names.
+            directory = pathlib.Path(args.store) / profile
+        states = []
+        for item in spec.get("files", []):
+            path = directory / item["name"]
+            if not path.exists():
+                states.append((item["name"], "absent"))
+                continue
+            try:
+                got = digest(path)
+            except OSError as err:
+                states.append((item["name"], "unreadable (%s)" % err))
+                worst = max(worst, 3)
+                continue
+            match = next((v for v in variants(item) if v["sha256"] == got), None)
+            if match:
+                states.append((item["name"],
+                               "ok" + (" (%s)" % match["note"] if match.get("note") else "")))
+            elif got in index:
+                other_profile, other_name = index[got]
+                states.append((item["name"], "WRONG GENERATION - this is %s's %s"
+                               % (other_profile, other_name)))
+                worst = max(worst, 3)
+            else:
+                states.append((item["name"], "CORRUPT - hash %s, expected %s"
+                               % (got[:16],
+                                  " or ".join(v["sha256"][:16] for v in variants(item)))))
+                worst = max(worst, 3)
+        present = [s for s in states if s[1] != "absent"]
+        if not present:
+            print("%-9s not imported - the device runs its own chain" % profile)
+            continue
+        # startswith, not equality: a matched variant reports "ok (Fire OS 6)"
+        # and an exact comparison called a perfectly good import a PROBLEM.
+        bad = [s for s in states
+               if not s[1].startswith("ok") and s[1] != "absent"]
+        print("%-9s %s" % (profile, "OK" if not bad else "PROBLEM"))
+        for name, state in states:
+            print("    %-34s %s" % (name, state))
+    return worst
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Import and verify owner-supplied stock DSP assets.")
+    parser.add_argument("--manifest", default=MANIFEST,
+                        help="asset manifest (default: %s)" % MANIFEST)
+    # Overridable so the whole import/activate/verify cycle can be exercised
+    # against a scratch directory without touching a device that is working.
+    parser.add_argument("--store", default=STORE,
+                        help="durable asset store (default: %s)" % STORE)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("detect", help="say which profiles a directory can supply")
+    p.add_argument("source")
+    p.set_defaults(func=cmd_detect)
+
+    p = sub.add_parser("import", help="verify and install a profile's assets")
+    p.add_argument("source")
+    p.add_argument("--profile", required=True)
+    p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("activate", help="re-link imported assets (run after an upgrade)")
+    p.add_argument("--profile")
+    p.set_defaults(func=cmd_activate)
+
+    p = sub.add_parser("deactivate", help="unlink one profile's assets")
+    p.add_argument("--profile", required=True)
+    p.set_defaults(func=cmd_deactivate)
+
+    p = sub.add_parser("verify", help="check what is installed")
+    p.set_defaults(func=cmd_verify)
+
+    args = parser.parse_args()
+    profiles = load_manifest(args.manifest)
+    if profiles is None:
+        return 1
+    return args.func(args, profiles)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

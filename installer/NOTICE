@@ -1,0 +1,380 @@
+NOTICE: the biscuit installer and its TWRP zips
+================================================
+
+The installer (the zip scripts, build_zips.py, biscuit-tool.c, the tools and
+the documentation) is Copyright (c) 2025-2026 liamtw22 and contributors, under
+the MIT licence in LICENSE.
+
+This project is not affiliated with or endorsed by Amazon or postmarketOS.
+
+Each zip carries this NOTICE, LICENSE and COPYING.GPL-2.0. It also carries two
+static armv7 programs that include third-party code under other licences:
+
+
+1. bin/busybox: BusyBox 1.38.0, GPL-2.0-only
+---------------------------------------------
+
+BusyBox is copyright its many authors (see AUTHORS and the file headers in its
+source). It is licensed under version 2 of the GNU General Public License only;
+the full text is in COPYING.GPL-2.0.
+
+bin/busybox is Alpine Linux's busybox-static package, unmodified:
+  package      busybox-static 1.38.0-r7, arch armv7, Alpine edge "main"
+  file         /bin/busybox.static in that package
+  sha256       a364319202fcbf94904916afb5e11e7dc5e210b480696716a8b7ea387af20581
+  built from   aports commit 768a1e8764c8ddda36995c2a4ba8ab9a9c78ef91,
+               main/busybox (APKBUILD, 42 patches, busyboxconfig)
+  upstream     busybox-1.38.0.tar.bz2 from https://busybox.net/downloads/
+               sha512 ba3866f0a9ceabafe8c4d43afaf031bc5554742903b3d08e59a8592351dc09c6
+                      e091bb0cd2852b3ed1e79e841de871bac4dc48d9bb1cef9309c3f8495aba0d00
+
+The complete corresponding source is published beside the zips on the
+project's GitHub release (https://github.com/liamtw22/pmaports-biscuit/releases),
+as the busybox source bundle:
+  busybox-1.38.0.tar.bz2                 the upstream source
+  aports-main-busybox-768a1e87.tar.gz    Alpine's build recipe at that commit:
+                                         APKBUILD, patches and busyboxconfig
+  busybox-static-1.38.0-r7.armv7.apk     the binary package bin/busybox came from
+Alpine's recipe is also at
+  https://gitlab.alpinelinux.org/alpine/aports/-/tree/768a1e8764c8ddda36995c2a4ba8ab9a9c78ef91/main/busybox
+
+bin/busybox statically links musl libc (section 3) and may contain libgcc
+runtime routines (section 5).
+
+
+2. bin/biscuit-tool: this project's code, with zlib, musl and libgcc
+---------------------------------------------------------------------
+
+biscuit-tool is built from zip/biscuit-tool.c (MIT, this project) by
+tools/build-biscuit-tool.sh, with Alpine edge armv7's gcc 15.2.0-r9,
+binutils 2.45.1-r1, musl-dev 1.2.6-r3 and zlib-static 1.3.2-r0. It statically
+links zlib 1.3.2 (section 4), musl libc (section 3) and libgcc (section 5).
+
+
+3. musl libc (MIT and compatible permissive licences)
+-----------------------------------------------------
+
+Both programs statically link musl 1.2.6. musl's COPYRIGHT file follows in
+full, then the two BSD licences it refers to that apply to code linked on
+armv7.
+
+  musl as a whole is licensed under the following standard MIT license:
+
+  ----------------------------------------------------------------------
+  Copyright © 2005-2020 Rich Felker, et al.
+
+  Permission is hereby granted, free of charge, to any person obtaining
+  a copy of this software and associated documentation files (the
+  "Software"), to deal in the Software without restriction, including
+  without limitation the rights to use, copy, modify, merge, publish,
+  distribute, sublicense, and/or sell copies of the Software, and to
+  permit persons to whom the Software is furnished to do so, subject to
+  the following conditions:
+
+  The above copyright notice and this permission notice shall be
+  included in all copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+  EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+  MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+  IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+  CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+  TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+  SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  ----------------------------------------------------------------------
+
+  Authors/contributors include:
+
+  A. Wilcox
+  Ada Worcester
+  Alex Dowad
+  Alex Suykov
+  Alexander Monakov
+  Andre McCurdy
+  Andrew Kelley
+  Anthony G. Basile
+  Aric Belsito
+  Arvid Picciani
+  Bartosz Brachaczek
+  Benjamin Peterson
+  Bobby Bingham
+  Boris Brezillon
+  Brent Cook
+  Chris Spiegel
+  Clément Vasseur
+  Daniel Micay
+  Daniel Sabogal
+  Daurnimator
+  David Carlier
+  David Edelsohn
+  Denys Vlasenko
+  Dmitry Ivanov
+  Dmitry V. Levin
+  Drew DeVault
+  Emil Renner Berthing
+  Fangrui Song
+  Felix Fietkau
+  Felix Janda
+  Gianluca Anzolin
+  Hauke Mehrtens
+  He X
+  Hiltjo Posthuma
+  Isaac Dunham
+  Jaydeep Patil
+  Jens Gustedt
+  Jeremy Huntwork
+  Jo-Philipp Wich
+  Joakim Sindholt
+  John Spencer
+  Julien Ramseier
+  Justin Cormack
+  Kaarle Ritvanen
+  Khem Raj
+  Kylie McClain
+  Leah Neukirchen
+  Luca Barbato
+  Luka Perkov
+  Lynn Ochs
+  M Farkas-Dyck (Strake)
+  Mahesh Bodapati
+  Markus Wichmann
+  Masanori Ogino
+  Michael Clark
+  Michael Forney
+  Mikhail Kremnyov
+  Natanael Copa
+  Nicholas J. Kain
+  orc
+  Pascal Cuoq
+  Patrick Oppenlander
+  Petr Hosek
+  Petr Skocik
+  Pierre Carrier
+  Reini Urban
+  Rich Felker
+  Richard Pennington
+  Ryan Fairfax
+  Samuel Holland
+  Segev Finer
+  Shiz
+  sin
+  Solar Designer
+  Stefan Kristiansson
+  Stefan O'Rear
+  Szabolcs Nagy
+  Timo Teräs
+  Trutz Behn
+  Will Dietz
+  William Haddon
+  William Pitcock
+
+  Portions of this software are derived from third-party works licensed
+  under terms compatible with the above MIT license:
+
+  The TRE regular expression implementation (src/regex/reg* and
+  src/regex/tre*) is Copyright © 2001-2008 Ville Laurikari and licensed
+  under a 2-clause BSD license (license text in the source files). The
+  included version has been heavily modified by Rich Felker in 2012, in
+  the interests of size, simplicity, and namespace cleanliness.
+
+  Much of the math library code (src/math/* and src/complex/*) is
+  Copyright © 1993,2004 Sun Microsystems or
+  Copyright © 2003-2011 David Schultz or
+  Copyright © 2003-2009 Steven G. Kargl or
+  Copyright © 2003-2009 Bruce D. Evans or
+  Copyright © 2008 Stephen L. Moshier or
+  Copyright © 2017-2018 Arm Limited
+  and labelled as such in comments in the individual source files. All
+  have been licensed under extremely permissive terms.
+
+  The ARM memcpy code (src/string/arm/memcpy.S) is Copyright © 2008
+  The Android Open Source Project and is licensed under a two-clause BSD
+  license. It was taken from Bionic libc, used on Android.
+
+  The AArch64 memcpy and memset code (src/string/aarch64/*) are
+  Copyright © 1999-2019, Arm Limited.
+
+  The implementation of DES for crypt (src/crypt/crypt_des.c) is
+  Copyright © 1994 David Burren. It is licensed under a BSD license.
+
+  The implementation of blowfish crypt (src/crypt/crypt_blowfish.c) was
+  originally written by Solar Designer and placed into the public
+  domain. The code also comes with a fallback permissive license for use
+  in jurisdictions that may not recognize the public domain.
+
+  The smoothsort implementation (src/stdlib/qsort.c) is Copyright © 2011
+  Lynn Ochs and is licensed under an MIT-style license.
+
+  The x86_64 port was written by Nicholas J. Kain and is licensed under
+  the standard MIT terms.
+
+  The mips and microblaze ports were originally written by Richard
+  Pennington for use in the ellcc project. The original code was adapted
+  by Rich Felker for build system and code conventions during upstream
+  integration. It is licensed under the standard MIT terms.
+
+  The mips64 port was contributed by Imagination Technologies and is
+  licensed under the standard MIT terms.
+
+  The powerpc port was also originally written by Richard Pennington,
+  and later supplemented and integrated by John Spencer. It is licensed
+  under the standard MIT terms.
+
+  All other files which have no copyright comments are original works
+  produced specifically for use as part of this library, written either
+  by Rich Felker, the main author of the library, or by one or more
+  contibutors listed above. Details on authorship of individual files
+  can be found in the git version control history of the project. The
+  omission of copyright and license comments in each file is in the
+  interest of source tree size.
+
+  In addition, permission is hereby granted for all public header files
+  (include/* and arch/*/bits/*) and crt files intended to be linked into
+  applications (crt/*, ldso/dlstart.c, and arch/*/crt_arch.h) to omit
+  the copyright notice and permission notice otherwise required by the
+  license, and to use these files without any requirement of
+  attribution. These files include substantial contributions from:
+
+  Bobby Bingham
+  John Spencer
+  Nicholas J. Kain
+  Rich Felker
+  Richard Pennington
+  Stefan Kristiansson
+  Szabolcs Nagy
+
+  all of whom have explicitly granted such permission.
+
+  This file previously contained text expressing a belief that most of
+  the files covered by the above exception were sufficiently trivial not
+  to be subject to copyright, resulting in confusion over whether it
+  negated the permissions granted in the license. In the spirit of
+  permissive licensing, and of not having licensing issues being an
+  obstacle to adoption, that text has been removed.
+
+--- TRE (musl src/regex), 2-clause BSD licence ---
+
+  Copyright (c) 2001-2009 Ville Laurikari <vl@iki.fi>
+  All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions
+  are met:
+
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
+
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in the
+       documentation and/or other materials provided with the distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDER AND CONTRIBUTORS
+  ``AS IS'' AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+  A PARTICULAR PURPOSE ARE DISCLAIMED.  IN NO EVENT SHALL THE COPYRIGHT
+  HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+  SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+  LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+  DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+  THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+  (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+  OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+--- ARM memcpy (musl src/string/arm/memcpy.S), 2-clause BSD licence ---
+
+  Copyright (C) 2008 The Android Open Source Project
+  All rights reserved.
+
+  Redistribution and use in source and binary forms, with or without
+  modification, are permitted provided that the following conditions
+  are met:
+   * Redistributions of source code must retain the above copyright
+     notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above copyright
+     notice, this list of conditions and the following disclaimer in
+     the documentation and/or other materials provided with the
+     distribution.
+
+  THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+  "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+  LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+  FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+  COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+  INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+  BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS
+  OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED
+  AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+  OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT
+  OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+  SUCH DAMAGE.
+
+
+4. zlib 1.3.2 (zlib licence), in bin/biscuit-tool
+--------------------------------------------------
+
+  Copyright (C) 1995-2026 Jean-loup Gailly and Mark Adler
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+
+  Jean-loup Gailly        Mark Adler
+  jloup@gzip.org          madler@alumni.caltech.edu
+
+
+5. libgcc (GPL-3.0-or-later WITH GCC-exception-3.1)
+----------------------------------------------------
+
+Both programs were compiled by GCC 15.2.0 (Alpine's gcc), which links small
+runtime routines from libgcc into the programs it builds. libgcc is licensed under the GNU GPL
+version 3 or later with the GCC Runtime Library Exception 3.1, which allows
+the resulting programs to be distributed under terms of the author's choice:
+https://www.gnu.org/licenses/gcc-exception-3.1.html. GCC's source is at
+https://gcc.gnu.org/, and Alpine's build of it in aports main/gcc.
+
+
+6. payload/ (the install zip only)
+----------------------------------
+
+pmos-amazon-biscuit-rNNN.zip also carries payload/boot.img and
+payload/pmos.img.xz: a postmarketOS system for the Echo, built with
+pmbootstrap from Alpine Linux, postmarketOS and this project's packages. Each
+package in it keeps its own licence. The installed system lists every package
+in /lib/apk/db/installed: its exact version (the "V:" line), its licence (the
+"L:" line) and, for Alpine's packages, the aports commit it was built from
+(the "c:" line). The corresponding source of each is:
+
+  Alpine packages    the package's directory in Alpine's aports at that
+                     commit, and the source files its APKBUILD names:
+                     https://gitlab.alpinelinux.org/alpine/aports
+  postmarketOS       the APKBUILD for that version in postmarketOS's
+  packages           pmaports, and the source files it names:
+                     https://gitlab.postmarketos.org/postmarketOS/pmaports
+  this project's     https://github.com/liamtw22/pmaports-biscuit at tag
+  packages           rNNN: device-amazon-biscuit and its subpackages,
+                     linux-amazon-biscuit (the Linux kernel, GPL-2.0) and its
+                     patches, and the patched boot-deploy 0.24.0-r1
+                     (GPL-2.0-or-later) in base-pmaports/. The kernel is also
+                     a git tree, in https://github.com/liamtw22/linux-mtk
+                     (branch biscuit-r<kernel release>).
+
+The same GitHub release as the zips carries the complete source of the
+kernel in the image, as linux-amazon-biscuit-r<kernel release>-source.tar.gz,
+and of the BusyBox in bin/busybox (section 1).
+
+No Amazon files are in any zip. The firmware, microphone files, speaker
+correction curve, sounds and light ring animations the Echo uses are copied
+from the owner's own Echo by amazon-biscuit-backup, and stay on that Echo and
+on the owner's computer.

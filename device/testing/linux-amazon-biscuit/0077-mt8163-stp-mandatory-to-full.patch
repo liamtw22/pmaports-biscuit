@@ -1,0 +1,641 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index 8f19b48..d87a182 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -36,19 +36,42 @@
+ #define MT8163_STP_MAX_PAYLOAD		2014
+ #define MT8163_STP_RX_FIFO_SIZE	SZ_16K
+ #define MT8163_STP_WMT_TIMEOUT		msecs_to_jiffies(1500)
++#define MT8163_STP_FULL_RETRIES		3
+ #define MT8163_WMT_PATCH_HEADER_LEN	28
+ #define MT8163_WMT_PATCH_FRAGMENT	1000
+ 
+-/* WMT starts raw, then uses STP task 4 after the SET_STP exchange. */
++/* Biscuit starts WMT in mandatory STP mode, then switches to full STP. */
+ static const u8 wmt_read_hw_code_cmd[] = {
+ 	0x01, 0x08, 0x10, 0x00, 0x02, 0x01, 0x00, 0x01,
+ 	0x08, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
+ 	0xff, 0xff, 0x00, 0x00,
+ };
+ static const u8 wmt_read_hw_code_evt[] = {
+-	0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01,
++	0x02, 0x08, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x01,
+ 	0x08, 0x00, 0x00, 0x80, 0x63, 0x81, 0x00, 0x00,
+ };
++static const u8 wmt_read_hw_version_cmd[] = {
++	0x01, 0x08, 0x10, 0x00, 0x02, 0x01, 0x00, 0x01,
++	0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
++	0xff, 0xff, 0x00, 0x00,
++};
++static const u8 wmt_read_hw_version_evt[] = {
++	0x02, 0x08, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x01,
++	0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
++};
++static const u8 wmt_read_fw_version_cmd[] = {
++	0x01, 0x08, 0x10, 0x00, 0x02, 0x01, 0x00, 0x01,
++	0x04, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
++	0xff, 0xff, 0x00, 0x00,
++};
++static const u8 wmt_read_fw_version_evt[] = {
++	0x02, 0x08, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x01,
++	0x04, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
++};
++static const u8 wmt_version_evt_mask[] = {
++	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
++	0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x00,
++};
+ 
+ static const u8 wmt_query_stp_cmd[] =
+ 	{ 0x01, 0x04, 0x01, 0x00, 0x04 };
+@@ -79,6 +102,11 @@ enum mt8163_stp_rx_state {
+ 	MT8163_STP_RX_BODY,
+ };
+ 
++enum mt8163_stp_mode {
++	MT8163_STP_MODE_MANDATORY,
++	MT8163_STP_MODE_FULL,
++};
++
+ struct mt8163_stp {
+ 	struct device *dev;
+ 	struct device *consys_dev;
+@@ -96,6 +124,7 @@ struct mt8163_stp {
+ 	spinlock_t wmt_lock;
+ 	struct completion wmt_done;
+ 	const u8 *wmt_expected;
++	const u8 *wmt_mask;
+ 	size_t wmt_expected_len;
+ 	u8 wmt_rx[32];
+ 	size_t wmt_rx_len;
+@@ -109,10 +138,22 @@ struct mt8163_stp {
+ 	size_t payload_len;
+ 	size_t payload_need;
+ 	u8 payload_type;
+-	bool framed;
++	u8 payload_seq;
++	u8 payload_ack;
++	enum mt8163_stp_mode mode;
++	u8 txseq;
++	u8 txack;
++	u8 rxack;
++	u8 expected_rxseq;
++	bool tx_pending;
++	u8 tx_pending_seq;
++	u8 full_tx_frame[MT8163_STP_HEADER_LEN + MT8163_STP_MAX_PAYLOAD +
++			 MT8163_STP_TRAILER_LEN];
++	size_t full_tx_len;
+ 	bool hci_registered;
+ 	bool bt_paldo_enabled;
+ 	u8 trace_rx;
++	u8 trace_tx;
+ 	u8 trace_xfer;
+ };
+ 
+@@ -132,8 +173,32 @@ static int mt8163_stp_btif_write(struct mt8163_stp *stp, const u8 *buf,
+ 	return -ETIMEDOUT;
+ }
+ 
+-static int mt8163_stp_send(struct mt8163_stp *stp, u8 type,
+-			   const u8 *payload, size_t len)
++static u16 mt8163_stp_crc16(const u8 *buf, size_t len)
++{
++	u16 crc = 0;
++	unsigned int bit;
++
++	while (len--) {
++		crc ^= *buf++;
++		for (bit = 0; bit < 8; bit++)
++			crc = (crc & 1) ? (crc >> 1) ^ 0xa001 : crc >> 1;
++	}
++
++	return crc;
++}
++
++static void mt8163_stp_trace_tx(struct mt8163_stp *stp, const char *mode,
++				const u8 *frame, size_t len)
++{
++	if (stp->trace_tx++ >= 12)
++		return;
++
++	dev_warn(stp->dev, "STP TX[%u] %s len=%zu data=%*ph\n",
++		 stp->trace_tx, mode, len, (int)min_t(size_t, len, 64), frame);
++}
++
++static int mt8163_stp_send_mandatory(struct mt8163_stp *stp, u8 type,
++				     const u8 *payload, size_t len)
+ {
+ 	u8 frame[MT8163_STP_HEADER_LEN + MT8163_STP_MAX_PAYLOAD +
+ 		 MT8163_STP_TRAILER_LEN];
+@@ -152,26 +217,113 @@ static int mt8163_stp_send(struct mt8163_stp *stp, u8 type,
+ 	frame[MT8163_STP_HEADER_LEN + len + 1] = 0;
+ 
+ 	mutex_lock(&stp->tx_lock);
++	mt8163_stp_trace_tx(stp, "mandatory", frame,
++				 len + MT8163_STP_HEADER_LEN +
++				 MT8163_STP_TRAILER_LEN);
+ 	ret = mt8163_stp_btif_write(stp, frame, len + MT8163_STP_HEADER_LEN +
+ 					 MT8163_STP_TRAILER_LEN);
+ 	mutex_unlock(&stp->tx_lock);
+ 	return ret;
+ }
+ 
+-static int mt8163_stp_send_raw(struct mt8163_stp *stp, const u8 *buf,
+-				       size_t len)
++static int mt8163_stp_send_full(struct mt8163_stp *stp, u8 type,
++				const u8 *payload, size_t len)
+ {
++	u16 crc;
+ 	int ret;
+ 
++	if (len > MT8163_STP_MAX_PAYLOAD)
++		return -EMSGSIZE;
++
+ 	mutex_lock(&stp->tx_lock);
+-	ret = mt8163_stp_btif_write(stp, buf, len);
++	if (stp->tx_pending) {
++		ret = -EAGAIN;
++		goto out;
++	}
++
++	stp->full_tx_frame[0] = 0x80 | (stp->txseq << 3) | stp->txack;
++	stp->full_tx_frame[1] = (type << 4) | ((len >> 8) & 0x0f);
++	stp->full_tx_frame[2] = len & 0xff;
++	stp->full_tx_frame[3] = stp->full_tx_frame[0] +
++				stp->full_tx_frame[1] + stp->full_tx_frame[2];
++	memcpy(stp->full_tx_frame + MT8163_STP_HEADER_LEN, payload, len);
++	crc = mt8163_stp_crc16(payload, len);
++	stp->full_tx_frame[MT8163_STP_HEADER_LEN + len] = crc & 0xff;
++	stp->full_tx_frame[MT8163_STP_HEADER_LEN + len + 1] = crc >> 8;
++	stp->full_tx_len = MT8163_STP_HEADER_LEN + len +
++			   MT8163_STP_TRAILER_LEN;
++	stp->tx_pending_seq = stp->txseq;
++	stp->tx_pending = true;
++	mt8163_stp_trace_tx(stp, "full", stp->full_tx_frame,
++				 stp->full_tx_len);
++	ret = mt8163_stp_btif_write(stp, stp->full_tx_frame,
++				    stp->full_tx_len);
++	if (ret) {
++		stp->tx_pending = false;
++		goto out;
++	}
++	stp->txseq = (stp->txseq + 1) & 0x7;
++out:
++	mutex_unlock(&stp->tx_lock);
++	return ret;
++}
++
++static int mt8163_stp_resend_full(struct mt8163_stp *stp)
++{
++	int ret;
++
++	mutex_lock(&stp->tx_lock);
++	if (!stp->full_tx_len) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	/* Stock refreshes the piggy-backed ACK and header checksum on retry. */
++	stp->full_tx_frame[0] &= 0xf8;
++	stp->full_tx_frame[0] |= stp->txack;
++	stp->full_tx_frame[3] = stp->full_tx_frame[0] +
++				stp->full_tx_frame[1] + stp->full_tx_frame[2];
++	stp->tx_pending = true;
++	mt8163_stp_trace_tx(stp, "full-retry", stp->full_tx_frame,
++				 stp->full_tx_len);
++	ret = mt8163_stp_btif_write(stp, stp->full_tx_frame,
++				    stp->full_tx_len);
++out:
+ 	mutex_unlock(&stp->tx_lock);
+ 	return ret;
+ }
+ 
++static int mt8163_stp_send_ack(struct mt8163_stp *stp)
++{
++	u8 frame[MT8163_STP_HEADER_LEN];
++	int ret;
++
++	frame[0] = 0x80 | stp->txack;
++	frame[1] = 0;
++	frame[2] = 0;
++	frame[3] = frame[0];
++
++	mutex_lock(&stp->tx_lock);
++	mt8163_stp_trace_tx(stp, "ack", frame, sizeof(frame));
++	ret = mt8163_stp_btif_write(stp, frame, sizeof(frame));
++	mutex_unlock(&stp->tx_lock);
++	return ret;
++}
++
++static int mt8163_stp_send(struct mt8163_stp *stp, u8 type,
++			   const u8 *payload, size_t len)
++{
++	if (stp->mode == MT8163_STP_MODE_MANDATORY)
++		return mt8163_stp_send_mandatory(stp, type, payload, len);
++
++	return mt8163_stp_send_full(stp, type, payload, len);
++}
++
+ static void mt8163_stp_wmt_byte(struct mt8163_stp *stp, u8 byte)
+ {
+ 	unsigned long flags;
++	size_t i;
++	bool match = true;
+ 	bool done = false;
+ 
+ 	spin_lock_irqsave(&stp->wmt_lock, flags);
+@@ -188,8 +340,15 @@ static void mt8163_stp_wmt_byte(struct mt8163_stp *stp, u8 byte)
+ 	if (stp->wmt_rx_len != stp->wmt_expected_len)
+ 		goto out;
+ 
+-	stp->wmt_result = memcmp(stp->wmt_rx, stp->wmt_expected,
+-				 stp->wmt_expected_len) ? -EPROTO : 0;
++	for (i = 0; i < stp->wmt_expected_len; i++) {
++		if (stp->wmt_mask && !stp->wmt_mask[i])
++			continue;
++		if (stp->wmt_rx[i] != stp->wmt_expected[i]) {
++			match = false;
++			break;
++		}
++	}
++	stp->wmt_result = match ? 0 : -EPROTO;
+ 	stp->wmt_waiting = false;
+ 	done = true;
+ out:
+@@ -228,11 +387,21 @@ static void mt8163_stp_hci_rx(struct mt8163_stp *stp, const u8 *data,
+ 	hci_recv_frame(stp->hdev, skb);
+ }
+ 
+-static void mt8163_stp_finish_frame(struct mt8163_stp *stp)
++static void mt8163_stp_process_ack(struct mt8163_stp *stp, u8 ack)
+ {
+-	if (stp->payload_type == MT8163_STP_TASK_WMT) {
+-		size_t i;
++	mutex_lock(&stp->tx_lock);
++	if (stp->tx_pending && ack == stp->tx_pending_seq) {
++		stp->rxack = ack;
++		stp->tx_pending = false;
++	}
++	mutex_unlock(&stp->tx_lock);
++}
+ 
++static void mt8163_stp_deliver_payload(struct mt8163_stp *stp)
++{
++	size_t i;
++
++	if (stp->payload_type == MT8163_STP_TASK_WMT) {
+ 		for (i = 0; i < stp->payload_need; i++)
+ 			mt8163_stp_wmt_byte(stp, stp->payload[i]);
+ 	} else if (stp->payload_type == MT8163_STP_TASK_BT) {
+@@ -240,11 +409,59 @@ static void mt8163_stp_finish_frame(struct mt8163_stp *stp)
+ 	}
+ }
+ 
++static void mt8163_stp_finish_frame(struct mt8163_stp *stp)
++{
++	u16 expected_crc, received_crc;
++	u8 previous_seq;
++
++	if (stp->mode == MT8163_STP_MODE_MANDATORY) {
++		if (stp->payload[stp->payload_need] ||
++		    stp->payload[stp->payload_need + 1]) {
++			dev_warn_ratelimited(stp->dev,
++					 "non-zero mandatory STP trailer\n");
++			return;
++		}
++		mt8163_stp_deliver_payload(stp);
++		return;
++	}
++
++	received_crc = stp->payload[stp->payload_need] |
++		       (stp->payload[stp->payload_need + 1] << 8);
++	expected_crc = mt8163_stp_crc16(stp->payload, stp->payload_need);
++	if (received_crc != expected_crc) {
++		dev_warn_ratelimited(stp->dev,
++				 "full STP CRC mismatch: got 0x%04x expected 0x%04x\n",
++				 received_crc, expected_crc);
++		mt8163_stp_send_ack(stp);
++		return;
++	}
++
++	mt8163_stp_process_ack(stp, stp->payload_ack);
++	if (stp->payload_seq == stp->expected_rxseq) {
++		stp->txack = stp->payload_seq;
++		stp->expected_rxseq = (stp->expected_rxseq + 1) & 0x7;
++		mt8163_stp_send_ack(stp);
++		mt8163_stp_deliver_payload(stp);
++		return;
++	}
++
++	previous_seq = (stp->expected_rxseq - 1) & 0x7;
++	if (stp->payload_seq != previous_seq)
++		dev_warn_ratelimited(stp->dev,
++				 "unexpected full STP sequence %u, expected %u\n",
++				 stp->payload_seq, stp->expected_rxseq);
++
++	/* Acknowledge the last accepted frame for duplicates and out-of-order RX. */
++	mt8163_stp_send_ack(stp);
++}
++
+ static void mt8163_stp_rx_byte(struct mt8163_stp *stp, u8 byte)
+ {
+ 	switch (stp->rx_state) {
+ 	case MT8163_STP_RX_SYNC:
+-		if (byte != 0x80)
++		if (!(byte & 0x80))
++			return;
++		if (stp->mode == MT8163_STP_MODE_MANDATORY && byte != 0x80)
+ 			return;
+ 		stp->header[0] = byte;
+ 		stp->header_len = 1;
+@@ -254,7 +471,24 @@ static void mt8163_stp_rx_byte(struct mt8163_stp *stp, u8 byte)
+ 		stp->header[stp->header_len++] = byte;
+ 		if (stp->header_len != MT8163_STP_HEADER_LEN)
+ 			break;
++		if (stp->mode == MT8163_STP_MODE_MANDATORY) {
++			if (stp->header[3]) {
++				dev_warn_ratelimited(stp->dev,
++						 "invalid mandatory STP header\n");
++				stp->rx_state = MT8163_STP_RX_SYNC;
++				break;
++			}
++		} else if (stp->header[3] !=
++			   (u8)(stp->header[0] + stp->header[1] +
++				stp->header[2])) {
++			dev_warn_ratelimited(stp->dev,
++					 "full STP header checksum mismatch\n");
++			stp->rx_state = MT8163_STP_RX_SYNC;
++			break;
++		}
+ 		stp->payload_type = (stp->header[1] >> 4) & 0x7;
++		stp->payload_seq = (stp->header[0] >> 3) & 0x7;
++		stp->payload_ack = stp->header[0] & 0x7;
+ 		stp->payload_need = ((stp->header[1] & 0x0f) << 8) |
+ 					stp->header[2];
+ 		if (stp->payload_need > MT8163_STP_MAX_PAYLOAD) {
+@@ -263,6 +497,11 @@ static void mt8163_stp_rx_byte(struct mt8163_stp *stp, u8 byte)
+ 			stp->rx_state = MT8163_STP_RX_SYNC;
+ 			break;
+ 		}
++		if (!stp->payload_need && stp->mode == MT8163_STP_MODE_FULL) {
++			mt8163_stp_process_ack(stp, stp->payload_ack);
++			stp->rx_state = MT8163_STP_RX_SYNC;
++			break;
++		}
+ 		stp->payload_len = 0;
+ 		stp->rx_state = MT8163_STP_RX_BODY;
+ 		break;
+@@ -270,8 +509,8 @@ static void mt8163_stp_rx_byte(struct mt8163_stp *stp, u8 byte)
+ 		stp->payload[stp->payload_len++] = byte;
+ 		if (stp->payload_len != stp->payload_need + MT8163_STP_TRAILER_LEN)
+ 			break;
+-		mt8163_stp_finish_frame(stp);
+ 		stp->rx_state = MT8163_STP_RX_SYNC;
++		mt8163_stp_finish_frame(stp);
+ 		break;
+ 	}
+ }
+@@ -290,12 +529,8 @@ static void mt8163_stp_rx_work(struct work_struct *work)
+ 		if (!len)
+ 			return;
+ 
+-		for (i = 0; i < len; i++) {
+-			if (stp->framed)
+-				mt8163_stp_rx_byte(stp, buf[i]);
+-			else
+-				mt8163_stp_wmt_byte(stp, buf[i]);
+-		}
++		for (i = 0; i < len; i++)
++			mt8163_stp_rx_byte(stp, buf[i]);
+ 	}
+ }
+ 
+@@ -304,8 +539,9 @@ static void mt8163_stp_receive(void *data, const u8 *buf, size_t len)
+ 	struct mt8163_stp *stp = data;
+ 	unsigned long flags;
+ 
+-	if (!stp->trace_rx++)
+-		dev_warn(stp->dev, "STP RX callback received %zu bytes\n", len);
++	if (stp->trace_rx++ < 12)
++		dev_warn(stp->dev, "STP RX[%u] len=%zu data=%*ph\n",
++			 stp->trace_rx, len, (int)min_t(size_t, len, 64), buf);
+ 
+ 	spin_lock_irqsave(&stp->rx_lock, flags);
+ 	if (kfifo_avail(&stp->rx_fifo) < len)
+@@ -316,11 +552,13 @@ static void mt8163_stp_receive(void *data, const u8 *buf, size_t len)
+ 	schedule_work(&stp->rx_work);
+ }
+ 
+-static int mt8163_stp_wmt_xfer(struct mt8163_stp *stp, bool framed,
+-				const u8 *cmd, size_t cmd_len,
+-				const u8 *event, size_t event_len)
++static int mt8163_stp_wmt_xfer_mask(struct mt8163_stp *stp,
++				     const u8 *cmd, size_t cmd_len,
++				     const u8 *event, const u8 *mask,
++				     size_t event_len)
+ {
+ 	unsigned long flags;
++	unsigned int attempt;
+ 	int ret;
+ 
+ 	if (event_len > sizeof(stp->wmt_rx))
+@@ -329,27 +567,40 @@ static int mt8163_stp_wmt_xfer(struct mt8163_stp *stp, bool framed,
+ 	reinit_completion(&stp->wmt_done);
+ 	spin_lock_irqsave(&stp->wmt_lock, flags);
+ 	stp->wmt_expected = event;
++	stp->wmt_mask = mask;
+ 	stp->wmt_expected_len = event_len;
+ 	stp->wmt_rx_len = 0;
+ 	stp->wmt_result = -ETIMEDOUT;
+ 	stp->wmt_waiting = true;
+ 	spin_unlock_irqrestore(&stp->wmt_lock, flags);
+ 
+-	if (framed)
+-		ret = mt8163_stp_send(stp, MT8163_STP_TASK_WMT, cmd, cmd_len);
+-	else
+-		ret = mt8163_stp_send_raw(stp, cmd, cmd_len);
+-	if (ret)
+-		goto cancel;
+-	if (stp->trace_xfer++ < 4)
+-		mt8163_btif_dump_state(stp->btif,
+-				      framed ? "framed-wmt-queued" : "raw-wmt-queued");
++	for (attempt = 0; attempt < MT8163_STP_FULL_RETRIES; attempt++) {
++		if (!attempt)
++			ret = mt8163_stp_send(stp, MT8163_STP_TASK_WMT,
++					      cmd, cmd_len);
++		else
++			ret = mt8163_stp_resend_full(stp);
++		if (ret)
++			goto cancel;
++		if (stp->trace_xfer++ < 8)
++			mt8163_btif_dump_state(stp->btif,
++				stp->mode == MT8163_STP_MODE_MANDATORY ?
++				"mandatory-wmt-queued" : "full-wmt-queued");
++
++		if (wait_for_completion_timeout(&stp->wmt_done,
++						MT8163_STP_WMT_TIMEOUT)) {
++			ret = READ_ONCE(stp->wmt_result);
++			break;
++		}
+ 
+-	if (!wait_for_completion_timeout(&stp->wmt_done, MT8163_STP_WMT_TIMEOUT)) {
+ 		mt8163_btif_dump_state(stp->btif, "wmt-timeout");
+ 		ret = -ETIMEDOUT;
+-	} else
+-		ret = READ_ONCE(stp->wmt_result);
++		if (stp->mode != MT8163_STP_MODE_FULL ||
++		    attempt + 1 == MT8163_STP_FULL_RETRIES)
++			break;
++		dev_warn(stp->dev, "full STP WMT retry %u/%u\n",
++			 attempt + 1, MT8163_STP_FULL_RETRIES - 1);
++	}
+ 	if (!ret)
+ 		return 0;
+ 
+@@ -360,6 +611,14 @@ cancel:
+ 	return ret;
+ }
+ 
++static int mt8163_stp_wmt_xfer(struct mt8163_stp *stp,
++				const u8 *cmd, size_t cmd_len,
++				const u8 *event, size_t event_len)
++{
++	return mt8163_stp_wmt_xfer_mask(stp, cmd, cmd_len, event, NULL,
++					 event_len);
++}
++
+ static int mt8163_stp_download_patch(struct mt8163_stp *stp,
+ 				     const char *name, const u8 address[4])
+ {
+@@ -384,13 +643,13 @@ static int mt8163_stp_download_patch(struct mt8163_stp *stp,
+ 	}
+ 
+ 	/* The stock multi-patch loader programs both MT8163 patch RAM windows. */
+-	ret = mt8163_stp_wmt_xfer(stp, true, wmt_patch_address_cmd,
++	ret = mt8163_stp_wmt_xfer(stp, wmt_patch_address_cmd,
+ 				  sizeof(wmt_patch_address_cmd), wmt_patch_address_evt,
+ 				  sizeof(wmt_patch_address_evt));
+ 	if (ret)
+ 		goto out;
+ 	memcpy(partial_address_cmd + 12, address, 4);
+-	ret = mt8163_stp_wmt_xfer(stp, true, partial_address_cmd,
++	ret = mt8163_stp_wmt_xfer(stp, partial_address_cmd,
+ 				  sizeof(partial_address_cmd), wmt_patch_address_evt,
+ 				  sizeof(wmt_patch_address_evt));
+ 	if (ret)
+@@ -407,7 +666,7 @@ static int mt8163_stp_download_patch(struct mt8163_stp *stp,
+ 		cmd[4] = remaining == len ? 0x03 : fragment ? 0x02 : 0x01;
+ 		memcpy(cmd + 5, data, len);
+ 
+-		ret = mt8163_stp_wmt_xfer(stp, true, cmd, len + 5,
++		ret = mt8163_stp_wmt_xfer(stp, cmd, len + 5,
+ 					  wmt_patch_evt, sizeof(wmt_patch_evt));
+ 		if (ret)
+ 			goto out;
+@@ -436,32 +695,64 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 	unsigned int i;
+ 	int ret;
+ 
+-	/* Stock WMT identifies the controller over raw BTIF before QUERY_STP. */
+-	stp->framed = false;
+-	ret = mt8163_stp_wmt_xfer(stp, false, wmt_read_hw_code_cmd,
++	/* Stock enables BTIF mandatory STP before the first WMT register read. */
++	stp->mode = MT8163_STP_MODE_MANDATORY;
++	ret = mt8163_stp_wmt_xfer(stp, wmt_read_hw_code_cmd,
+ 				  sizeof(wmt_read_hw_code_cmd), wmt_read_hw_code_evt,
+ 				  sizeof(wmt_read_hw_code_evt));
+ 	if (ret)
+ 		return dev_err_probe(stp->dev, ret,
+-				     "raw WMT hardware-code read failed\n");
++				     "mandatory WMT hardware-code read failed\n");
+ 
+-	dev_info(stp->dev, "raw WMT hardware code 0x8163\n");
++	dev_info(stp->dev, "mandatory WMT hardware code 0x8163\n");
++
++	ret = mt8163_stp_wmt_xfer_mask(stp, wmt_read_hw_version_cmd,
++				       sizeof(wmt_read_hw_version_cmd),
++				       wmt_read_hw_version_evt,
++				       wmt_version_evt_mask,
++				       sizeof(wmt_read_hw_version_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret,
++				     "mandatory WMT hardware-version read failed\n");
++	dev_info(stp->dev, "mandatory WMT hardware version %4ph\n",
++		 stp->wmt_rx + 12);
++
++	ret = mt8163_stp_wmt_xfer_mask(stp, wmt_read_fw_version_cmd,
++				       sizeof(wmt_read_fw_version_cmd),
++				       wmt_read_fw_version_evt,
++				       wmt_version_evt_mask,
++				       sizeof(wmt_read_fw_version_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret,
++				     "mandatory WMT firmware-version read failed\n");
++	dev_info(stp->dev, "mandatory WMT firmware version %4ph\n",
++		 stp->wmt_rx + 12);
+ 
+-	ret = mt8163_stp_wmt_xfer(stp, false, wmt_query_stp_cmd,
++	ret = mt8163_stp_wmt_xfer(stp, wmt_query_stp_cmd,
+ 				  sizeof(wmt_query_stp_cmd), wmt_query_stp_default_evt,
+ 				  sizeof(wmt_query_stp_default_evt));
+ 	if (ret)
+-		return dev_err_probe(stp->dev, ret, "raw WMT STP query failed\n");
++		return dev_err_probe(stp->dev, ret,
++				     "mandatory WMT STP query failed\n");
+ 
+-	ret = mt8163_stp_wmt_xfer(stp, false, wmt_set_stp_cmd,
++	ret = mt8163_stp_wmt_xfer(stp, wmt_set_stp_cmd,
+ 				  sizeof(wmt_set_stp_cmd), wmt_set_stp_evt,
+ 				  sizeof(wmt_set_stp_evt));
+ 	if (ret)
+-		return dev_err_probe(stp->dev, ret, "raw WMT STP setup failed\n");
++		return dev_err_probe(stp->dev, ret,
++				     "mandatory WMT STP setup failed\n");
+ 
++	mutex_lock(&stp->tx_lock);
++	stp->txseq = 0;
++	stp->txack = 7;
++	stp->rxack = 7;
++	stp->expected_rxseq = 0;
++	stp->tx_pending = false;
++	stp->full_tx_len = 0;
++	stp->mode = MT8163_STP_MODE_FULL;
++	mutex_unlock(&stp->tx_lock);
+ 	msleep(10);
+-	stp->framed = true;
+-	ret = mt8163_stp_wmt_xfer(stp, true, wmt_query_stp_cmd,
++	ret = mt8163_stp_wmt_xfer(stp, wmt_query_stp_cmd,
+ 				  sizeof(wmt_query_stp_cmd), wmt_query_stp_evt,
+ 				  sizeof(wmt_query_stp_evt));
+ 	if (ret)
+@@ -472,7 +763,7 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 						patches[i].address);
+ 		if (ret)
+ 			return ret;
+-		ret = mt8163_stp_wmt_xfer(stp, true, wmt_reset_cmd,
++		ret = mt8163_stp_wmt_xfer(stp, wmt_reset_cmd,
+ 					  sizeof(wmt_reset_cmd), wmt_reset_evt,
+ 					  sizeof(wmt_reset_evt));
+ 		if (ret)
+@@ -484,7 +775,7 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 		return dev_err_probe(stp->dev, ret, "failed to enable BT PALDO\n");
+ 	stp->bt_paldo_enabled = true;
+ 
+-	ret = mt8163_stp_wmt_xfer(stp, true, wmt_bt_on_cmd,
++	ret = mt8163_stp_wmt_xfer(stp, wmt_bt_on_cmd,
+ 				  sizeof(wmt_bt_on_cmd), wmt_bt_on_evt,
+ 				  sizeof(wmt_bt_on_evt));
+ 	if (ret)
+@@ -660,13 +951,6 @@ static int mt8163_stp_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto err_btif;
+ 
+-	/* Match stock PSM's physical host-wake edge before the raw WMT probe. */
+-	ret = mt8163_btif_wakeup_consys(stp->btif);
+-	if (ret)
+-		goto err_client;
+-
+-	dev_info(&pdev->dev, "stock BTIF PSM wake completed; starting raw WMT\n");
+-
+ 	ret = mt8163_stp_bootstrap(stp);
+ 	if (ret)
+ 		goto err_client;

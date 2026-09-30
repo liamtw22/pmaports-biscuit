@@ -1,0 +1,76 @@
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -80,8 +80,31 @@
+ 				 <MT8163_PIN_37_KPCOL1__FUNC_KPCOL1>;
+ 			input-enable;
+ 		};
+ 	};
++
++	biscuit_audio_i2s1_pins: biscuit-audio-i2s1-pins {
++		pins {
++			pinmux = <MT8163_PIN_72_I2S_DATA_IN__FUNC_I2S1_DO>,
++				 <MT8163_PIN_73_I2S_LRCK__FUNC_I2S1_LRCK>,
++				 <MT8163_PIN_74_I2S_BCK__FUNC_I2S1_BCK>;
++			drive-strength = <4>;
++		};
++	};
++
++	biscuit_audio_mclk_pin: biscuit-audio-mclk-pin {
++		pins {
++			pinmux = <MT8163_PIN_119_CMMCLK__FUNC_CMMCLK>;
++			drive-strength = <4>;
++		};
++	};
++
++	biscuit_audio_amp_enable: biscuit-audio-amp-enable {
++		pins {
++			pinmux = <MT8163_PIN_124_MSDC1_DAT1__FUNC_GPIO124>;
++			output-high;
++		};
++	};
+ };
+ 
+ /*
+  * MT8163 firmware does not implement PSCI CPU_ON for secondary cores.
+@@ -149,8 +172,9 @@
+ 	biscuit_audio: biscuit-audio {
+ 		compatible = "amazon,mt8163-biscuit-audio";
+ 		mediatek,afe = <&afe>;
+ 		audio-codec = <&tlv320_codec>;
+-		speaker-amp-gpios = <&pio 24 0>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&biscuit_audio_i2s1_pins &biscuit_audio_mclk_pin &biscuit_audio_amp_enable>;
+ 		status = "okay";
+ 	};
+ };
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -68,11 +68,28 @@
+ 
+ 	mt8163_biscuit_speaker_amp(priv, false);
+ }
+ 
++
++/*
++ * Biscuit routes the codec MCLK through GPIO119's CMMCLK function.
++ * Amazon's machine driver uses a fixed 9.6 MHz source for this codec.
++ */
++static int mt8163_biscuit_be_hw_params(struct snd_pcm_substream *substream,
++				       struct snd_pcm_hw_params *params)
++{
++	struct snd_soc_pcm_runtime *rtd = substream->private_data;
++	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
++
++	(void)params;
++	return snd_soc_dai_set_sysclk(codec_dai, 0, 9600000,
++				      SND_SOC_CLOCK_OUT);
++}
++
+ static const struct snd_soc_ops mt8163_biscuit_be_ops = {
+ 	.startup = mt8163_biscuit_be_startup,
+ 	.shutdown = mt8163_biscuit_be_shutdown,
++	.hw_params = mt8163_biscuit_be_hw_params,
+ };
+ 
+ static int mt8163_biscuit_probe(struct platform_device *pdev)
+ {

@@ -1,0 +1,35 @@
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -14,6 +14,9 @@
+ #include <linux/delay.h>
+ #include <linux/platform_device.h>
+ #include <sound/soc.h>
++
++#define MT8163_BISCUIT_AIC32X4_DOUTCTL          0x35
++#define MT8163_BISCUIT_AIC32X4_MFP2_GPIO_UNMUTE 0x04
+ 
+ struct mt8163_biscuit_priv {
+ 	struct gpio_desc *speaker_amp;
+@@ -71,6 +74,22 @@
+ 	struct mt8163_biscuit_priv *priv = snd_soc_card_get_drvdata(rtd->card);
+ 
+ 	mt8163_biscuit_speaker_amp(priv, true);
++
++	/*
++	 * EVT routes the external amplifier mute through TLV320 MFP2.
++	 * Vendor audio programs DOUTCTL=0x04: GPIO output enabled, low = unmute.
++	 */
++	{
++		int ret = snd_soc_component_write(
++			snd_soc_rtd_to_codec(rtd, 0)->component,
++			MT8163_BISCUIT_AIC32X4_DOUTCTL,
++			MT8163_BISCUIT_AIC32X4_MFP2_GPIO_UNMUTE);
++
++		if (ret < 0)
++			dev_warn(rtd->card->dev, "MFP2 amplifier unmute failed: %d\n", ret);
++		else
++			dev_info(rtd->card->dev, "MFP2 amplifier unmuted\n");
++	}
+ 	return 0;
+ }
+ 

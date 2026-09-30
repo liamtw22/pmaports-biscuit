@@ -1,0 +1,159 @@
+#!/sbin/openrc-run
+
+name="biscuit-voice-assistant"
+description="Home Assistant voice satellite over the ESPHome native API"
+
+# WHAT HOME ASSISTANT SEES:
+#
+#   This is OHF-Voice/linux-voice-assistant, which speaks the ESPHome NATIVE API
+#   on port 6053 - the same protocol as a Voice PE - so HA discovers it as an
+#   ESPHome voice device, not as a Wyoming satellite. Add it in HA under
+#   Settings > Devices > ESPHome with this device's IP and port 6053.
+#
+#   If HA says "unable to connect, make sure the device's YAML includes an api
+#   section", the device is simply NOT LISTENING - that message is ESPHome's
+#   generic connect failure and says nothing about YAML. Check with:
+#       grep -i 17A5 /proc/net/tcp        # 0x17A5 == 6053
+#
+# AUDIO DEVICES are the PipeWire nodes, not ALSA hardware:
+#
+#   biscuit_mic     the PROCESSED array - biscuit-mic-stream.sh's beamformed
+#                   mono 16 kHz, pumped through the spare snd-aloop cable. The
+#                   assistant gets high-pass, filterbank, AEC and beamforming
+#                   rather than the raw 8 channels.
+#   biscuit_speaker the shared output, so TTS goes through the speaker
+#                   correction, compressor and limiter like every other source.
+#
+# WAKE WORD: 'alexa' by default, which is apt for the hardware. Others shipped:
+# okay_nabu, hey_jarvis, hey_mycroft, hey_luna, hey_morgan, okay_computer,
+# hey_home_assistant, choo_choo_homie. Set WAKE_MODEL in conf.d to change it.
+#
+# THE TFLITE DEPENDENCY - do not let this regress:
+#
+#   pymicro-wakeword and pyopen-wakeword each ship a bundled
+#   libtensorflowlite_c.so built for x86-64 GLIBC, and 2.x has no wheels on PyPI
+#   at all, so the ARM path is broken upstream. Both packages' copies are
+#   symlinked to /usr/lib/biscuit-tflite/libtensorflowlite_c.so - TensorFlow Lite 2.17.0 built
+#   for aarch64 musl in the pmbootstrap aarch64 buildroot. Reinstalling either
+#   package via pip WILL restore the x86-64 blob and break wake word loading
+#   with "Error loading shared library ld-linux-x86-64.so.2".
+#
+# webrtc-noise-gain is absent (it does not build here) but is lazily imported,
+# so the assistant runs without it. biscuit-dsp already does that processing.
+
+: ${VA_NAME:=$(hostname)}
+: ${WAKE_MODEL:=alexa}
+: ${VA_PORT:=6053}
+# Explicit, so the assistant never has to guess its interface or address.
+: ${VA_IFACE:=wlan0}
+: ${VA_HOME:=/usr/lib/linux-voice-assistant}
+
+# Invoked through env(1): OpenRC does not reliably pass an exported environment
+# to a supervised process, and without XDG_RUNTIME_DIR PortAudio cannot see the
+# PipeWire nodes at all - the device list comes back EMPTY and the assistant
+# dies with "No output device matching ...".
+# Stock earcons for the sounds the assistant plays itself, resolved from the
+# single activity->sound table. Empty is safe: the assistant then uses its
+# own bundled sounds. Read once at launch, so a change needs a restart.
+VA_SOUNDS="$(/usr/bin/biscuit-earcon-args 2>/dev/null)"
+
+command="/usr/bin/biscuit-voice-assistant-wait.sh"
+# THE OUTPUT DEVICES MUST CARRY THE "pulse/" PREFIX. Both --audio-output-device
+# and --music-output-device are handed straight to libmpv as its `audio-device`
+# property, and mpv expects <ao>/<device>. Given a bare "biscuit_speaker" mpv
+# raises NO ERROR and reports playback completing - it simply routes nowhere:
+#
+#   audio-device=biscuit_speaker        peak -36.0 dBFS at the mic (silent)
+#   audio-device=pulse/biscuit_speaker  peak  -0.6 dBFS (correct)
+#
+# The failure is worse than silence. The wake chime ends with mpv
+# reason=4 (MPV_END_FILE_REASON_ERROR), the pipeline never leaves "active", and
+# every later wake word is discarded with "Ignoring wake word - pipeline already
+# active" - so detection keeps working at 0.99 probability while the device sits
+# idle in Home Assistant forever.
+#
+# --audio-input-device is NOT prefixed: it goes to soundcard/PortAudio, which
+# wants the plain PulseAudio node name.
+#
+# biscuit_mic is not a raw microphone. The device package has already applied
+# the stock-mapped codec PGA, factory calibration, HPF/filterbank, AEC, fixed
+# and adaptive beam stages, selection, and +7.2 dB ASR output stage. Marking it
+# as a processed profile makes LVA byte-transparent and removes its obsolete
+# post-DSP Mic Auto Gain / Noise Suppression / Mic Volume entities. Bump the
+# profile name only when the packaged microphone contract changes; LVA records
+# it in preferences so stale settings can be migrated explicitly.
+#
+# The deployed microWakeWord classifier is strongly level dependent: the same
+# audio scores 2-3 of 6 at the level the AFE delivers and 5-6 of 6 once its peak
+# reaches about -20 dBFS, with background false accepts unchanged at zero. A
+# single fixed gain cannot cover a room whose delivered level moves 20 dB or
+# more, so --wake-input-agc normalises it. It is deliberately slow; a fast AGC
+# moves within one "Alexa" and scored worse than a plain fixed gain. This is
+# classifier-only: the command audio sent to Home Assistant stays byte-exact.
+#
+# --audio-input-command takes the beamformer output directly instead of routing
+# it through snd-aloop and PipeWire's 16->48->16 kHz conversions, which were
+# measured losing marginal wake evidence. LVA then owns the capture, so
+# biscuit-mic-pump is no longer in the default runlevel - if it runs, it takes
+# hw:0,2 first and LVA comes up with no microphone at all.
+#
+# Stock opens the command stream while its wake acknowledgement is playing.
+# Our processed chain contains the local playback reference and AEC, so do the
+# same instead of dropping the beginning of commands spoken after "Alexa".
+# The TFLite runtime for the wake-word models is an aarch64 MUSL build that
+# lives inside pymicro_wakeword; libtensorflowlite_c.so needs
+# libtensorflow-lite.so beside it and carries no RPATH, so without this the
+# loader cannot resolve it and every wake word fails with a bare
+# "Error loading shared lib". Scoped to this service rather than
+# /etc/ld-musl-aarch64.path so nothing else on the system sees these.
+_LVA_TFLITE=/usr/lib/biscuit-tflite:/usr/lib/linux-voice-assistant/lib/python3.14/site-packages/pymicro_wakeword/lib
+
+command_args="${VA_IFACE} /usr/bin/env LD_LIBRARY_PATH=${_LVA_TFLITE} XDG_RUNTIME_DIR=/run/pipewire PULSE_RUNTIME_PATH=/run/pipewire/pulse ${VA_HOME}/bin/python -m linux_voice_assistant --name '${VA_NAME}' --audio-input-command /usr/bin/biscuit-mic-direct.sh --audio-output-device pulse/biscuit_speaker --music-output-device pulse/biscuit_speaker --wake-model ${WAKE_MODEL} --port ${VA_PORT} --network-interface ${VA_IFACE} --preferences-file /opt/persist/voice-assistant-prefs.json --processed-mic-profile biscuit-stock-afe-r106-direct --wake-input-agc --listen-during-wake-sound ${VA_SOUNDS}"
+supervisor="supervise-daemon"
+# Respawn forever. The command is a low-cost network wait wrapper until wlan0
+# has an IPv4 address, then it execs LVA. If connectivity is later lost and
+# LVA exits, its next supervised invocation waits instead of crash-looping.
+respawn_delay=5
+respawn_max=0
+respawn_period=1800
+directory="${VA_HOME}"
+pidfile="/run/${RC_SVCNAME}.pid"
+# Logged through a pipe, not straight to the file. This service runs at
+# realtime priority, and a write to the ext4 root can stall for most of a
+# second behind the journal while something else writes (3.8: the call DSP
+# did exactly that and its branch overflowed). OpenRC hands the output to a
+# cat at ordinary priority instead, which takes any such stall; the pipe
+# absorbs 64 KiB meanwhile.
+output_logger="cat >> /var/log/biscuit-voice-assistant.log"
+error_logger="cat >> /var/log/biscuit-voice-assistant.log"
+
+depend() {
+	# PipeWire provides both audio nodes AND the PulseAudio server that
+	# soundcard connects to at import time.
+	need biscuit-pipewire
+	# LVA spawns its own arecord -> beamformer pipeline, so it needs the DSP
+	# service (which owns hw:0,0 and satisfies the FPGA's capture gate) rather
+	# than the pump.
+	need biscuit-dsp
+	# `local` is where /etc/local.d/wifi.start brings up wlan0. Starting before
+	# it means binding and advertising before there is an address.
+	after local avahi-daemon biscuit-persist
+}
+
+start_pre() {
+	checkpath -f -m 0644 -o root:root /var/log/biscuit-voice-assistant.log
+	checkpath -d -m 0755 -o root:root /opt/persist 2>/dev/null || true
+
+	# biscuit-pipewire returns once pipewire is up, but pipewire-pulse takes a
+	# moment longer to accept connections. Bounded wait - never block boot.
+	i=0
+	while [ ! -S /run/pipewire/pulse/native ] && [ $i -lt 20 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	[ -S /run/pipewire/pulse/native ] || ewarn "pipewire-pulse socket not ready after ${i}s; continuing"
+
+	# Do not wait for wlan0 here. OpenRC starts `local` (and wifi.start) after
+	# this service, so blocking start_pre would hold the runlevel hostage. The
+	# command wrapper waits after the service is considered started instead.
+}

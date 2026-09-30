@@ -1,0 +1,41 @@
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -194,7 +194,11 @@
+ 		mediatek,afe = <&afe>;
+ 		audio-codec = <&tlv320_codec>;
+ 		pinctrl-names = "default";
+-		pinctrl-0 = <&biscuit_audio_i2s1_pins &biscuit_audio_mclk_pin &biscuit_audio_amp_enable>;
++		pinctrl-0 = <&biscuit_audio_i2s1_pins &biscuit_audio_mclk_pin>;
++
++		/* EVT: GPIO122 enables the amplifier; GPIO124 selects speaker DAC. */
++		speaker-amp-gpios = <&pio 122 0>;
++		dacmux-gpios = <&pio 124 0>;
+ 		status = "okay";
+ 	};
+ };
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -17,6 +17,7 @@
+ 
+ struct mt8163_biscuit_priv {
+ 	struct gpio_desc *speaker_amp;
++	struct gpio_desc *dacmux;
+ 	struct snd_soc_card card;
+ 	struct snd_soc_dai_link links[2];
+ 	struct snd_soc_dai_link_component cpus[2];
+@@ -289,6 +290,15 @@
+ 
+ 	pm_runtime_enable(&pdev->dev);
+ 
++	/* r104: GPIO124 low selects the physical speaker route. */
++
++	priv->dacmux = devm_gpiod_get_optional(dev, "dacmux", GPIOD_OUT_LOW);
++
++	if (IS_ERR(priv->dacmux))
++
++	    return PTR_ERR(priv->dacmux);
++
++
+ 	priv->speaker_amp = devm_gpiod_get_optional(dev, "speaker-amp", GPIOD_OUT_LOW);
+ 	if (IS_ERR(priv->speaker_amp))
+ 	        return dev_err_probe(dev, PTR_ERR(priv->speaker_amp),

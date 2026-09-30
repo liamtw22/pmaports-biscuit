@@ -1,0 +1,29 @@
+# Pinned contents of biscuit-sendspin-venv.tar.gz, recovered from the shipped
+# venv's dist-info on 2026-09-20. Every one of these came from PyPI; the
+# sendspin package itself does NOT appear here because it is installed from
+# git, see build-sendspin-venv.sh.
+#
+# av is listed for the version pin only. It MUST be installed --no-binary,
+# because the wheel bundles its own FFmpeg including libx264 and libx265.
+aiosendspin-mpris==2.1.1
+aiosendspin==6.0.5
+av==18.1.0
+cffi==2.1.1
+dbus-next==0.2.3
+markdown-it-py==4.2.0
+mashumaro==3.22
+mdurl==0.1.2
+mpris-api==1.3.0
+orjson==3.12.0
+pillow==12.3.0
+pulsectl-asyncio==1.3.2
+pulsectl==24.12.0
+pycparser==3.0
+Pygments==2.21.0
+qrcode==8.2
+readchar==4.2.2
+rich==15.0.0
+sounddevice==0.5.6
+textual-image==0.13.2
+tunit==1.7.2
+Unidecode==1.4.0

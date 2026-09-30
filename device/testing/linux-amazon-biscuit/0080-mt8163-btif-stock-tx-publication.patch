@@ -1,0 +1,102 @@
+diff --git a/drivers/misc/mt8163-btif.c b/drivers/misc/mt8163-btif.c
+index 75d567c..a0e34ee 100644
+--- a/drivers/misc/mt8163-btif.c
++++ b/drivers/misc/mt8163-btif.c
+@@ -92,6 +92,7 @@ struct mt8163_btif {
+ 	bool rx_irq_requested;
+ 	u8 trace_tx;
+ 	u8 trace_irq;
++	u8 trace_large_tx;
+ 	u8 trace_rx;
+ };
+ 
+@@ -218,11 +219,12 @@ void mt8163_btif_dump_state(struct mt8163_btif *btif, const char *tag)
+ 		return;
+ 
+ 	dev_warn(btif->dev,
+-		 "BTIF trace %s: core dma_en=%#x handshake=%#x; tx en=%#x int=%#x flag=%#x valid=%u left=%u wpt=%#x rpt=%#x; rx en=%#x int=%#x flag=%#x valid=%u left=%u wpt=%#x rpt=%#x\n",
++		 "BTIF trace %s: core dma_en=%#x handshake=%#x; tx en=%#x int=%#x flag=%#x flush=%#x valid=%u left=%u wpt=%#x rpt=%#x; rx en=%#x int=%#x flag=%#x valid=%u left=%u wpt=%#x rpt=%#x\n",
+ 		 tag, readl(btif->base + BTIF_DMA_EN),
+ 		 readl(btif->base + BTIF_HANDSHAKE),
+ 		 readl(btif->tx.base + DMA_EN), readl(btif->tx.base + DMA_INT_EN),
+ 		 readl(btif->tx.base + DMA_INT_FLAG),
++		 readl(btif->tx.base + DMA_FLUSH),
+ 		 readl(btif->tx.base + DMA_VFF_VALID) & DMA_PTR_MASK,
+ 		 readl(btif->tx.base + DMA_VFF_LEFT) & DMA_PTR_MASK,
+ 		 readl(btif->tx.base + DMA_VFF_WPT),
+@@ -239,7 +241,8 @@ EXPORT_SYMBOL_GPL(mt8163_btif_dump_state);
+ int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len)
+ {
+ 	struct mt8163_btif_dma *tx;
+-	u32 left, valid, wpt, offset, wrap;
++	u32 flush, left, valid, wpt, offset, wrap;
++	bool trace_large;
+ 	size_t first;
+ 	int ret = 0;
+ 
+@@ -252,6 +255,11 @@ int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len)
+ 
+ 	tx = &btif->tx;
+ 	mutex_lock(&btif->tx_lock);
++	trace_large = len > 256 && btif->trace_large_tx < 4;
++	if (trace_large) {
++		btif->trace_large_tx++;
++		mt8163_btif_dump_state(btif, "large-tx-before-publish");
++	}
+ 
+ 	left = readl(tx->base + DMA_VFF_LEFT) & DMA_PTR_MASK;
+ 	if (len > left) {
+@@ -261,6 +269,15 @@ int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len)
+ 
+ 	/* Keep the completion handler out of a concurrent flush while queuing. */
+ 	mt8163_btif_tx_irq_enable(tx, false);
++	readl(tx->base + DMA_INT_EN);
++	flush = readl(tx->base + DMA_FLUSH);
++	if (flush & DMA_ENABLE) {
++		if (trace_large)
++			dev_warn(btif->dev,
++				 "BTIF large TX deferred while flush=%#x\n", flush);
++		ret = -EAGAIN;
++		goto out_restore_irq;
++	}
+ 
+ 	wpt = readl(tx->base + DMA_VFF_WPT);
+ 	offset = wpt & DMA_PTR_MASK;
+@@ -270,8 +287,8 @@ int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len)
+ 	if (first != len)
+ 		memcpy(tx->fifo, buf + first, len - first);
+ 
+-	/* Publish the payload before handing its updated WPT to APDMA. */
+-	dma_wmb();
++	/* Match stock's full barrier before handing the updated WPT to APDMA. */
++	wmb();
+ 	offset += len;
+ 	if (offset >= DMA_VFIFO_SIZE) {
+ 		offset -= DMA_VFIFO_SIZE;
+@@ -280,12 +297,15 @@ int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len)
+ 
+ 	/* A completed flush clears DMA_EN; make the engine live before WPT. */
+ 	writel(DMA_ENABLE, tx->base + DMA_EN);
++	readl(tx->base + DMA_EN);
+ 	writel(offset | wrap, tx->base + DMA_VFF_WPT);
++	readl(tx->base + DMA_VFF_WPT);
+ 
+ 	valid = readl(tx->base + DMA_VFF_VALID) & DMA_PTR_MASK;
+ 	if (valid && valid < BTIF_TX_FIFO_THRESHOLD)
+ 		writel(DMA_ENABLE, tx->base + DMA_FLUSH);
+-	mt8163_btif_tx_irq_enable(tx, true);
++	if (trace_large)
++		mt8163_btif_dump_state(btif, "large-tx-after-publish");
+ 	if (!btif->trace_tx) {
+ 		btif->trace_tx = 1;
+ 		mt8163_btif_dump_state(btif, "first-tx-queued");
+@@ -296,6 +316,9 @@ int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len)
+ 	 * the STP/WMT client must wait for the controller response after enqueue.
+ 	 */
+ 	ret = 0;
++out_restore_irq:
++	mt8163_btif_tx_irq_enable(tx, true);
++	readl(tx->base + DMA_INT_EN);
+ out:
+ 	mutex_unlock(&btif->tx_lock);
+ 	return ret;

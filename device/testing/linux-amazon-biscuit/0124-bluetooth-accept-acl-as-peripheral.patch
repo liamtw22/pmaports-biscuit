@@ -1,0 +1,51 @@
+Accept incoming Bluetooth connections as the peripheral.
+
+A computer paired to the speaker could not use it as a microphone: Windows
+built the hands-free endpoints, but opening the microphone failed every time
+the computer had connected in. A Windows HCI trace showed why - the computer's
+Setup Synchronous Connection (eSCO) came back from this controller with
+Limited Resources (0x0D). The MT8163's Bluetooth firmware refuses the remote's
+eSCO setup whenever it is the central of the ACL link.
+
+It is the central on every incoming link because the kernel accepts with role
+0x00 ("become central") when a listener asks for HCI_LM_MASTER, and BlueZ's
+A2DP (AVDTP) listener does. Windows then refuses the switch back (0x21), so a
+userspace fix after the connection completes cannot recover the link.
+
+Measured on Device 1 with a Windows 11 laptop:
+
+  Speaker peripheral (bluetoothd without A2DP)   3/3 eSCO opens succeed
+  Speaker central (stock accept)                 eSCO refused 0x0D
+  Switch Role to peripheral after connecting     refused 0x21
+
+So accept every incoming ACL as the peripheral. Outgoing connections are left
+alone: those already offer the remote a role switch, and a remote that takes
+it leaves this side the peripheral.
+
+The cost is scatternet. With two sources connected at once, the speaker is now
+a peripheral in two piconets rather than the central of one, which the
+controller must time-share. BLE (the Home Assistant Bluetooth proxy) is a
+different link type and does not pass through here.
+
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -3340,10 +3340,15 @@
+ 
+ 		bacpy(&cp.bdaddr, &ev->bdaddr);
+ 
+-		if (lmp_rswitch_capable(hdev) && (mask & HCI_LM_MASTER))
+-			cp.role = 0x00; /* Become central */
+-		else
+-			cp.role = 0x01; /* Remain peripheral */
++		/* Always remain peripheral on this device. The MT8163's
++		 * Bluetooth firmware refuses a remote's eSCO setup with
++		 * Limited Resources (0x0D) whenever it is the central of the
++		 * ACL, so a computer connecting in could never open its
++		 * hands-free audio. The request to become central comes from
++		 * BlueZ's A2DP listener (HCI_LM_MASTER), and remotes such as
++		 * Windows then refuse a later switch back (0x21).
++		 */
++		cp.role = 0x01; /* Remain peripheral */
+ 
+ 		hci_send_cmd(hdev, HCI_OP_ACCEPT_CONN_REQ, sizeof(cp), &cp);
+ 	} else if (!(flags & HCI_PROTO_DEFER)) {

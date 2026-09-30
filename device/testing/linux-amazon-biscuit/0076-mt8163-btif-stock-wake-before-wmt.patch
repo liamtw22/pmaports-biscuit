@@ -1,0 +1,76 @@
+diff --git a/drivers/misc/mt8163-btif.c b/drivers/misc/mt8163-btif.c
+--- a/drivers/misc/mt8163-btif.c
++++ b/drivers/misc/mt8163-btif.c
+@@ -13,5 +13,6 @@
+ #include <linux/bits.h>
+ #include <linux/clk.h>
++#include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/errno.h>
+ #include <linux/interrupt.h>
+@@ -25,5 +26,6 @@
+ #define BTIF_TRI_LVL			0x60
+ #define BTIF_DMA_EN			0x4c
++#define BTIF_WAK			0x64
+ #define BTIF_HANDSHAKE			0x6c
+ 
+ #define BTIF_IER_RXFEN			BIT(0)
+@@ -186,3 +186,30 @@
+ EXPORT_SYMBOL_GPL(mt8163_btif_unregister_client);
+ 
++/*
++ * The vendor BTIF PSM path wakes CONSYS by pulsing AP_WAKEUP_CONSYS low for
++ * 64--96 us, then restoring it high.  The register is write-only and bit 0
++ * is its sole defined bit, so use direct writes instead of read-modify-write.
++ */
++int mt8163_btif_wakeup_consys(struct mt8163_btif *btif)
++{
++	if (!btif)
++		return -EINVAL;
++
++	mutex_lock(&btif->state_lock);
++	if (!btif->active) {
++		mutex_unlock(&btif->state_lock);
++		return -EHOSTDOWN;
++	}
++
++	writel(0, btif->base + BTIF_WAK);
++	usleep_range(64, 96);
++	writel(BIT(0), btif->base + BTIF_WAK);
++
++	mutex_unlock(&btif->state_lock);
++	dev_info(btif->dev,
++		 "BTIF AP-to-CONSYS wake pulse completed before WMT bootstrap\n");
++	return 0;
++}
++EXPORT_SYMBOL_GPL(mt8163_btif_wakeup_consys);
++
+ void mt8163_btif_dump_state(struct mt8163_btif *btif, const char *tag)
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -642,6 +642,13 @@ static int mt8163_stp_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		goto err_btif;
+ 
++	/* Match stock PSM's physical host-wake edge before the raw WMT probe. */
++	ret = mt8163_btif_wakeup_consys(stp->btif);
++	if (ret)
++		goto err_client;
++
++	dev_info(&pdev->dev, "stock BTIF PSM wake completed; starting raw WMT\n");
++
+ 	ret = mt8163_stp_bootstrap(stp);
+ 	if (ret)
+ 		goto err_client;
+diff --git a/include/linux/mt8163-btif.h b/include/linux/mt8163-btif.h
+--- a/include/linux/mt8163-btif.h
++++ b/include/linux/mt8163-btif.h
+@@ -25,6 +25,7 @@ struct mt8163_btif_client {
+ struct mt8163_btif *mt8163_btif_get(struct device *dev);
+ int mt8163_btif_start(struct mt8163_btif *btif);
+ void mt8163_btif_stop(struct mt8163_btif *btif);
++int mt8163_btif_wakeup_consys(struct mt8163_btif *btif);
+ void mt8163_btif_dump_state(struct mt8163_btif *btif, const char *tag);
+ int mt8163_btif_register_client(struct mt8163_btif *btif,
+ 				const struct mt8163_btif_client *client);

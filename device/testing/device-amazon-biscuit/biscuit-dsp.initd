@@ -1,0 +1,115 @@
+#!/sbin/openrc-run
+
+description="Playback DSP: speaker correction, per-volume loudness, compressor and limiter"
+
+# Keep audio off CPU 0, which handles USB/SPI interrupt bursts.
+# exec inheritance also covers subprocesses and supervised restarts.
+command="/usr/bin/taskset"
+command_args="-c 1-3 /usr/bin/biscuit-dsp -v -i hw:Loopback,1,0 -o hw:0,0"
+
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+# Logged through a pipe, not straight to the file. This service runs at
+# realtime priority, and a write to the ext4 root can stall for most of a
+# second behind the journal while something else writes (3.8: the call DSP
+# did exactly that and its branch overflowed). OpenRC hands the output to a
+# cat at ordinary priority instead, which takes any such stall; the pipe
+# absorbs 64 KiB meanwhile.
+output_logger="cat >> /var/log/biscuit-dsp.log"
+error_logger="cat >> /var/log/biscuit-dsp.log"
+
+# Respawn, and this one really is a daemon - unlike biscuit-setup, it is meant
+# to run forever, so supervision is the right model here.
+#
+# It also has to run, because pcm."default" points at the loopback: if this is
+# not draining the loopback there is no path to the codec and playback is
+# silent. supervise-daemon restarts it rather than leaving the device mute.
+supervisor="supervise-daemon"
+respawn_delay=2
+respawn_max=0
+
+depend() {
+	need localmount
+	before bluealsa
+}
+
+start_pre() {
+	# snd-aloop is what "default" writes into. Without it there is no
+	# hw:Loopback and nothing plays at all.
+	if [ ! -d /proc/asound/Loopback ]; then
+		modprobe snd-aloop pcm_substreams=1 2>/dev/null
+		i=0
+		while [ ! -d /proc/asound/Loopback ] && [ $i -lt 10 ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+	fi
+	if [ ! -d /proc/asound/Loopback ]; then
+		eerror "snd-aloop did not load - playback would be silent, refusing to start"
+		return 1
+	fi
+	checkpath -d -m 0755 /run/biscuit-dsp
+	# The EQ the settings page shows is /opt/persist/eq.json; the files this
+	# reads are on the root filesystem and do not follow it through a reset or
+	# a reflash on their own. Re-derive them before starting. Never fatal: a
+	# failure here leaves the previous EQ, which is still a working one.
+	if [ -r /usr/bin/biscuit_eq.py ]; then
+		python3 /usr/bin/biscuit_eq.py --apply || \
+			ewarn "could not re-apply the EQ from /opt/persist/eq.json"
+	fi
+	return 0
+}
+
+# Realtime priority for the audio path.
+#
+# SCHED_OTHER at nice 0 produced audible break-up: biscuit-dsp logged 1301
+# output xruns, and playback was described as robotic. At SCHED_FIFO 50,
+# twenty-five seconds of continuous playback produced zero new ones.
+#
+# Done here rather than by wrapping command= because some of these services are
+# shell pipelines: chrt on the shell would not reach the process actually
+# touching the codec, so this walks the children too.
+#
+# Never fatal. A device that cannot get realtime priority should still play
+# audio badly rather than not start.
+_apply_rt() {
+	_pid=$(cat "${pidfile}" 2>/dev/null)
+	[ -n "${_pid}" ] || return 0
+	for _p in ${_pid} $(pgrep -P "${_pid}" 2>/dev/null); do
+		chrt -f -p 50 "${_p}" 2>/dev/null || true
+	done
+	return 0
+}
+
+start_post() {
+	# supervise-daemon writes the pidfile as it forks; give it a moment.
+	sleep 1
+	_apply_rt
+	_relearn_volume
+}
+
+_relearn_volume() {
+	# biscuit-dsp holds the per-volume loudness push in memory and learns the
+	# level ONLY from its control FIFO, which biscuit-audio writes when the
+	# volume CHANGES. So a DSP that restarts on its own - an xrun, a crash, a
+	# manual restart - comes back at push 0 and stays there until somebody
+	# happens to touch the volume, playing about 15 dB quieter than it should at
+	# the same indicated level. Nothing surfaces it: every service still reports
+	# "started" and the indicated volume is unchanged.
+	#
+	# Pulling the published level here makes the DSP self-sufficient instead of
+	# depending on a message it may have missed.
+	i=0
+	while [ ! -p /run/biscuit-dsp/control ] && [ $i -lt 25 ]; do
+		sleep 0.2
+		i=$((i + 1))
+	done
+	[ -p /run/biscuit-dsp/control ] || return 0
+	[ -r /run/biscuit-audio/volume ] || return 0
+	vol=$(cat /run/biscuit-audio/volume 2>/dev/null)
+	case "$vol" in
+		''|*[!0-9]*) return 0 ;;
+	esac
+	echo "volume $vol" > /run/biscuit-dsp/control 2>/dev/null || true
+	return 0
+}

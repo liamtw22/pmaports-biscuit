@@ -1,0 +1,15 @@
+# Loopback only, and that is the point.
+#
+# Wi-Fi is brought up by /etc/local.d/wifi.start rather than by this file:
+# busybox ifupdown cannot express the retry-and-blacklist behaviour the CONSYS
+# radio needs, so the networking service is deliberately not used for wlan0.
+#
+# But the file still has to exist and still has to parse. Shipping it empty -
+# which is what happened through pkgrel 37 - makes `ifquery` fail, which makes
+# the networking service fail, which silently blocks every service that
+# declares `need net`. chronyd is one of those, so the RTC fix added in
+# pkgrel 36 never ran: the clock stayed at 2069 and TLS stayed broken
+# device-wide, with nothing in the logs pointing at the real cause.
+
+auto lo
+iface lo inet loopback

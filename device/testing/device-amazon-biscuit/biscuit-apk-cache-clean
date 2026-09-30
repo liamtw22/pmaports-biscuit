@@ -1,0 +1,22 @@
+#!/bin/sh
+# apk commit hook: keep the package cache from filling the root filesystem.
+# Installed as /etc/apk/commit_hooks.d/biscuit-cache-clean.
+#
+# apk-tools 3's own /lib/apk/config sets cache-predownload: every package is
+# downloaded into /var/cache/apk before the commit starts, so a lost Wi-Fi
+# connection cannot leave a half-upgraded device. Then the files are kept. On a
+# 3.1 GB root that grew about 45 MB a release and had reached 1.2 GB (114
+# files) by r271.
+#
+# apk runs every executable in commit_hooks.d twice per transaction, with
+# "pre-commit" and then "post-commit". By post-commit every downloaded package
+# is installed and not needed again, so delete the package files. Keep the
+# repository indexes, which make the next transaction faster. Predownload stays
+# on; only what it leaves behind goes.
+#
+# Only on the device itself: pmbootstrap installs this package into an image
+# from a build host, and the cache there is pmbootstrap's own.
+[ "${1:-}" = post-commit ] || exit 0
+grep -qs 'amazon,biscuit' /proc/device-tree/compatible || exit 0
+rm -f /var/cache/apk/*.apk
+exit 0

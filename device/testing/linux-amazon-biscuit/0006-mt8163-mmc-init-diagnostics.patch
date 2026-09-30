@@ -1,0 +1,81 @@
+--- a/drivers/mmc/host/mtk-sd.c
++++ b/drivers/mmc/host/mtk-sd.c
+@@ -1373,8 +1373,16 @@
+ 		}
+ 	}
+ 
+ 	if (!sbc_error && !(events & MSDC_INT_CMDRDY)) {
++		if (cmd->opcode <= 3 &&
++		    (events & (MSDC_INT_RSPCRCERR | MSDC_INT_CMDTMO)))
++			dev_info(host->dev,
++				 "MT8163-DIAG: cmd%d fault events=%08x ps=%08x sdc_cfg=%08x sdc_sts=%08x cfg=%08x int=%08x inten=%08x iocon=%08x\n",
++				 cmd->opcode, events, readl(host->base + MSDC_PS),
++				 readl(host->base + SDC_CFG), readl(host->base + SDC_STS),
++				 readl(host->base + MSDC_CFG), readl(host->base + MSDC_INT),
++				 readl(host->base + MSDC_INTEN), readl(host->base + EMMC_IOCON));
+ 		if ((events & MSDC_INT_CMDTMO && !host->hs400_tuning) ||
+ 		    (!mmc_op_tuning(cmd->opcode) && !host->hs400_tuning))
+ 			/*
+ 			 * should not clear fifo/interrupt as the tune data
+@@ -1396,8 +1404,12 @@
+ 				"%s: cmd=%d arg=%08X; rsp %08X; cmd_error=%d\n",
+ 				__func__, cmd->opcode, cmd->arg, rsp[0],
+ 				cmd->error);
+ 
++	if (cmd->opcode <= 3)
++		dev_info(host->dev,
++			 "MT8163-DIAG: cmd%d done events=%08x rsp=%08x error=%d\n",
++			 cmd->opcode, events, rsp[0], cmd->error);
+ 	msdc_cmd_next(host, mrq, cmd);
+ 	return true;
+ }
+ 
+@@ -1442,8 +1454,14 @@
+ 	unsigned long flags;
+ 
+ 	WARN_ON(host->cmd);
+ 	host->cmd = cmd;
++	if (cmd->opcode <= 3)
++		dev_info(host->dev,
++			 "MT8163-DIAG: cmd%d start arg=%08x flags=%08x mclk=%u actual=%u ps=%08x sts=%08x\n",
++			 cmd->opcode, cmd->arg, cmd->flags, host->mclk,
++			 mmc_from_priv(host)->actual_clock,
++			 readl(host->base + MSDC_PS), readl(host->base + SDC_STS));
+ 
+ 	mod_delayed_work(system_percpu_wq, &host->req_timeout, DAT_TIMEOUT);
+ 	if (!msdc_cmd_is_ready(host, mrq, cmd))
+ 		return;
+@@ -2159,8 +2177,15 @@
+ 	}
+ 
+ 	if (host->mclk != ios->clock || host->timing != ios->timing)
+ 		msdc_set_mclk(host, ios->timing, ios->clock);
++	dev_info(host->dev,
++		 "MT8163-DIAG: ios power=%u vdd=%u req=%u actual=%u mclk=%u timing=%u width=%u vmmc_uv=%d vqmmc_uv=%d vq_en=%d\n",
++		 ios->power_mode, ios->vdd, ios->clock, mmc->actual_clock,
++		 host->mclk, ios->timing, ios->bus_width,
++		 IS_ERR(mmc->supply.vmmc) ? -1 : regulator_get_voltage(mmc->supply.vmmc),
++		 IS_ERR(mmc->supply.vqmmc) ? -1 : regulator_get_voltage(mmc->supply.vqmmc),
++		 host->vqmmc_enabled);
+ }
+ 
+ static u64 test_delay_bit(u64 delay, u32 bit)
+ {
+@@ -2676,11 +2701,17 @@
+ static void msdc_hw_reset(struct mmc_host *mmc)
+ {
+ 	struct msdc_host *host = mmc_priv(mmc);
+ 
++	dev_info(host->dev,
++		 "MT8163-DIAG: hw-reset before iocon=%08x ps=%08x sts=%08x\n",
++		 readl(host->base + EMMC_IOCON), readl(host->base + MSDC_PS),
++		 readl(host->base + SDC_STS));
+ 	sdr_set_bits(host->base + EMMC_IOCON, 1);
+ 	udelay(10); /* 10us is enough */
+ 	sdr_clr_bits(host->base + EMMC_IOCON, 1);
++	dev_info(host->dev, "MT8163-DIAG: hw-reset after iocon=%08x\n",
++		 readl(host->base + EMMC_IOCON));
+ }
+ 
+ static void msdc_ack_sdio_irq(struct mmc_host *mmc)
+ {

@@ -1,0 +1,52 @@
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -251,6 +251,41 @@
+ 	.hw_params = mt8163_biscuit_be_hw_params,
+ };
+ 
++static int mt8163_biscuit_vendor_48k_hw_params(
++        struct snd_pcm_substream *substream,
++        struct snd_pcm_hw_params *params)
++{
++        struct snd_soc_pcm_runtime *rtd = substream->private_data;
++        struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
++        struct snd_soc_component *codec = codec_dai->component;
++
++        if (params_rate(params) != 48000)
++                return 0;
++
++        snd_soc_component_write(codec, 0x04, 0x03);
++        snd_soc_component_write(codec, 0x05, 0xd1);
++        snd_soc_component_write(codec, 0x06, 0x30);
++        snd_soc_component_write(codec, 0x07, 0x00);
++        snd_soc_component_write(codec, 0x08, 0x00);
++        snd_soc_component_write(codec, 0x0b, 0x85);
++        snd_soc_component_write(codec, 0x0c, 0x83);
++        snd_soc_component_write(codec, 0x0d, 0x00);
++        snd_soc_component_write(codec, 0x0e, 0x80);
++        snd_soc_component_write(codec, 0x12, 0x85);
++        snd_soc_component_write(codec, 0x13, 0x83);
++        snd_soc_component_write(codec, 0x14, 0x80);
++        snd_soc_component_write(codec, 0x1e, 0x81);
++        snd_soc_component_write(codec, 0x3c, 0x02);
++        snd_soc_component_write(codec, 0x44, 0x0f);
++
++        dev_info(codec->dev, "BISCUIT: applied vendor TLV320 9.6MHz/48k clock recipe\n");
++        return 0;
++}
++
++static const struct snd_soc_ops mt8163_biscuit_i2s1_ops = {
++        .hw_params = mt8163_biscuit_vendor_48k_hw_params,
++};
++
+ static int mt8163_biscuit_i2s1_init(struct snd_soc_pcm_runtime *rtd)
+ {
+ 	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+@@ -371,6 +406,7 @@
+ 	priv->links[1].no_pcm = 1;
+ 	priv->links[1].playback_only = 1;
+ 	priv->links[1].init = mt8163_biscuit_i2s1_init;
++	priv->links[1].ops = &mt8163_biscuit_i2s1_ops;
+ 	priv->links[1].dai_fmt = SND_SOC_DAIFMT_I2S |
+ 		SND_SOC_DAIFMT_NB_NF |
+ 		SND_SOC_DAIFMT_CBC_CFC;

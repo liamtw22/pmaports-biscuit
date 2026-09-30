@@ -1,0 +1,97 @@
+Expose the microphone-mute LED and its brightness selector.
+
+The red LED under the mute button was never wired up, and it is on neither LED
+controller. All 36 IS31FL3236 channels are light ring - confirmed by lighting
+biscuit:ring:segment-11:red alone and watching a ring segment come on, which
+also disproves the vendor's channel-offset = <3> implying an 11-segment ring.
+The LP55231 the vendor declares at i2c0 0x32 is simply not populated here:
+i2cdetect finds nothing at that address while its enable line, GPIO29, already
+reads DIR=1 DOUT=1 DIN=1.
+
+It belongs to Amazon's privacy circuit instead (biscuit.dtsi amz_privacy, driven
+by drivers/misc/amz_priv.c):
+
+	amz_privacy {
+		gpios = <&pio 87 1>;
+		hw_latch = <0>;
+		bright-state-gpio = <&pio 88 1>;
+	};
+
+Both pins are outputs left set by the bootloader and claimed by nothing.
+
+Measured on hardware:
+
+  - GPIO87 high lights the LED red.
+  - GPIO88 selects one of two brightness levels, and is active low: driving
+    it low is the brighter state. That matches the active-low flag on the
+    vendor's bright-state-gpio. LK leaves it high, so the LED starts dim.
+
+Both are exposed through gpio-leds. The brightness selector is modelled as a
+second LED only because that is the sane way to hand a bare GPIO to userspace
+here - it modifies the LED above rather than being a light of its own.
+LEDS_GPIO is already enabled by defconfig, so there is no config change.
+
+What this deliberately does not do is mute anything. The privacy line does not
+gate the microphones on this board: hw_latch is 0, and amz_priv.c mutes them in
+software from a callback (amz_priv_mute_cb, PRIV_CB_MIC). Verified by recording
+the array for six seconds with the LED lit and again with it unlit, under the
+same conditions - seven channels at -13 to -17 dBFS both times, no difference.
+Muting is done by turning the four "Mic X PGA Capture Switch" controls off,
+which gives digital silence on every channel. Tying that and this LED to the
+KEY_MUTE press that mtk-pmic-keys has reported since r188 is userspace work.
+
+diff -urN '--exclude=.git' r188new/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts r189new/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -44,6 +44,51 @@
+ 			debounce-interval = <20>;
+ 		};
+ 	};
++
++	/*
++	 * The red LED under the microphone-mute button. It is on neither LED
++	 * controller - the IS31FL3236's 36 channels are all light ring, and the
++	 * LP55231 the vendor declares at i2c0 0x32 is not populated on this
++	 * board. It belongs to Amazon's privacy circuit instead, which the
++	 * vendor drives from drivers/misc/amz_priv.c:
++	 *
++	 *	amz_privacy {
++	 *		gpios = <&pio 87 1>;
++	 *		hw_latch = <0>;
++	 *		bright-state-gpio = <&pio 88 1>;
++	 *	};
++	 *
++	 * GPIO87 lights it, measured on hardware. GPIO88 selects between the
++	 * two brightness levels and is active low - driving it low is the
++	 * brighter state - which is why the vendor declares it with the
++	 * active-low flag. LK leaves it high, so the LED comes up dim.
++	 *
++	 * The brightness selector is exposed as a second LED only because that
++	 * is the sane way to hand a bare GPIO to userspace here. It is a
++	 * modifier for the LED above, not a light of its own.
++	 *
++	 * Note what this does NOT do: the privacy line does not gate the
++	 * microphones on this board. hw_latch is 0, and the vendor mutes them
++	 * in software from a callback. Verified by recording the array with the
++	 * LED lit and unlit - identical levels. Muting is done by turning the
++	 * four "Mic X PGA Capture Switch" controls off, which gives digital
++	 * silence on every channel.
++	 */
++	mute-leds {
++		compatible = "gpio-leds";
++
++		led-mute {
++			label = "biscuit:mute:red";
++			gpios = <&pio 87 GPIO_ACTIVE_HIGH>;
++			default-state = "off";
++		};
++
++		led-mute-bright {
++			label = "biscuit:mute:bright";
++			gpios = <&pio 88 GPIO_ACTIVE_LOW>;
++			default-state = "off";
++		};
++	};
+ };
+ 
+ &keypad {

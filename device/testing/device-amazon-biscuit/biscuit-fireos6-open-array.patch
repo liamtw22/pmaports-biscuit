@@ -1,0 +1,226 @@
+Open-coefficient array mode for the Fire OS 6 frontend (pmOS 8-beam profile).
+
+--open-coefficients computes the 768-tap WOLA prototype (Kaiser-windowed sinc)
+and the eight fixed beams (diffuse-field superdirective, MK2/MK3/MK5/MK6 at
+their measured positions) at startup, so this frontend runs with no vendor file.
+--clean-on-echo adapts the all-beam canceller only while playback is active and
+passes the fixed beams through untouched otherwise. The READY banner reports
+both. --merge-all outputs the mean of the eight cleaned beams. Applied by
+abuild's default_prepare after the tarball is unpacked.
+
+--- a/biscuit-fireos6/src/frontend.c
++++ b/biscuit-fireos6/src/frontend.c
+@@ -43,6 +43,7 @@
+ #define M 4
+ #define B 8
+ #define PI 3.14159265358979323846
++#define RATE_HZ 16000.0
+ typedef aec_complex cpx;
+ static const int channel[M]={1,2,4,5};
+ static float prototype[LEN],normalizer[HOP],history[M+2][LEN],overlap[B][LEN];
+@@ -106,6 +107,88 @@
+     }
+     return 0;
+ }
++/* OPEN COEFFICIENTS (--open-coefficients): the two things this frontend
++ * otherwise reads from Amazon's files, designed here from first principles so
++ * the chain needs no vendor asset at all.
++ *
++ * Prototype: a 768-tap Kaiser-windowed sinc (beta 8, -6 dB at 0.65 of a bin),
++ * the textbook oversampled-DFT-filterbank lowpass. Its analysis/synthesis round
++ * trip through this file's WOLA measures a -24.2 dB residual on white noise,
++ * the same as the vendor prototype's -24.4 dB. It is scaled to a DC gain of
++ * OPEN_PROTO_DC so every level-dependent constant downstream (the 2*HOP
++ * synthesis normaliser, the adaptive stage's floors, --gain 13) keeps the level
++ * it was tuned at.
++ *
++ * Beams: diffuse-field superdirective (MVDR with diagonal loading 0.05) for the
++ * four capsules this frontend reads - MK2, MK3, MK5 and MK6 at their measured
++ * positions (tools/beamform/biscuit-mic-array.json) - steered to 150 - 45*b
++ * degrees, distortionless (unity gain) in the look direction, one tap per bin.
++ * The adaptive stage's references {b+3, b+5} assume eight beams in circular
++ * order, which this preserves.
++ *
++ * Measured on the 2026-09-24 captures with --adaptive --adapt-mask 255
++ * --no-aec --clean-on-echo and no VAD: barge-in 48/50 (production pmOS 31),
++ * quiet 50/50/49 at 1/4/8 m (pmOS 50/50/49), and 49/50/49 on quiet prompts
++ * straight after three minutes of music. */
++#define OPEN_PROTO_BETA 8.0
++#define OPEN_PROTO_CUTOFF 1.3
++#define OPEN_PROTO_DC 10.8933
++#define OPEN_LOADING 0.05
++#define OPEN_SOUND 343.0
++static const double open_mic_mm[M][2]={{-31.18,-18.0},{0.0,-36.0},{31.18,18.0},{0.0,36.0}};
++static double bessel_i0(double x) {
++    double sum=1,term=1;
++    for(int k=1;k<200;k++){term*=(x/(2*k))*(x/(2*k));sum+=term;if(term<1e-17*sum)break;}
++    return sum;
++}
++static double sinc_pi(double x) {return fabs(x)<1e-12?1.0:sin(PI*x)/(PI*x);}
++/* Solve the real 4x4 system a*x=b in place (partial pivoting). */
++static void solve4(double a[M][M],double *b) {
++    for(int c=0;c<M;c++){
++        int piv=c;for(int r=c+1;r<M;r++)if(fabs(a[r][c])>fabs(a[piv][c]))piv=r;
++        for(int j=0;j<M;j++){double t=a[c][j];a[c][j]=a[piv][j];a[piv][j]=t;}
++        double t=b[c];b[c]=b[piv];b[piv]=t;
++        for(int r=c+1;r<M;r++){double f=a[r][c]/a[c][c];for(int j=c;j<M;j++)a[r][j]-=f*a[c][j];b[r]-=f*b[c];}
++    }
++    for(int r=M-1;r>=0;r--){double v=b[r];for(int j=r+1;j<M;j++)v-=a[r][j]*b[j];b[r]=v/a[r][r];}
++}
++static void open_coefficients(void) {
++    double sum=0,i0b=bessel_i0(OPEN_PROTO_BETA),proto[LEN];
++    for(int n=0;n<LEN;n++){
++        double x=n-(LEN-1)/2.0,r=2.0*n/(LEN-1)-1.0;
++        proto[n]=sinc_pi(x*OPEN_PROTO_CUTOFF/N)*bessel_i0(OPEN_PROTO_BETA*sqrt(fmax(0.0,1-r*r)))/i0b;
++        sum+=proto[n];
++    }
++    for(int n=0;n<LEN;n++)prototype[n]=(float)(proto[n]*OPEN_PROTO_DC/sum);
++    for(int p=0;p<HOP;p++)normalizer[p]=2*HOP;
++    memset(coefficients,0,sizeof(coefficients));
++    for(int b=0;b<B;b++){
++        double th=(150.0-45.0*b)*PI/180.0,ux=cos(th),uy=sin(th);
++        for(int k=0;k<N/2;k++){
++            double f=(k>0?k:0.5)*RATE_HZ/N,g[M][M],dre[M],dim[M],xr[M],xi[M];
++            for(int i=0;i<M;i++){
++                for(int j=0;j<M;j++){
++                    double dx=(open_mic_mm[i][0]-open_mic_mm[j][0])/1000,dy=(open_mic_mm[i][1]-open_mic_mm[j][1])/1000;
++                    g[i][j]=sinc_pi(2*f*sqrt(dx*dx+dy*dy)/OPEN_SOUND)+(i==j?OPEN_LOADING:0);
++                }
++                double tau=-(open_mic_mm[i][0]/1000*ux+open_mic_mm[i][1]/1000*uy)/OPEN_SOUND;
++                dre[i]=cos(-2*PI*f*tau);dim[i]=sin(-2*PI*f*tau);
++                xr[i]=dre[i];xi[i]=dim[i];
++            }
++            double g2[M][M];memcpy(g2,g,sizeof(g2));
++            solve4(g,xr);solve4(g2,xi);          /* the coherence matrix is real */
++            /* d^H w for w = xr + j xi */
++            double nre=0,nim=0;
++            for(int i=0;i<M;i++){nre+=dre[i]*xr[i]+dim[i]*xi[i];nim+=dre[i]*xi[i]-dim[i]*xr[i];}
++            double den=nre*nre+nim*nim;
++            for(int i=0;i<M;i++){
++                /* w = (xr + j xi) / (nre + j nim); the frontend applies conj(w). */
++                double wr=(xr[i]*nre+xi[i]*nim)/den,wi=(xi[i]*nre-xr[i]*nim)/den;
++                coefficients[b][k][0][i]=(cpx){(float)wr,(float)-wi};
++            }
++        }
++    }
++}
+ /* Stock's existing 80-Hz high-pass coefficients; no stock +20-dB makeup is
+  * assumed for the new MicPreProcess configuration (MicBoostdB=0). */
+ struct hpf80 { float x1[3], x2[3], y1[3], y2[3]; };
+@@ -162,12 +245,13 @@
+ }
+ static int usage(void) {
+     fprintf(stderr,"fireos6-v0.4.0 UNQUALIFIED reference/adaptive/lifecycle candidate.\n"
+-      "Usage: --allow-unqualified --assets DIR [--beam 0..7|--all-beams] [--float32]\n"
++      "Usage: --allow-unqualified --assets DIR|--open-coefficients [--beam 0..7|--all-beams] [--float32]\n"
+       " [--no-aec] [--aec-hold] [--bypass-fbf] [--no-hpf] [--reverse-taps] [--conjugate] [--gain N] [--cal FILE] [--timing FILE]\n"
+       " [--framed-input] [--framed-output] [--rendered-reference PATH]\n"
+       " [--ref-delay -256..256] [--nl-ref] [--freeze-aec-on-speech] [--vad-file F]\n"
+       " [--dnn-vad vad_lite.tflite] [--dnn-lib DIR] [--dnn-threshold 0..1]\n"
+       " [--adaptive] [--adapt-mask 0..255] [--protect-mask 0..255] [--select-beam]\n"
++      " [--adapt-on-echo] [--clean-on-echo] [--merge-all]\n"
+       " [--rt-priority 1..99]  SCHED_FIFO + mlockall for this thread; needs root. 45\n"
+       "                        matches the biscuit-beamform branch. Fatal if refused.\n"
+       "Input: 8-channel S24_3LE/16kHz; output: mono (or 8-beam) S16_LE/16kHz.\n");return 2;
+@@ -225,7 +309,7 @@
+      * against a slowly tracked noise floor - NOT stock's DNN VAD, and not qualified.
+      * Exists to test whether the merger helps once it is fed at all. */
+     int vad_energy=0;float vad_floor=0.f,vad_confidence=0.f;
+-    int adapt_on_echo=0;
++    int adapt_on_echo=0,clean_on_echo=0,open_coefs=0,merge_all=0;
+     int freeze_on_speech=0;
+     float aec_band_lo=0.f,aec_band_hi=0.f;
+     int ref_delay=0,nl_ref=0,freeze_aec=0,prev_speech=0;
+@@ -265,6 +349,9 @@
+         else if(!strcmp(argv[i],"--stock-observer"))stock_observer=1;
+         else if(!strcmp(argv[i],"--vad-energy"))vad_energy=1;
+         else if(!strcmp(argv[i],"--adapt-on-echo"))adapt_on_echo=1;
++        else if(!strcmp(argv[i],"--open-coefficients"))open_coefs=1;
++        else if(!strcmp(argv[i],"--merge-all"))merge_all=1;
++        else if(!strcmp(argv[i],"--clean-on-echo"))adapt_on_echo=clean_on_echo=1;
+         else if(!strcmp(argv[i],"--freeze-on-speech"))freeze_on_speech=1;
+         else if(!strcmp(argv[i],"--nl-ref"))nl_ref=1;
+         else if(!strcmp(argv[i],"--freeze-aec-on-speech"))freeze_aec=1;
+@@ -300,14 +387,18 @@
+         else if(!strcmp(argv[i],"--rt-priority")&&i+1<argc){char *end;long v=strtol(argv[++i],&end,10);if(*end||v<1||v>99)return usage();rt_priority=(int)v;}
+         else return usage();
+     }
+-    if(!allowed||!dir)return usage();
++    if(!allowed||(!dir&&!open_coefs)||(dir&&open_coefs))return usage();
+     if(stock_observer&&!adaptive_enabled)return usage();
+     /* The refusal stands unless something is actually producing confidence. */
++    /* --merge-all is an output mode of the adaptive stage and excludes the
++     * other two: one beam per channel, or the selected group. */
++    if(merge_all&&(!adaptive_enabled||all||select_beam))return usage();
+     if(select_beam&&!vad_energy){fprintf(stderr,"Selection requires a qualified per-hop confidence source; unavailable in this CLI.\n");return 2;}
+     if(select_beam&&vad_energy)fprintf(stderr,"WARNING: selection driven by the UNQUALIFIED energy VAD prototype\n");
+     if((framed_output&&(all||floating))||((select_beam||adapt_mask||protect_mask)&&!adaptive_enabled)||
+        (adaptive_enabled&&bypass)||(render_path&&!framed_input))return usage();
+-    if(assets(dir,reverse,conjugate)){fprintf(stderr,"Invalid experimental assets\n");return 1;}
++    if(open_coefs)open_coefficients();
++    else if(assets(dir,reverse,conjugate)){fprintf(stderr,"Invalid experimental assets\n");return 1;}
+     /* The AEC step-size schedule is an ordinary imported asset: the built-in
+      * curve is ours and always works, and the owner can supply the stock one
+      * alongside the other Fire OS 6 files. Absence is normal, not an error; a
+@@ -341,7 +432,8 @@
+     if(nl_ref){aec_destroy(aec);aec=aec_create(4,2);if(!aec)return 1;
+         if(aec_band_hi>0.f)aec_set_adapt_band(aec,aec_band_lo,aec_band_hi);}
+     {char vss[512];int rc;
+-     if(snprintf(vss,sizeof(vss),"%s/aec_vss_table.bin",dir)<(int)sizeof(vss)){
++     /* No assets directory with --open-coefficients: nothing to import. */
++     if(dir&&snprintf(vss,sizeof(vss),"%s/aec_vss_table.bin",dir)<(int)sizeof(vss)){
+          rc=aec_vss_load(vss);
+          if(rc<0&&rc!=-2){fprintf(stderr,"vss table at %s is not usable (%d)\n",vss,rc);return 1;}
+      }}
+@@ -358,10 +450,12 @@
+     adaptive_state *adaptive=adaptive_enabled?adaptive_create((unsigned)beam):NULL;
+     if(!consumer||(render_path&&!worker)||(adaptive_enabled&&!adaptive)){fprintf(stderr,"Candidate initialization failed\n");return 1;}
+     if(rt_priority&&realtime_engage(rt_priority))return 1;
+-    fprintf(stderr,"READY fireos6-v0.4.0 vss=%s vad=%s selection=%s\n",
++    fprintf(stderr,"READY fireos6-v0.4.0 vss=%s vad=%s selection=%s coefficients=%s cleaning=%s\n",
+             aec_vss_is_imported()?"imported":"pmos",
+             dnn?"dnn-stock":vad_table?"external-file":vad_energy?"energy-prototype":"none",
+-            select_beam?"merged-groups":"single-beam");fflush(stderr);
++            merge_all?"mean-of-8":select_beam?"merged-groups":"single-beam",
++            open_coefs?"open":"assets",
++            clean_on_echo?"on-echo":adapt_on_echo?"adapt-on-echo":"always");fflush(stderr);
+     unsigned long hops=0,clipped=0,missed=0;double wall_sum=0,wall_max=0,cpu_sum=0;
+     int channels=all?B:1;size_t bytes=0;double read_start=stamp(CLOCK_MONOTONIC);
+     uint64_t previous_capture=0,expected_sample=0,stream_generation=0,resets=0,reference_resets=0,stale_capture_hops=0;
+@@ -504,6 +598,11 @@
+             ac.adapt_mask=(warming||!valid||muted||_speech||
+                 (adapt_on_echo&&!control.permit_ref))?0:adapt_mask;
+             ac.protected_mask=protect_mask;
++            /* Without playback there is no echo to remove, and filters learned
++             * on the last song would only subtract part of the talker. Pass the
++             * fixed beams through untouched, and keep what was learned for when
++             * the music comes back. */
++            if(clean_on_echo&&!control.permit_ref)ac.bypass_mask=0xffu;
+             ac.selection_enabled=select_beam&&!warming&&valid&&!muted;
+             ac.speech_confidence=vad_energy?vad_confidence:0.f;
+             if(vad_energy){vad_hops++;if(vad_confidence>=.6f)vad_above++;if(vad_confidence>vad_max)vad_max=vad_confidence;}
+@@ -530,7 +629,23 @@
+         }
+         for(int out=0;out<channels;out++) {
+             int b=all?out:beam;cpx y[N];memset(y,0,sizeof(y));
+-            const cpx *source=adaptive?(all?cleaned[out]:select_beam?merged:cleaned[beam]):beam_spectra[out];
++            /* --merge-all: the plain mean of the eight cleaned beams. Nothing
++             * steers, so nothing can steer at an interferer or sit on a beam
++             * that faces away from the talker; the adaptive stage has already
++             * removed the echo from every beam. Measured on eight sets against
++             * a fixed beam and against selection, it was never worse than pmOS,
++             * and the best or equal best realisable output on seven; the
++             * exception is an off-axis interferer, where a fixed beam that
++             * happened to face away from it did better. */
++            cpx mean8[128];
++            if(merge_all){
++                for(int k=0;k<128;k++){
++                    float re=0,im=0;
++                    for(int bb=0;bb<B;bb++){re+=cleaned[bb][k].re;im+=cleaned[bb][k].im;}
++                    mean8[k]=(cpx){re/B,im/B};
++                }
++            }
++            const cpx *source=adaptive?(merge_all?mean8:all?cleaned[out]:select_beam?merged:cleaned[beam]):beam_spectra[out];
+             memcpy(y,source,128*sizeof(cpx));
+             if(bypass)y[N/2]=spectra[0][0][N/2];
+             for(int k=N/2+1;k<N;k++)y[k]=(cpx){y[N-k].re,-y[N-k].im};

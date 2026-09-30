@@ -1,0 +1,164 @@
+#!/bin/sh
+# Tell BlueZ this device is a loudspeaker.
+#
+# /etc/bluetooth/main.conf belongs to the bluez package, so it cannot simply be
+# shipped as a file without conflicting. It is patched here instead, and the
+# edit is idempotent so repeated installs and upgrades are safe.
+#
+# Class 0x240414 = Audio/Video major class, Loudspeaker minor class, with the
+# Audio and Rendering service bits. BlueZ overrides the service half from the
+# profiles actually registered, so `bluetoothctl show` will report 0x000c0414 -
+# that is expected. The half that matters is the major/minor: without it the
+# adapter advertises major class 0 (Miscellaneous), and a phone connects, fails
+# to recognise it as a media sink, and drops the link within seconds.
+#
+# The device class can only come from this file; there is no bluetoothctl
+# command for it, which is why this is a post-install rather than something the
+# biscuit-btaudio service does at runtime.
+set -e
+
+CONF=/etc/bluetooth/main.conf
+CLASS="0x240414"
+# The device name, as biscuit-persist and biscuit-btaudio use it. This was a
+# fixed "Echo Dot", which every upgrade wrote over the name chosen in setup.
+NAME=$(cat /etc/hostname 2>/dev/null)
+case "$NAME" in ""|*[!A-Za-z0-9-]*) NAME="Echo Dot" ;; esac
+
+# SCOPED to the Bluetooth section, NOT the whole script.
+#
+# This was `[ -f "$CONF" ] || exit 0`, which made EVERYTHING below it dead
+# code. device-amazon-biscuit is installed before bluez, so main.conf does not
+# exist when this runs and the script exited right here every single time.
+# biscuit-btaudio.sh already documents that for the Bluetooth half and re-does
+# it at runtime - but nothing re-did the rest.
+#
+# Verified on a fresh r131 flash: Class/Name were set (by biscuit-btaudio at
+# boot, note the Jan 1 2010 mtime) while rc.conf and the runlevel cleanup below
+# were untouched, and `user.user [failed]` came straight back.
+#
+# The Bluetooth patch stays, because it is correct when bluez IS already there,
+# e.g. on an upgrade rather than a first install.
+if [ -f "$CONF" ]; then
+	# One substitution matching an optional leading '#', instead of separate
+	# commented/uncommented branches. The old form used `0,/re/s||repl|`, whose
+	# empty regex means "reuse the last one" - a GNU sed extension. THE DEVICE
+	# HAS BUSYBOX SED, which accepts that, changes nothing and exits 0, so
+	# `set -e` never sees a failure. Demonstrated directly on the device. This
+	# is the portable idiom biscuit-btaudio.sh uses, which is why its runtime
+	# patch has always worked where this one silently did not.
+	if grep -qE '^[[:space:]]*#?[[:space:]]*Class[[:space:]]*=' "$CONF"; then
+		sed -i "s|^[[:space:]]*#\?[[:space:]]*Class[[:space:]]*=.*|Class = $CLASS|" "$CONF"
+	else
+		printf '\nClass = %s\n' "$CLASS" >> "$CONF"
+	fi
+
+	if grep -qE '^[[:space:]]*#?[[:space:]]*Name[[:space:]]*=' "$CONF"; then
+		sed -i "s|^[[:space:]]*#\?[[:space:]]*Name[[:space:]]*=.*|Name = $NAME|" "$CONF"
+	else
+		printf 'Name = %s\n' "$NAME" >> "$CONF"
+	fi
+fi
+
+# Stop pam_openrc autostarting a per-user OpenRC session on every login.
+#
+# On a headless appliance that session has nothing to run - no user runlevel is
+# populated - but a second concurrent login collides with the first session's
+# supervisor, OpenRC records the collision in /run/openrc/failed, and the
+# marker outlives the supervisor. `rc-status` then reports `user.user [failed]`
+# indefinitely, which is exactly the sort of standing false alarm that hides a
+# real one.
+#
+# rc.conf's own documentation calls this out as the supported switch: it
+# "effectively disables the pam module, without the need of removing it from
+# the pam configuration files" - so no PAM stack is forked, and authentication
+# is untouched.
+#
+# Lives here rather than in a shipped file because /etc/rc.conf belongs to
+# openrc. Idempotent: handles the commented default, an existing YES, and a
+# file that has neither.
+RC_CONF=/etc/rc.conf
+if [ -f "$RC_CONF" ]; then
+	if grep -qE '^[[:space:]]*rc_autostart_user[[:space:]]*=' "$RC_CONF"; then
+		sed -i 's|^[[:space:]]*rc_autostart_user[[:space:]]*=.*|rc_autostart_user="NO"|' "$RC_CONF"
+	elif grep -qE '^[[:space:]]*#[[:space:]]*rc_autostart_user[[:space:]]*=' "$RC_CONF"; then
+		sed -i 's|^[[:space:]]*#[[:space:]]*rc_autostart_user[[:space:]]*=.*|rc_autostart_user="NO"|' "$RC_CONF"
+	else
+		printf '
+rc_autostart_user="NO"
+' >> "$RC_CONF"
+	fi
+fi
+
+# r108 removed biscuit-mic-pump from the default runlevel, because back then the
+# pump opened its own capture chain and took hw:0,2 before LVA could, leaving
+# the assistant with no microphone. This file still carried that `rc-update del`
+# long after it stopped being true, so every install actively DISABLED the pump.
+#
+# The hub now owns the hardware PCM outright. The pump runs biscuit-call-pump.py
+# against it and publishes only the call branch; LVA reads the separate
+# assistant socket through biscuit-mic-direct.sh. Both belong in the runlevel,
+# and removing the pump is what would break Bluetooth calls.
+#
+# The symlinks are shipped by the package, so these are belt-and-braces for a
+# device upgrading from a release that had them removed. rc-update -u rebuilds
+# the cached dependency graph, without which an upgraded device keeps acting on
+# the old one. All three are safe to repeat.
+# biscuit-ring moves to the BOOT runlevel.
+#
+# It was in `default`, which on this device means it is one of 55 services
+# starting at t+10s and is not marked started until t+21s - and it does not
+# reach its own mkfifo until t+34s, by which time zz-boot-done has already
+# run at t+34s and `local` at t+35s. A "while booting" animation therefore had
+# a window of zero. The delay is not the ring's own work: import 0.25s,
+# load_animations 0.22s, Ring() 0.00s. It is contention.
+#
+# The boot runlevel finishes at t+9s, so starting it there puts the ring up
+# around t+10s and gives the animation roughly a 24 second window - the actual
+# length of a boot as an owner experiences it.
+#
+# del from default first, or an upgrade leaves it in both.
+rc-update del biscuit-ring default 2>/dev/null || true
+rc-update add biscuit-ring boot 2>/dev/null || true
+rc-update add biscuit-mic-hub default 2>/dev/null || true
+rc-update add biscuit-mic-pump default 2>/dev/null || true
+rc-update -u 2>/dev/null || true
+
+# Re-link the owner's imported stock DSP assets.
+#
+# They live on the persist partition and are symlinked into /usr/share/biscuit,
+# which belongs to this package and is replaced wholesale by an upgrade - so
+# without this, every update silently reverts an owner who imported a stock
+# profile back to the pmOS chain. A no-op when nothing was imported, so it is
+# safe to run unconditionally, and non-fatal because losing the link degrades
+# to a working device rather than a broken one.
+#
+# biscuit-mic-hub's start_pre does this too, deliberately. Install scripts have
+# failed silently on this device twice - the old post-install exited before
+# almost all of its work, and post-install does not run on an upgrade at all -
+# so the service that actually consumes the assets repairs them at boot as
+# well, and whichever runs first makes the other a no-op.
+if [ -x /usr/bin/biscuit-import-assets ]; then
+    /usr/bin/biscuit-import-assets activate >/dev/null 2>&1 || true
+fi
+
+# Apply this package's SSH rules now, not at the next boot.
+#
+# sshd reads its configuration only when it starts or reloads, and an upgrade
+# does neither, so an owner who updated and did not restart kept the old rules:
+# /etc/ssh/sshd_config.d/40-biscuit.conf (every login to the setup address
+# refused, keyboard-interactive off) and the rule biscuit-firstboot writes while
+# the shipped account still has its published password. sshpolicy writes or
+# removes that rule, reloading sshd itself when it changes; the reload after it
+# picks up 40-biscuit.conf.
+#
+# Only on a running system: in a build chroot OpenRC has not started and there
+# is nothing to reload. --ifstarted, so an sshd the owner turned off stays off -
+# this never starts it. Alpine's reload runs `sshd -t` first and refuses a
+# configuration that does not parse, leaving the running sshd untouched. Never
+# fatal: the rules still apply at the next boot.
+if [ -e /run/openrc/softlevel ]; then
+	rc-service biscuit-firstboot sshpolicy >/dev/null 2>&1 || true
+	rc-service --ifstarted sshd reload >/dev/null 2>&1 || true
+fi
+
+exit 0

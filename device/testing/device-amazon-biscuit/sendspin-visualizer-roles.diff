@@ -1,0 +1,88 @@
+Ask Music Assistant for the visualiser and colour roles.
+
+The daemon hardcodes [Roles.PLAYER], so the ring could never be driven from
+the music: Music Assistant supports visualizer@v1 and color@v1 and grants both
+the moment they are requested, but nothing was asking. Verified against a live
+server, which replied
+
+  active_roles=['player@v1','controller@v1','color@v1','visualizer@v1','metadata@v1']
+
+and then sent VISUALIZATION_LOUDNESS, VISUALIZATION_SPECTRUM (12 bins, the
+count requested here) and VISUALIZATION_BEAT.
+
+The roles have to go on the PLAYER rather than a client of our own. A
+standalone VISUALIZER+COLOR client is legal and the server grants it both
+roles, but it never receives a stream/start, so _current_visualizer_config
+stays None and every frame is dropped before the callback. Measured: the
+standalone client received colour and zero frames; the player received all
+three feeds.
+
+n_disp_bins is 12 because the ring has twelve segments, so the server does the
+band mapping and the device does not have to. Everything else here follows
+sendspin's own reference client in sendspin/tui/app.py: all six types, a
+65536 buffer, and a mel scale from 20 Hz to 20 kHz. METADATA and CONTROLLER are requested unconditionally, not only when
+MPRIS works: there is no session bus here, so the upstream condition meant
+the server was never asked for its metadata or controller state at all.
+
+We had asked for four
+types, which is why f_peak and pitch never arrived - the server was not
+withholding them.
+
+Everything else lives in biscuit_sendspin_viz, which this only calls, so that
+the vendored application carries as little of ours as possible.
+
+--- a/sendspin/daemon/daemon.py
++++ b/sendspin/daemon/daemon.py
+@@ -12,6 +12,11 @@
+ 
+ from aiohttp import ClientError, web
+ from aiosendspin.client import ClientListener, SendspinClient
++from aiosendspin.models.visualizer import (
++    ClientHelloVisualizerSpectrum,
++    ClientHelloVisualizerSupport,
++)
++import biscuit_sendspin_viz
+ from aiosendspin.models.core import GroupUpdateServerPayload, ServerCommandPayload
+ from aiosendspin.models.player import ClientHelloPlayerSupport, SupportedAudioFormat
+ from aiosendspin_mpris import MPRIS_AVAILABLE, SendspinMpris
+@@ -85,9 +90,13 @@
+     def _create_client(self) -> SendspinClient:
+         """Create a new SendspinClient instance."""
+         assert self._audio_handler is not None
+-        client_roles = [Roles.PLAYER]
+-        if MPRIS_AVAILABLE and self._args.use_mpris:
+-            client_roles.extend([Roles.METADATA, Roles.CONTROLLER])
++        # COLOR and VISUALIZER so the ring can be driven from the audio,
++        # and METADATA and CONTROLLER unconditionally rather than only
++        # when MPRIS works: there is no session bus on this device, so
++        # the upstream condition meant the server was never asked for
++        # its metadata or controller state at all.
++        client_roles = [Roles.PLAYER, Roles.COLOR, Roles.VISUALIZER,
++                        Roles.METADATA, Roles.CONTROLLER]
+ 
+         supported_formats = detect_supported_audio_formats(self._args.audio_device)
+         if self._args.preferred_format is not None:
+@@ -102,6 +111,15 @@
+                 manufacturer=self._args.manufacturer,
+                 product_name=self._args.product_name,
+             ),
++            visualizer_support=ClientHelloVisualizerSupport(
++                buffer_capacity=65536,
++                rate_max=30,
++                types=["loudness", "spectrum", "beat", "peak",
++                       "f_peak", "pitch"],
++                spectrum=ClientHelloVisualizerSpectrum(
++                    n_disp_bins=12, scale="mel", f_min=20, f_max=20000
++                ),
++            ),
+             player_support=ClientHelloPlayerSupport(
+                 supported_formats=supported_formats,
+                 buffer_capacity=32_000_000,
+@@ -304,6 +322,7 @@
+             # Per spec: always complete the handshake before deciding which
+             # server to keep.
+             client = self._create_client()
++            biscuit_sendspin_viz.attach(client)
+ 
+             try:
+                 await client.attach_websocket(ws)

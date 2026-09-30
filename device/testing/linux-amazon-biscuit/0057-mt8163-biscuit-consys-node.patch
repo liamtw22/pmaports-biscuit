@@ -1,0 +1,27 @@
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -620,3 +620,24 @@
+ &mt6323_vcn28_reg {
+ 	regulator-always-on;
+ };
++
++&{/soc} {
++	/*
++	 * The Wi-Fi and Bluetooth radios live on the die, not on a bus, so
++	 * mainline has no node for them and nothing would ever probe. This
++	 * describes only what the block needs to be powered and identified:
++	 * the CONN_MCU_CONFIG window, the CONN power domain (which carries
++	 * the bus-protection handshake), the connectivity processor reset,
++	 * and the three PMIC rails the vendor tree brings up alongside them.
++	 */
++	consys: consys@18070000 {
++		compatible = "mediatek,mt8163-consys";
++		reg = <0 0x18070000 0 0x200>;
++		power-domains = <&spm MT8163_POWER_DOMAIN_CONN>;
++		resets = <&watchdog MT8163_TOPRGU_CONN_MCU_RST>;
++		reset-names = "connsys-cpu";
++		vcn18-supply = <&mt6323_vcn18_reg>;
++		vcn28-supply = <&mt6323_vcn28_reg>;
++		vcn33-supply = <&mt6323_vcn33_bt_reg>;
++	};
++};

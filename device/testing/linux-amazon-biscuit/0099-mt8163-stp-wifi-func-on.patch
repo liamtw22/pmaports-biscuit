@@ -1,0 +1,96 @@
+Wi-Fi stage 1: ask the controller to enable the WLAN function.
+
+Diagnostic only. This produces no network interface and is not meant to.
+
+The point is to establish whether CONSYS and our WMT transport can bring the
+WLAN function up at all, which is the precondition for any attempt at the rest.
+Everything above it is unported: WIFI_RAM_CODE_8163 and the whole 802.11 data
+path belong to the vendor WLAN driver, which is 67 .c files, 90 headers and
+about 169,500 lines written against 3.18, with nothing in mainline for the
+MT6625L (mt76 covers newer parts only).
+
+The split matters and is worth recording. WIFI_RAM_CODE is referenced only
+inside drv_wlan/ - CFG_FW_FILENAME - so the WLAN driver downloads its own
+firmware. WMT's job is powering the chip, downloading the ROM patch, and
+turning functions on and off. We already do all of that for Bluetooth.
+
+So the command is the one we already send, with one byte changed:
+
+	wmt_bt_on_cmd[]   = { 0x01, 0x06, 0x02, 0x00, 0x00, 0x01 };
+	wmt_wifi_on_cmd[] = { 0x01, 0x06, 0x02, 0x00, 0x03, 0x01 };
+	                                             ^^^^
+	01     PKT_TYPE_CMD
+	06     OPCODE_FUNC_CTRL
+	02 00  SDU length: flag byte + parameter byte
+	03     WMTDRV_TYPE_WIFI  (Bluetooth is 0)
+	01     on
+
+answered by 02 06 01 00 <status>, status 0 for success. Constants from the
+vendor's wmt_core.h and wmt_core_func_ctrl_cmd().
+
+No separate power rail is needed. A comment already in this driver records that
+wmt_plat's BT and WIFI PALDO calls land on the same refcounted supply, and the
+Bluetooth bring-up immediately above has already raised it.
+
+The call is deliberately non-fatal: a rejection logs a warning and Bluetooth
+continues unaffected. Same discipline as the r183 VCN33 efuse read - a
+diagnostic must not be able to cost a working feature.
+
+diff -urN stpnew/drivers/bluetooth/hci_mt8163_stp.c stpwifi/drivers/bluetooth/hci_mt8163_stp.c
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -170,6 +170,24 @@
+ 	{ 0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01 };
+ static const u8 wmt_bt_on_cmd[] = { 0x01, 0x06, 0x02, 0x00, 0x00, 0x01 };
+ static const u8 wmt_bt_on_evt[] = { 0x02, 0x06, 0x01, 0x00, 0x00 };
++
++/*
++ * The same WMT FUNC_CTRL opcode, for the WLAN function instead of Bluetooth.
++ *
++ *   01     PKT_TYPE_CMD
++ *   06     OPCODE_FUNC_CTRL
++ *   02 00  SDU length: flag byte + parameter byte
++ *   03     WMTDRV_TYPE_WIFI   (Bluetooth is 0, which is the only difference)
++ *   01     on
++ *
++ * Answered by 02 06 01 00 <status>, status 0 for success.
++ *
++ * No separate power rail is needed: wmt_plat's BT and WIFI PALDO calls land on
++ * the same refcounted supply, which the Bluetooth bring-up above has already
++ * raised.
++ */
++static const u8 wmt_wifi_on_cmd[] = { 0x01, 0x06, 0x02, 0x00, 0x03, 0x01 };
++static const u8 wmt_wifi_on_evt[] = { 0x02, 0x06, 0x01, 0x00, 0x00 };
+ /*
+  * Stock reads an efuse to pick the VCN33 rail voltage and then calls
+  * wmt_set_pmic_voltage(). PMOS hardcodes 3.3 V. Read the value and log it so it
+@@ -1233,6 +1251,29 @@
+ 	if (ret)
+ 		return dev_err_probe(stp->dev, ret, "WMT Bluetooth enable failed\n");
+ 
++	/*
++	 * Wi-Fi stage 1, diagnostic only.
++	 *
++	 * This asks the controller whether it will bring the WLAN function up
++	 * at all. It produces no network interface: the firmware
++	 * (WIFI_RAM_CODE_8163) and the whole 802.11 data path belong to the
++	 * WLAN driver, which is ~169,500 lines of out-of-tree vendor code we
++	 * have not ported. What it does establish is whether the CONSYS side
++	 * and our WMT transport can enable the function, which is the first
++	 * thing any port of that driver would need.
++	 *
++	 * Non-fatal on purpose. A rejection here must not cost us Bluetooth.
++	 */
++	ret = mt8163_stp_wmt_xfer(stp, wmt_wifi_on_cmd,
++				  sizeof(wmt_wifi_on_cmd), wmt_wifi_on_evt,
++				  sizeof(wmt_wifi_on_evt));
++	if (ret)
++		dev_warn(stp->dev,
++			 "WMT Wi-Fi function enable rejected (%d); Bluetooth unaffected\n",
++			 ret);
++	else
++		dev_info(stp->dev, "WMT Wi-Fi function enabled\n");
++
+ 	dev_info(stp->dev, "WMT/STP bootstrap complete\n");
+ 	return 0;
+ }

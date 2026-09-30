@@ -1,0 +1,85 @@
+--- a/sound/soc/mediatek/mt8163/mt8163-dai-i2s.c
++++ b/sound/soc/mediatek/mt8163/mt8163-dai-i2s.c
+@@ -158,33 +158,33 @@
+ /* dai component */
+ /* interconnection */
+ static const struct snd_kcontrol_new mtk_i2s3_ch1_mix[] = {
+-	/* I05 - O00 */
+-	SOC_DAPM_SINGLE_AUTODISABLE("DL1_CH1", AFE_CONN0, 5, 1, 0),
+-	/* I07 - O00 */
+-	SOC_DAPM_SINGLE_AUTODISABLE("DL2_CH1", AFE_CONN0, 7, 1, 0),
+-};
+-
+-static const struct snd_kcontrol_new mtk_i2s3_ch2_mix[] = {
+-	/* I06 - O01 */
+-	SOC_DAPM_SINGLE_AUTODISABLE("DL1_CH2", AFE_CONN0, 22, 1, 0),
+-	/* I08 - O01 */
+-	SOC_DAPM_SINGLE_AUTODISABLE("DL2_CH2", AFE_CONN0, 24, 1, 0),
+-};
+-
+-static const struct snd_kcontrol_new mtk_i2s1_ch1_mix[] = {
+ 	/* I05 - O03 */
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL1_CH1", AFE_CONN1, 21, 1, 0),
+ 	/* I07 - O03 */
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL2_CH1", AFE_CONN1, 23, 1, 0),
+ };
+ 
+-static const struct snd_kcontrol_new mtk_i2s1_ch2_mix[] = {
++static const struct snd_kcontrol_new mtk_i2s3_ch2_mix[] = {
+ 	/* I06 - O04 */
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL1_CH2", AFE_CONN2, 6, 1, 0),
+ 	/* I08 - O04 */
+ 	SOC_DAPM_SINGLE_AUTODISABLE("DL2_CH2", AFE_CONN2, 8, 1, 0),
+ };
+ 
++static const struct snd_kcontrol_new mtk_i2s1_ch1_mix[] = {
++	/* I05 - O00 */
++	SOC_DAPM_SINGLE_AUTODISABLE("DL1_CH1", AFE_CONN0, 5, 1, 0),
++	/* I07 - O00 */
++	SOC_DAPM_SINGLE_AUTODISABLE("DL2_CH1", AFE_CONN0, 7, 1, 0),
++};
++
++static const struct snd_kcontrol_new mtk_i2s1_ch2_mix[] = {
++	/* I06 - O01 */
++	SOC_DAPM_SINGLE_AUTODISABLE("DL1_CH2", AFE_CONN0, 22, 1, 0),
++	/* I08 - O01 */
++	SOC_DAPM_SINGLE_AUTODISABLE("DL2_CH2", AFE_CONN0, 24, 1, 0),
++};
++
+ enum {
+ 	SUPPLY_SEQ_APLL,
+ 	SUPPLY_SEQ_I2S_MCLK_EN,
+@@ -565,6 +565,15 @@
+ 
+ 	mask |= AFE_I2S_M_I2S_LR_SWAP;
+ 
++	/*
++	 * Low-jitter (HD) mode must stay off for the Biscuit TLV320 path:
++	 * measured on stock firmware, setting AFE_I2S_CON1 bit 12 silences
++	 * playback instantly. Program the bit explicitly so it never floats.
++	 */
++	mask |= BIT(AFE_I2S_M_I2S_HD_EN_SHIFT);
++	if (i2s_priv->low_jitter_en)
++		val |= BIT(AFE_I2S_M_I2S_HD_EN_SHIFT);
++
+ 	ret = regmap_update_bits(afe->regmap, i2s_priv->con_reg, mask, val);
+ 	if (ret)
+ 		return ret;
+@@ -835,7 +844,7 @@
+ 		.mclk_id = MT8163_I2S1_MCK,
+ 		.share_i2s_id = -1,
+ 		.con_reg = AFE_I2S_CON1,
+-		.output_fmt_bits = GENMASK(4, 3), /* O03 - O04 */
++		.output_fmt_bits = GENMASK(1, 0), /* O00 - O01 */
+ 	},
+ 	[DAI_I2S2] = {
+ 		.id = MT8163_AFE_DAI_I2S2,
+@@ -849,7 +858,7 @@
+ 		.mclk_id = MT8163_I2S3_MCK,
+ 		.share_i2s_id = -1,
+ 		.con_reg = AFE_I2S_CON3,
+-		.output_fmt_bits = GENMASK(1, 0), /* O00 - O01 */
++		.output_fmt_bits = GENMASK(4, 3), /* O03 - O04 */
+ 	},
+ };
+ 

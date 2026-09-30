@@ -1,0 +1,139 @@
+#!/sbin/sh
+# amazon-biscuit-restore: put this Echo's own Fire OS files - firmware,
+# microphone coefficients, the Fire OS 6 beamformer, the speaker correction
+# curve, its sounds and its light ring animations - into an installed postmarketOS's settings store, from its
+# backup (made by amazon-biscuit-backup).
+#
+# For after a factory reset or a reflash that lost them, or to import them on
+# an Echo installed without them. Changes nothing but the store's
+# persist/biscuit/assets, persist/biscuit/led and persist/earcon. What the
+# backup does not hold is kept: an asset profile it lacks (the speaker curve,
+# in a backup made before r294) stays as the store has it, and so do ring
+# animations imported on the settings page.
+#
+# On postmarketOS's layout TWRP has no /sdcard, so push the backup first:
+#   adb push biscuit-backup/<serial> /tmp/biscuit-backup/<serial>
+
+OUTFD=$2
+ZIP=$3
+WORK=/dev/tmp/biscuit
+LOG=/tmp/biscuit-restore.log
+rm -rf $WORK
+mkdir -p $WORK
+: > $LOG
+# TWRP's unzip ignores wildcards - it extracts nothing and still succeeds -
+# so every member is named.
+ok=1
+unzip -o "$ZIP" zip.prop bin/busybox bin/biscuit-tool common/functions.sh -d $WORK >> $LOG 2>&1 || ok=0
+for f in zip.prop bin/busybox bin/biscuit-tool common/functions.sh; do [ -s $WORK/$f ] || ok=0; done
+[ $ok = 1 ] || { echo -e "ui_print (!) Could not unpack the zip\nui_print" >> /proc/self/fd/$OUTFD; exit 1; }
+chmod 755 $WORK/bin/*
+. $WORK/common/functions.sh
+fix_outfd
+
+banner
+check_device
+read_layout
+[ "$KIND" = v2_merged_geometry ] ||
+	abort "postmarketOS is not installed here (the layout is '$KIND')."
+
+BACKUP=$(find_backup) ||
+	abort "No backup in /tmp. Push it first: adb push biscuit-backup/$SERIAL /tmp/biscuit-backup/$SERIAL"
+ui_print "Checking the backup in $BACKUP ..."
+verify_backup "$BACKUP"
+[ -d "$BACKUP/assets" ] || abort "The backup has no assets folder."
+LED=0
+backup_has_led "$BACKUP" && LED=1
+
+PERSIST=$(by_name persist) || abort "No persist partition."
+unmount_all
+mkdir -p $WORK/opt
+run "Could not mount the settings store" mount -t ext4 $PERSIST $WORK/opt
+[ -d $WORK/opt/persist ] || { umount $WORK/opt; abort "persist does not hold postmarketOS's settings store."; }
+label=$($BB blkid $PERSIST | sed -n 's/.*LABEL="\([^"]*\)".*/\1/p')
+[ "$label" = biscuit-opt ] || { umount $WORK/opt; abort "persist is labelled '$label', not biscuit-opt."; }
+
+# Stage beside the live copy, then swap: a store left half-written would hold
+# some of one set of coefficients beside none of another.
+S=$WORK/opt/persist
+rm -rf $S/biscuit/assets.new $S/earcon.new $S/biscuit/led.new
+mkdir -p $S/biscuit/assets.new $S/earcon.new $S/biscuit/led.new
+give_up() {
+	rm -rf $S/biscuit/assets.new $S/earcon.new $S/biscuit/led.new
+	umount $WORK/opt
+	abort "$1; the store was not changed."
+}
+cp -r "$BACKUP/assets"/* $S/biscuit/assets.new/ || give_up "The settings store is too small for these files"
+if [ -n "$(ls "$BACKUP/earcon" 2>/dev/null)" ]; then
+	cp "$BACKUP/earcon"/* $S/earcon.new/ || give_up "The settings store is too small for the sounds"
+fi
+# The ring's animations, with the install's filter: the volume ramp and the
+# device's own act_/fx_ names are left out.
+if [ $LED = 1 ]; then
+	for f in "$BACKUP/led"/*.animation; do
+		[ -f "$f" ] && led_wanted "$f" || continue
+		cp "$f" $S/biscuit/led.new/ || give_up "The settings store is too small for the ring animations"
+	done
+fi
+rm -f $S/biscuit/assets.new/SOURCES
+for f in $(cd $S/biscuit/assets.new && find . -type f); do
+	want=$(grep " \./assets/${f#./}\$" "$BACKUP/SHA256SUMS" | cut -d' ' -f1)
+	[ -n "$want" ] && [ "$(sha_of_file $S/biscuit/assets.new/$f)" = "$want" ] || give_up "$f did not copy correctly"
+done
+for f in $(cd $S/earcon.new && find . -type f); do
+	want=$(grep " \./earcon/${f#./}\$" "$BACKUP/SHA256SUMS" | cut -d' ' -f1)
+	[ -n "$want" ] && [ "$(sha_of_file $S/earcon.new/$f)" = "$want" ] || give_up "$f did not copy correctly"
+done
+# Matched as a whole string: an animation's name may hold . and +.
+for f in $S/biscuit/led.new/*; do
+	[ -f "$f" ] || continue
+	want=$(awk -v p="./led/${f##*/}" '{ h = $1; sub(/^[0-9a-f]+  /, ""); if ($0 == p) print h }' "$BACKUP/SHA256SUMS")
+	[ -n "$want" ] && [ "$(sha_of_file "$f")" = "$want" ] || give_up "led/${f##*/} did not copy correctly"
+done
+# Animations imported on the settings page that the backup does not hold
+# (another Fire OS's set) are kept, as the page's own import keeps them.
+led_new=$(ls $S/biscuit/led.new)
+if [ -n "$led_new" ] && [ -d $S/biscuit/led ]; then
+	for f in $S/biscuit/led/*; do
+		[ -f "$f" ] && led_wanted "$f" && [ ! -e "$S/biscuit/led.new/${f##*/}" ] || continue
+		cp "$f" $S/biscuit/led.new/ || give_up "The settings store is too small for the ring animations"
+	done
+fi
+# Asset profiles the backup does not hold are kept, whole: a backup older than
+# the speaker curve (r293's) must not delete the curve the upgrade or an
+# import put in the store. After the checks above, which read the backup's
+# SHA256SUMS: a kept profile was never in the backup.
+kept=
+for d in $S/biscuit/assets/*; do
+	[ -d "$d" ] || continue
+	p=${d##*/}
+	[ -e "$S/biscuit/assets.new/$p" ] && continue
+	cp -r "$d" $S/biscuit/assets.new/ || give_up "The settings store is too small to keep $p"
+	kept="$kept $p"
+done
+rm -rf $S/biscuit/assets.old $S/earcon.old $S/biscuit/led.old
+[ -d $S/biscuit/assets ] && mv $S/biscuit/assets $S/biscuit/assets.old
+mv $S/biscuit/assets.new $S/biscuit/assets
+if [ -n "$(ls $S/earcon.new)" ]; then
+	[ -d $S/earcon ] && mv $S/earcon $S/earcon.old
+	mv $S/earcon.new $S/earcon
+fi
+if [ -n "$led_new" ]; then
+	[ -d $S/biscuit/led ] && mv $S/biscuit/led $S/biscuit/led.old
+	mv $S/biscuit/led.new $S/biscuit/led
+fi
+rm -rf $S/biscuit/assets.old $S/earcon.old $S/earcon.new $S/biscuit/led.old $S/biscuit/led.new
+chmod -R u=rwX,go=rX $S/biscuit $S/earcon 2>/dev/null
+sync
+for profile in firmware fireos6 fireos5 speaker; do
+	[ -d $S/biscuit/assets/$profile ] && ui_print "  $profile: $(find $S/biscuit/assets/$profile -type f | wc -l) file(s)"
+done
+[ -z "$kept" ] || ui_print "  kept from the store, not in the backup:$kept"
+ui_print "  earcons: $(ls $S/earcon 2>/dev/null | wc -l) file(s)"
+ui_print "  ring animations: $(ls $S/biscuit/led 2>/dev/null | wc -l) file(s)"
+umount $WORK/opt
+
+ui_print " "
+ui_print "Done. Reboot with: adb reboot"
+ui_print "postmarketOS puts them in place as it boots."
+exit 0

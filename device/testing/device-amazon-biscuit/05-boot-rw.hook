@@ -1,0 +1,35 @@
+#!/bin/sh
+# Open /boot for writing so boot-deploy can install into it.
+#
+# biscuit-persist mounts /boot READ-ONLY at every boot, because it is
+# journal-less ext2 that postmarketOS never fsck's and that initramfs stage 1
+# cannot boot without: a power cut with it mounted rw is the one failure on this
+# device that a reflash is the only recovery from. See biscuit-persist.initd.
+#
+# That has to be undone for the few seconds boot-deploy is actually writing.
+# Hooks run BEFORE the installs - the run order is "Running hooks", then
+# "Checking free space at /boot", then "Installing: /boot/..." - so this is the
+# right place to do it.
+#
+# It is NOT put back here, and that is deliberate rather than an oversight: the
+# hook cannot know when boot-deploy has finished, and remounting ro underneath
+# it would fail the very install this exists to allow. /boot therefore stays
+# writable until the next reboot, when biscuit-persist closes it again. The
+# exposure is a package install a person chose to run, not the months of
+# uptime this is really protecting against.
+#
+# Numbered 05 so it runs before 10-dtb-mtk-wrap, which is the hook that
+# actually cares whether the filesystem is writable.
+
+if [ -d /boot ] && grep -q " /boot .*[( ,]ro[, )]" /proc/mounts 2>/dev/null; then
+	if mount -o remount,rw /boot 2>/dev/null; then
+		echo "==> /boot remounted rw for boot-deploy"
+	else
+		# Not fatal here. boot-deploy will fail its own writes with a clearer
+		# message than anything this hook could produce, and failing the hook
+		# would only obscure that.
+		echo "==> WARNING: could not remount /boot rw; the install will fail"
+	fi
+fi
+
+exit 0

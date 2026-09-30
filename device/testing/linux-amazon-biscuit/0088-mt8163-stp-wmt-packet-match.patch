@@ -1,0 +1,221 @@
+From caab04f8715fe3550af5a2aabe0297274c5975c4 Mon Sep 17 00:00:00 2001
+From: Claude <claude@localhost>
+Date: Mon, 10 Aug 2026 14:58:32 -0400
+Subject: [PATCH] bluetooth: match WMT events per frame instead of per byte
+
+r180 failed the antenna-selection command with -EPROTO 78 us after the
+preceding command completed. No real round trip on this transport is that
+fast: the DLM power commands sit ~1.2 ms apart and the quickest TX-to-RX
+ever measured is ~611 us. The bytes that produced the mismatch were already
+in flight, so the controller never rejected anything - and probe aborted,
+losing hci0 completely.
+
+The cause is the matcher. mt8163_stp_deliver_payload() fed a WMT frame into
+mt8163_stp_wmt_byte() one byte at a time, and that completed the pending
+command as soon as the accumulated length equalled the expected length.
+Surplus bytes from an over-length frame were dropped only while no command
+was armed; because the receive worker runs concurrently with the caller,
+they were instead consumed as the next command's reply. r179's RF
+calibration step made this reachable, being the first command whose
+declared event length may not equal the frame the controller sends - stock
+comments that opcode "do not care this EVT" - and stock guards the same
+hazard from the other side, flushing the WMT receive buffer with
+wmt_core_rx_flush(WMT_TASK_INDX) whenever a script step goes wrong.
+
+Match a whole frame at a time. Treat a frame as the outstanding reply only
+when its two-byte event header matches, never buffer across frames, accept
+a longer event the way stock's fixed-length read from a packet buffer does,
+and log the real length so the true size of these events becomes known.
+Unsolicited and mismatched frames are reported with bounded hex dumps
+instead of being folded silently into the next transaction.
+
+Also stop treating the antenna-selection result as fatal for now. The wire
+traffic is unchanged from r180, but a diagnostic revision should not be
+able to cost the working controller a second time on an error the matcher
+may have invented.
+
+No firmware, patch address, fragmentation, STP framing, BTIF, CONSYS power,
+EMI, quirk or boot packaging behaviour changed.
+---
+ drivers/bluetooth/hci_mt8163_stp.c | 113 ++++++++++++++++++++++++-----
+ 1 file changed, 94 insertions(+), 19 deletions(-)
+
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index b46faa6..aeca3e2 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -43,6 +43,7 @@
+ #define MT8163_STP_RX_FIFO_SIZE	SZ_16K
+ #define MT8163_STP_WMT_TIMEOUT		msecs_to_jiffies(1500)
+ #define MT8163_STP_FULL_RETRIES		3
++#define MT8163_STP_WMT_EVT_TRACES	16
+ #define MT8163_WMT_PATCH_HEADER_LEN	28
+ #define MT8163_WMT_PATCH_FRAGMENT	1000
+ 
+@@ -229,6 +230,7 @@ struct mt8163_stp {
+ 	u8 trace_tx;
+ 	u8 trace_fw_msg;
+ 	u8 trace_xfer;
++	u8 trace_wmt_evt;
+ 	u8 rx_history[16];
+ 	u8 rx_history_pos;
+ 	u8 rx_history_count;
+@@ -396,33 +398,77 @@ static int mt8163_stp_send(struct mt8163_stp *stp, u8 type,
+ 	return mt8163_stp_send_full(stp, type, payload, len);
+ }
+ 
+-static void mt8163_stp_wmt_byte(struct mt8163_stp *stp, u8 byte)
++/*
++ * WMT events are delivered a whole STP frame at a time. Matching them byte by
++ * byte, and completing the pending command purely on accumulated length, let a
++ * frame that was longer than the expected event spill its surplus into the next
++ * command's matcher: the receive worker and the caller run concurrently, so the
++ * leftovers were consumed as the following reply and compared against the wrong
++ * template. That produced an "impossible" -EPROTO 78 us after the previous
++ * command, far quicker than any real round trip on this transport.
++ *
++ * Match per frame instead. A frame is only treated as the outstanding command's
++ * reply when its two-byte event header matches, it is never buffered across
++ * frames, and anything unexpected is logged rather than silently folded into
++ * the next transaction. Stock guards the same hazard from the other direction,
++ * flushing the WMT receive buffer with wmt_core_rx_flush(WMT_TASK_INDX)
++ * whenever a script step goes wrong.
++ */
++static void mt8163_stp_wmt_frame(struct mt8163_stp *stp, const u8 *data,
++				 size_t len)
+ {
++	u8 snapshot[sizeof(stp->wmt_rx)];
++	u8 expected_snapshot[sizeof(stp->wmt_rx)] = {};
++	size_t snapshot_len;
+ 	unsigned long flags;
++	size_t expected_len = 0;
+ 	size_t i;
+ 	bool match = true;
++	bool length_differs = false;
++	bool unsolicited = false;
+ 	bool done = false;
+ 
++	snapshot_len = min(len, sizeof(snapshot));
++	memcpy(snapshot, data, snapshot_len);
++
+ 	spin_lock_irqsave(&stp->wmt_lock, flags);
+-	if (!stp->wmt_waiting)
++	if (!stp->wmt_waiting) {
++		unsolicited = true;
+ 		goto out;
+-	if (stp->wmt_rx_len >= sizeof(stp->wmt_rx)) {
+-		stp->wmt_result = -EMSGSIZE;
+-		stp->wmt_waiting = false;
+-		done = true;
++	}
++	/*
++	 * Identify the reply by its event header rather than by length, so an
++	 * unrelated or asynchronous frame cannot satisfy the wait.
++	 */
++	if (len < 2 || stp->wmt_expected_len < 2 ||
++	    data[0] != stp->wmt_expected[0] || data[1] != stp->wmt_expected[1]) {
++		unsolicited = true;
+ 		goto out;
+ 	}
+ 
+-	stp->wmt_rx[stp->wmt_rx_len++] = byte;
+-	if (stp->wmt_rx_len != stp->wmt_expected_len)
+-		goto out;
++	expected_len = stp->wmt_expected_len;
++	memcpy(expected_snapshot, stp->wmt_expected,
++	       min(expected_len, sizeof(expected_snapshot)));
++	stp->wmt_rx_len = min(len, sizeof(stp->wmt_rx));
++	memcpy(stp->wmt_rx, data, stp->wmt_rx_len);
+ 
+-	for (i = 0; i < stp->wmt_expected_len; i++) {
+-		if (stp->wmt_mask && !stp->wmt_mask[i])
+-			continue;
+-		if (stp->wmt_rx[i] != stp->wmt_expected[i]) {
+-			match = false;
+-			break;
++	/*
++	 * Stock reads a fixed number of bytes out of a packet-oriented buffer
++	 * and tolerates a longer event, so accept one here too but record the
++	 * real length: the true size of some events is still unknown.
++	 */
++	if (len != expected_len)
++		length_differs = true;
++	if (len < expected_len) {
++		match = false;
++	} else {
++		for (i = 0; i < expected_len; i++) {
++			if (stp->wmt_mask && !stp->wmt_mask[i])
++				continue;
++			if (data[i] != stp->wmt_expected[i]) {
++				match = false;
++				break;
++			}
+ 		}
+ 	}
+ 	stp->wmt_result = match ? 0 : -EPROTO;
+@@ -430,6 +476,26 @@ static void mt8163_stp_wmt_byte(struct mt8163_stp *stp, u8 byte)
+ 	done = true;
+ out:
+ 	spin_unlock_irqrestore(&stp->wmt_lock, flags);
++
++	if (unsolicited) {
++		if (stp->trace_wmt_evt++ < MT8163_STP_WMT_EVT_TRACES)
++			dev_warn(stp->dev,
++				 "unsolicited WMT event len=%zu data=%*ph\n",
++				 len, (int)min_t(size_t, snapshot_len, 32),
++				 snapshot);
++		return;
++	}
++	if (length_differs && stp->trace_wmt_evt++ < MT8163_STP_WMT_EVT_TRACES)
++		dev_warn(stp->dev,
++			 "WMT event length %zu differs from expected %zu: data=%*ph\n",
++			 len, expected_len,
++			 (int)min_t(size_t, snapshot_len, 32), snapshot);
++	if (!match && stp->trace_wmt_evt++ < MT8163_STP_WMT_EVT_TRACES)
++		dev_warn(stp->dev,
++			 "WMT event mismatch: got len=%zu data=%*ph expected len=%zu data=%*ph\n",
++			 len, (int)min_t(size_t, snapshot_len, 32), snapshot,
++			 expected_len,
++			 (int)min_t(size_t, expected_len, 32), expected_snapshot);
+ 	if (done)
+ 		complete(&stp->wmt_done);
+ }
+@@ -479,8 +545,7 @@ static void mt8163_stp_deliver_payload(struct mt8163_stp *stp)
+ 	size_t i;
+ 
+ 	if (stp->payload_type == MT8163_STP_TASK_WMT) {
+-		for (i = 0; i < stp->payload_need; i++)
+-			mt8163_stp_wmt_byte(stp, stp->payload[i]);
++		mt8163_stp_wmt_frame(stp, stp->payload, stp->payload_need);
+ 	} else if (stp->payload_type == MT8163_STP_TASK_BT) {
+ 		mt8163_stp_hci_rx(stp, stp->payload, stp->payload_need);
+ 	}
+@@ -1099,13 +1164,23 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 	 * switch never routes the antenna to the controller, which leaves every
+ 	 * command acknowledged and the receiver deaf.
+ 	 */
++	/*
++	 * r180 made this fatal and lost hci0 entirely, on an -EPROTO that the
++	 * byte-oriented matcher had manufactured from stale bytes rather than
++	 * received from the controller. Until the corrected matcher has shown
++	 * what this command really answers, record the outcome and carry on, so
++	 * a diagnostic revision cannot cost the working controller again.
++	 */
+ 	ret = mt8163_stp_wmt_xfer(stp, wmt_antenna_select_cmd,
+ 				  sizeof(wmt_antenna_select_cmd),
+ 				  wmt_antenna_select_evt,
+ 				  sizeof(wmt_antenna_select_evt));
+ 	if (ret)
+-		return dev_err_probe(stp->dev, ret, "WMT antenna selection failed\n");
+-	dev_warn(stp->dev, "WMT antenna selection applied\n");
++		dev_warn(stp->dev,
++			 "WMT antenna selection failed (%d); continuing bootstrap\n",
++			 ret);
++	else
++		dev_warn(stp->dev, "WMT antenna selection applied\n");
+ 
+ 	ret = mt8163_consys_bt_paldo_set(stp->consys_dev, true);
+ 	if (ret)
+-- 
+2.55.0.windows.3
+

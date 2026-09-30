@@ -1,0 +1,14 @@
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -122,9 +122,10 @@
+         	ldoin-supply = <&biscuit_codec_1v8>;
+ 
+                 compatible = "ti,tlv320aic32x4";
+                 reg = <0x18>;
+-                reset-gpios = <&pio 51 0>;
++                /* TLV320 RESET is electrically active-low. */
++                reset-gpios = <&pio 51 1>;
+                 clocks = <&biscuit_codec_mclk>;
+                 clock-names = "mclk";
+         };
+ };

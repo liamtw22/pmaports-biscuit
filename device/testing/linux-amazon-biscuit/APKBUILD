@@ -1,0 +1,547 @@
+# Reference: <https://postmarketos.org/vendorkernel>
+# Kernel: bengris32/linux-mtk (mainline-based MT8163 kernel), branch mt8163/7.0,
+# pinned to commit $_commit below, plus the patches and the MT6625L driver
+# tarball in source=. See NOTICE for where each part comes from.
+
+maintainer="liamtw22 <31185529+liamtw22@users.noreply.github.com>"
+pkgname=linux-amazon-biscuit
+# pkgver tracks what this source actually builds, which is NOT 6.6.30.
+# bengris32/linux-mtk branch mt8163/7.0 is a 7.0-rc kernel: the built modules
+# install under /lib/modules/7.0.0-rc6 and `uname -r` reports 7.0.0-rc6. The
+# 6.6.30 carried here until 2026-09-04 was simply wrong - harmless while this
+# was a private tree, misleading the moment anyone else installs it.
+#
+# _rc6 is apk's release-candidate suffix, so this sorts after 6.6.30 (7 > 6)
+# and before a future 7.0.0 release. pkgrel is NOT reset to 0 on this change:
+# r229 had not been built yet, and the project's docs number kernels by pkgrel,
+# so restarting the count would break every reference for no gain.
+pkgver=7.0.0_rc6
+pkgrel=243
+install="$pkgname.pre-install $pkgname.pre-upgrade"
+pkgdesc="Amazon Echo Dot (2nd gen) mainline kernel fork"
+arch="aarch64"
+_carch="arm64"
+_flavor="amazon-biscuit"
+url="https://github.com/bengris32/linux-mtk"
+license="GPL-2.0-only"
+makedepends="
+	bash
+	bc
+	bison
+	devicepkg-dev
+	findutils
+	flex
+	openssl-dev
+	perl
+"
+
+options="
+	!strip
+	!check
+	!tracedeps
+	!pmb:kconfigcheck
+	pmb:cross-native
+"
+
+_repository="linux-mtk"
+_commit="20951722df6ae1f6fecbfcea0a7d585118a06f3f"
+_dtb="mt8163-amazon-biscuit"
+source="
+	$pkgname-$_commit.tar.gz::https://github.com/bengris32/$_repository/archive/$_commit.tar.gz
+	0001-pwrap-mt8163-skip-mt2701-gps-init.patch
+	0002-mt6323-regulator-probe-synchronous.patch
+	0003-mt6323-skip-initial-buck-vsel-query.patch
+	0005-mt8163-biscuit-emmc-regulators-boot-on.patch
+	0006-mt8163-mmc-init-diagnostics.patch
+	0009-mt8163-apmixed-pass-device-to-pll-helper.patch
+	0010-mt8163-psci-cpuon-diagnostics.patch
+	0011-mt8163-psci-enable-ca53-coherency.patch
+	0012-mt8163-psci-power-state-diagnostics.patch
+	0013-mt8163-custom-secondary-cpu-boot.patch
+	0014-mt8163-musb-late-probe-diagnostics.patch
+	0015-mt8163-biscuit-enable-afe-probe.patch
+	0016-mt8163-biscuit-tlv320-codec-probe.patch
+	0017-mt8163-biscuit-tlv320-1v8-supplies.patch
+	0018-mt8163-biscuit-tlv320-reset-active-low.patch
+	0019-mt8163-biscuit-machine-card.patch
+	0020-mt8163-biscuit-aw8736-speaker-amp.patch
+	0021-mt8163-biscuit-i2s1-pinctrl-mclk.patch
+	0022-mt8163-biscuit-enable-cmmclk.patch
+	0023-mt8163-biscuit-cmmclk-diagnostics.patch
+	0024-mt8163-biscuit-camtg-parent-order.patch
+     0025-mt8163-biscuit-seninf-register-readback.patch
+     0026-mt8163-biscuit-isp-power-domain.patch
+     0027-mt8163-biscuit-seninf-mmio-fix.patch
+     0028-mt8163-biscuit-seninf-gates.patch
+     0029-mt8163-biscuit-enable-mmsys.patch
+     0030-mt8163-mmsys-of-match.patch
+     0031-mt8163-mmsys-simple-probe.patch
+     0032-mt8163-biscuit-seninf-top-gate.patch
+     0033-mt8163-biscuit-evt-speaker-routing.patch
+     0034-mt8163-biscuit-mfp2-amp-unmute.patch
+     0036-mt8163-biscuit-vendor-tlv320-48k-clock.patch
+     0037-tlv320-vendor-48k-post-hwparams.patch
+     0039-regmap-enable-debugfs-writes.patch
+     0044-mt6323-biscuit-always-on-rails.patch
+     0045-mt6323-regulator-bind-dt-constraints.patch
+     0047-mt8163-i2s1-con1-ports-and-normal-clock.patch
+     0048-mt8163-i2s1-enable-adda-dl-src.patch
+     0049-mt8163-i2s1-con3-and-24bit-at-start.patch
+     0050-mt8163-biscuit-spi-dough-node.patch
+     0051-misc-dough-fpga-driver.patch
+     0052-tlv320adc3xxx-optional-reset.patch
+     0053-mt8163-biscuit-mic-capture-link.patch
+     0054-tlv320adc3xxx-tdm-slots.patch
+     0055-mt8163-biscuit-mic-tdm-frame.patch
+     0056-misc-mt8163-consys-driver.patch
+     0057-mt8163-biscuit-consys-node.patch
+     0058-mt8163-consys-emi-window.patch
+     0059-misc-mt8163-btif-driver.patch
+     0060-mt8163-biscuit-consys-emi-and-btif.patch
+     0063-mt8163-consys-emi-mpu-region13.patch
+     0064-mt8163-consys-wifi-reset-pins.patch
+     0065-mt8163-btif-dma-client-api.patch
+     0066-mt8163-stp-wmt-hci.patch
+     0067-mt8163-btif-deferred-activation.patch
+     0068-mt8163-btif-write-zero-success.patch
+     0069-mt8163-btif-wmt-transport-trace.patch
+     0070-mt8163-btif-stock-tx-irq-semantics.patch
+     0071-mt8163-btif-core-rx-gate.patch
+     0072-mt8163-consys-stock-power-order.patch
+     0073-mt8163-stp-stock-wmt-hw-check-and-bt-paldo.patch
+     0074-mt8163-consys-clear-shared-emi.patch
+     0075-mt8163-biscuit-consys-fixed-pool.patch
+     0076-mt8163-btif-stock-wake-before-wmt.patch
+     0077-mt8163-stp-mandatory-to-full.patch
+     0078-mt8163-consys-stock-settle-before-btif.patch
+     0079-mt8163-stp-fw-message-rx.patch
+     0080-mt8163-btif-stock-tx-publication.patch
+     0081-mt8163-stp-patch-mcu-clock.patch
+     0082-mt8163-stp-power-on-dlm.patch
+     0083-mt8163-stp-fw-emi-dlm-diagnostics.patch
+     0084-mt8163-stp-patch-address-align.patch
+     0085-mt8163-hci-extfeat-page2-quirk.patch
+     0086-mt8163-stp-rf-calibration.patch
+     0087-mt8163-stp-antenna-select.patch
+     0088-mt8163-stp-wmt-packet-match.patch
+     0089-mt8163-hci-le-event-mask.patch
+     0090-mt8163-stp-tx-backpressure.patch
+	0091-mt8163-biscuit-output-select-jack-and-amp-lifecycle.patch
+	0092-mt8163-biscuit-jack-gpio-desc.patch
+	0093-mt8163-biscuit-hold-codec-output.patch
+	0094-mt8163-biscuit-amp-ordering.patch
+	0095-mt8163-biscuit-buttons.patch
+	0096-mt8163-biscuit-mute-led.patch
+	0097-mt8163-stp-bdaddr-from-idme.patch
+	0098-mt8163-biscuit-enable-thermal.patch
+	0099-mt8163-stp-wifi-func-on.patch
+	0100-mt8163-biscuit-enable-auxadc.patch
+	0101-mt8163-cpu-cooling-cells.patch
+	0102-mt8163-biscuit-wifi-dt-node.patch
+	0103-mt8163-consys-refcount-bt-paldo.patch
+	0104-mt8163-stp-skip-ilm-patch.patch
+	0105-mt8163-stp-wifi-func-runtime.patch
+	0106-mt8163-stp-bringup-retry.patch
+	0107-mt8163-consys-full-assert-dump.patch
+	0109-mt8163-stp-log-rf-calibration-event.patch
+	0110-mt8163-stp-deferred-bringup.patch
+	0111-mt8163-stp-bt-withhold-and-fm-strap.patch
+	0112-mt8163-stp-enable-bt-after-wifi.patch
+	0113-mt8163-stp-wmt-coex-config.patch
+	0114-tlv320adc3xxx-biquad-and-prb.patch
+	0115-tlv320adc3xxx-bclk-without-pll.patch
+	0116-mt8163-biscuit-aw8736-mode3-gain.patch
+	0117-mt8163-rtc-clamp-implausible-time.patch
+	0120-mt8163-biscuit-bluetooth-sco-audio.patch
+	0121-musb-isoc-in-dma-diagnostic.patch
+	0122-dough-capture-timing-diagnostics.patch
+	0123-mt8163-biscuit-ramoops.patch
+	0124-bluetooth-accept-acl-as-peripheral.patch
+	$pkgname.pre-install
+	$pkgname.pre-upgrade
+	mt6625l-wlan-20260823.tar.gz
+"
+builddir="$srcdir/$_repository-$_commit"
+_outdir="out"
+
+prepare() {
+	default_prepare
+
+	# The microphone array depends on all three pieces of the shared-TDM
+	# implementation surviving the complete patch series.  Fail the build
+	# instead of silently shipping a codec that cannot register or emits
+	# 16-bit words into the FPGA's 24-bit slots.
+	grep -Fq 'case SND_SOC_DAIFMT_DSP_B | SND_SOC_DAIFMT_NB_NF:' \
+		"$builddir/sound/soc/codecs/tlv320adc3xxx.c"
+	grep -Fq 'if (adc3xxx->tdm_slot_width == 24)' \
+		"$builddir/sound/soc/codecs/tlv320adc3xxx.c"
+	grep -Fq 'ADC3XXX_WLENGTH_MASK, iface_len);' \
+		"$builddir/sound/soc/codecs/tlv320adc3xxx.c"
+	grep -Fq 'return ret < 0 ? ret : 0;' \
+		"$builddir/sound/soc/codecs/tlv320adc3xxx.c"
+
+	# Wi-Fi: the MT6625L driver, imported as a tarball rather than a patch
+	# because it is 169,459 lines of third-party source. Only the wiring
+	# into its parent directory is ours.
+	mkdir -p "$builddir/drivers/net/wireless/mediatek/mt6625l"
+	cp -r "$srcdir"/mt6625l/* "$builddir/drivers/net/wireless/mediatek/mt6625l/"
+	grep -q mt6625l "$builddir/drivers/net/wireless/mediatek/Kconfig" || \
+		echo 'source "drivers/net/wireless/mediatek/mt6625l/Kconfig"' \
+			>> "$builddir/drivers/net/wireless/mediatek/Kconfig"
+	grep -q mt6625l "$builddir/drivers/net/wireless/mediatek/Makefile" || \
+		echo 'obj-$(CONFIG_MT6625L_WLAN) += mt6625l/' \
+			>> "$builddir/drivers/net/wireless/mediatek/Makefile"
+
+	sed -i '/#include <dt-bindings\/clock\/mediatek,mt8163-audsys.h>/a #include <dt-bindings/thermal/thermal.h>' \
+		"$builddir/arch/arm64/boot/dts/mediatek/mt8163.dtsi"
+}
+
+build() {
+	unset LDFLAGS
+	# No vendor firmware is compiled in any more.
+	#
+	# The FPGA bitstream and the two Bluetooth ROM patches used to be copied
+	# into the source tree and compiled in through CONFIG_EXTRA_FIRMWARE, so
+	# they were inside the kernel image - and therefore inside any prebuilt
+	# image shipped from it. CONFIG_EXTRA_FIRMWARE is now empty. They are
+	# MediaTek's and Amazon's, not ours, so they are now owner-imported like
+	# the audio coefficients.
+	#
+	# They still have to exist before the root filesystem does, because the
+	# drivers that want them are built in and ask during device_initcall
+	# (t=0.61 s for the FPGA, t=0.93-1.00 s for Bluetooth) while the root
+	# filesystem arrives at t=7.4 s. The initramfs is the answer: the kernel
+	# unpacks it at rootfs_initcall, before device_initcall. The device
+	# package's -nonfree-firmware subpackage lists them in
+	# /usr/share/mkinitfs/files so mkinitfs puts the owner's copies in the
+	# cpio.
+	make O="$_outdir" ARCH="$_carch" CC="${CC:-gcc}" defconfig
+	# CONFIG_BT_RFCOMM is why HFP (hands-free calling) never worked, and the
+	# cause took a long time to find because it looks nothing like an audio
+	# problem. HFP carries its AT-command control channel over RFCOMM, which
+	# arm64 defconfig does not enable at all - not even as a module. BlueZ
+	# therefore cannot open its server socket:
+	#
+	#   profile.c:ext_start_servers() RFCOMM server failed:
+	#       socket(STREAM, RFCOMM): Protocol not supported (93)
+	#
+	# With no socket it publishes no SDP record, so a phone never offers to
+	# route calls here, however the profile is registered. A2DP hid the gap
+	# completely: it runs over L2CAP/AVDTP and never touches RFCOMM.
+	#
+	# The open item blamed the missing BTCVSD driver and SCO routing. Both were
+	# red herrings - SCO is the AUDIO channel, and the control channel never got
+	# far enough to need it.
+	#
+	# SCO audio is that separate problem, and BTCVSD is its answer. With
+	# RFCOMM in place, two real calls established a SCO link that carried
+	# zero HCI packets in either direction: this controller does not send
+	# call audio over HCI at all, it leaves CVSD/mSBC frames in a shared
+	# SRAM bank. Stock drove the same block - its defconfig sets
+	# CONFIG_MTK_BTCVSD - and mainline carries a driver for it whose
+	# binding example matches MT8163's addresses and offsets exactly.
+	#
+	# USB Audio Class gadget (UAC1 and UAC2). The board already runs a USB
+	# gadget - that is what usb0 is - so this adds a function to an existing
+	# composite rather than a new subsystem. It exists because the mic array
+	# on this device is genuinely good, and Bluetooth is a poor way to reach
+	# it: HFP caps out at 8 kHz CVSD or 16 kHz mSBC, forces the device out of
+	# A2DP while the mic is live, and depends on host-specific SCO behaviour
+	# that took a whole session to characterise on Windows alone. USB has
+	# none of those problems - 48 kHz, no pairing, no codec negotiation.
+	#
+	# Both classes are enabled deliberately. UAC2 is the better transport and
+	# Windows 10+, macOS and Linux all take it without a driver; UAC1 is the
+	# fallback for hosts that handle UAC2 badly, and costs a few KB. Which one
+	# a given host gets is a runtime choice in configfs, so having both means
+	# the decision does not need another 90 minute kernel build to revisit.
+	"$builddir/scripts/config" --file "$builddir/$_outdir/.config" \
+		--enable CONFIG_SYN_COOKIES \
+		--enable CONFIG_BT_RFCOMM \
+		--enable CONFIG_BT_RFCOMM_TTY \
+		--enable CONFIG_SND_SOC_MTK_BTCVSD \
+		--enable CONFIG_USB_CONFIGFS_F_UAC1 \
+		--enable CONFIG_USB_CONFIGFS_F_UAC2 \
+		--disable CONFIG_DRM \
+		--disable CONFIG_PHY_MTK_MIPI_DSI \
+		--disable CONFIG_EFI \
+		--disable CONFIG_ATA \
+		--disable CONFIG_SCSI_UFSHCD \
+		--disable CONFIG_XEN \
+		--disable CONFIG_STRICT_DEVMEM \
+		--disable CONFIG_MEDIA_SUPPORT \
+		--disable CONFIG_INFINIBAND \
+		--disable CONFIG_ARCH_ACTIONS \
+		--disable CONFIG_ARCH_AIROHA \
+		--disable CONFIG_ARCH_SUNXI \
+		--disable CONFIG_ARCH_ALPINE \
+		--disable CONFIG_ARCH_APPLE \
+		--disable CONFIG_ARCH_ARTPEC \
+		--disable CONFIG_ARCH_AXIADO \
+		--disable CONFIG_ARCH_BCM \
+		--disable CONFIG_ARCH_BCM2835 \
+		--disable CONFIG_ARCH_BCM_IPROC \
+		--disable CONFIG_ARCH_BCMBCA \
+		--disable CONFIG_ARCH_BRCMSTB \
+		--disable CONFIG_ARCH_BERLIN \
+		--disable CONFIG_ARCH_BLAIZE \
+		--disable CONFIG_ARCH_BST \
+		--disable CONFIG_ARCH_CIX \
+		--disable CONFIG_ARCH_EXYNOS \
+		--disable CONFIG_ARCH_K3 \
+		--disable CONFIG_ARCH_LG1K \
+		--disable CONFIG_ARCH_HISI \
+		--disable CONFIG_ARCH_KEEMBAY \
+		--disable CONFIG_ARCH_MESON \
+		--disable CONFIG_ARCH_MICROCHIP \
+		--disable CONFIG_ARCH_SPARX5 \
+		--disable CONFIG_ARCH_MVEBU \
+		--disable CONFIG_ARCH_NXP \
+		--disable CONFIG_ARCH_LAYERSCAPE \
+		--disable CONFIG_ARCH_MXC \
+		--disable CONFIG_ARCH_S32 \
+		--disable CONFIG_ARCH_MA35 \
+		--disable CONFIG_ARCH_NPCM \
+		--disable CONFIG_ARCH_QCOM \
+		--disable CONFIG_ARCH_REALTEK \
+		--disable CONFIG_ARCH_RENESAS \
+		--disable CONFIG_ARCH_ROCKCHIP \
+		--disable CONFIG_ARCH_SEATTLE \
+		--disable CONFIG_ARCH_INTEL_SOCFPGA \
+		--disable CONFIG_ARCH_SOPHGO \
+		--disable CONFIG_ARCH_STM32 \
+		--disable CONFIG_ARCH_SYNQUACER \
+		--disable CONFIG_ARCH_TEGRA \
+		--disable CONFIG_ARCH_TESLA_FSD \
+		--disable CONFIG_ARCH_SPRD \
+		--disable CONFIG_ARCH_THUNDER \
+		--disable CONFIG_ARCH_THUNDER2 \
+		--disable CONFIG_ARCH_UNIPHIER \
+		--disable CONFIG_ARCH_VEXPRESS \
+		--disable CONFIG_ARCH_VISCONTI \
+		--disable CONFIG_ARCH_XGENE \
+		--disable CONFIG_ARCH_ZYNQMP \
+		--disable CONFIG_ETHERNET \
+		--disable CONFIG_SCSI_SAS_ATTRS \
+		--disable CONFIG_MEGARAID_SAS \
+		--disable CONFIG_VFIO \
+		--disable CONFIG_IPMI_HANDLER \
+		--disable CONFIG_SND_SOC_QCOM \
+		--disable CONFIG_SND_SOC_TEGRA \
+		--disable CONFIG_SND_SOC_SOF_TOPLEVEL \
+		--enable CONFIG_MTK_PMIC_WRAP \
+		--enable CONFIG_MFD_MT6397 \
+		--enable CONFIG_REGULATOR_MT6323 \
+		--set-val CONFIG_REGULATOR_FIXED_VOLTAGE y \
+		--enable CONFIG_RTC_DRV_MT6397 \
+		--enable CONFIG_SOUND \
+		--enable CONFIG_SND \
+		--enable CONFIG_SND_PCM \
+		--enable CONFIG_SND_SOC \
+		--enable CONFIG_SND_SOC_MT8163 \
+		--set-val CONFIG_SND_SOC_TLV320AIC32X4_I2C y \
+		--enable CONFIG_NOP_USB_XCEIV \
+		--enable CONFIG_USB_MUSB_HDRC \
+		--enable CONFIG_USB_MUSB_GADGET \
+		--disable CONFIG_USB_MUSB_HOST \
+		--enable CONFIG_USB_MUSB_MEDIATEK \
+		--enable CONFIG_USB_INVENTRA_DMA \
+		--enable CONFIG_USB_CONFIGFS \
+		--enable CONFIG_USB_CONFIGFS_RNDIS \
+		--enable CONFIG_USB_CONFIGFS_OS_DESC \
+		--enable CONFIG_ZRAM \
+		--enable CONFIG_SPI \
+		--enable CONFIG_SPI_MT65XX \
+		--enable CONFIG_SPI_SPIDEV \
+		--enable CONFIG_DOUGH_FPGA \
+		--enable CONFIG_SND_SOC_TLV320ADC3XXX \
+		--enable CONFIG_NEW_LEDS \
+		--enable CONFIG_LEDS_CLASS \
+		--enable CONFIG_LEDS_CLASS_MULTICOLOR \
+		--enable CONFIG_LEDS_IS31FL32XX \
+		--enable CONFIG_IIO \
+		--enable CONFIG_TSL2583 \
+		--enable CONFIG_MT8163_CONSYS \
+		--set-val CONFIG_BT y \
+		--set-val CONFIG_BT_HCI_MT8163_STP y \
+		--enable CONFIG_MFD_SYSCON \
+		--enable CONFIG_MT8163_BTIF \
+		--enable CONFIG_RFKILL \
+		--enable CONFIG_CC_OPTIMIZE_FOR_SIZE
+	make O="$_outdir" ARCH="$_carch" CC="${CC:-gcc}" olddefconfig
+	"$builddir/scripts/config" --file "$builddir/$_outdir/.config" \
+		--enable CONFIG_LEDS_CLASS_MULTICOLOR \
+		--enable CONFIG_LEDS_IS31FL32XX \
+		--enable CONFIG_MT8163_CONSYS \
+		--enable CONFIG_MT8163_BTIF \
+		--enable CONFIG_RFKILL \
+		--enable CONFIG_REGMAP_MMIO \
+		--enable CONFIG_INPUT_MATRIXKMAP \
+		--enable CONFIG_KEYBOARD_MT6779 \
+		--enable CONFIG_KEYBOARD_MTK_PMIC \
+		--enable CONFIG_MTK_THERMAL \
+		--enable CONFIG_MTK_SOC_THERMAL \
+		--set-val CONFIG_MEDIATEK_MT6577_AUXADC y \
+		--enable CONFIG_CFG80211 \
+		--enable CONFIG_NL80211_TESTMODE \
+		--enable CONFIG_CFG80211_WEXT \
+		--set-val CONFIG_MT6625L_WLAN m
+	make O="$_outdir" ARCH="$_carch" CC="${CC:-gcc}" KCFLAGS="-Wno-error=incompatible-pointer-types" \
+		KBUILD_BUILD_VERSION="$((pkgrel + 1 ))-postmarketOS"
+	make O="$_outdir" ARCH="$_carch" CC="${CC:-gcc}" KCFLAGS="-Wno-error=incompatible-pointer-types" \
+		KBUILD_BUILD_VERSION="$((pkgrel + 1 ))-postmarketOS" \
+		mediatek/$_dtb.dtb
+}
+
+package() {
+	KERNEL_IMAGE_NAME="Image.gz" \
+	downstreamkernel_package "$builddir" "$pkgdir" "$_carch" \
+		"$_flavor" "$_outdir"
+	install -Dm644 "$builddir/$_outdir/arch/arm64/boot/dts/mediatek/$_dtb.dtb" \
+		"$pkgdir/usr/share/dtb/$_dtb.dtb"
+
+	# downstreamkernel_package installs the image and kernel.release only.
+	# Every revision up to r193 was fully built-in so that was enough; r194
+	# is the first with a loadable module (the MT6625L WLAN driver) and it
+	# would otherwise be dropped on the floor.
+	make -C "$builddir" O="$_outdir" ARCH="$_carch" CC="${CC:-gcc}" \
+		INSTALL_MOD_PATH="$pkgdir" INSTALL_MOD_STRIP=1 \
+		DEPMOD=/bin/true modules_install
+
+	# WLAN firmware is OWNER-IMPORTED and is deliberately not shipped.
+	#
+	# It is MediaTek's, not ours, and its redistribution terms are not
+	# established - the same reason the Fire OS audio coefficients are not
+	# here. The owner exports it before conversion with
+	# tools/export_stock_assets.py and installs it with
+	#     biscuit-import-assets import <export> --profile firmware
+	# which verifies it by hash and links it to /lib/firmware/WIFI_RAM_CODE,
+	# the bare name the driver requests (CFG_FW_FILENAME has no chip suffix).
+	#
+	# This works ONLY because wlan_mt6625l is a loadable module that comes up
+	# around t=35 s, long after the root filesystem at t=7.4 s. The Bluetooth
+	# ROM patches and the FPGA bitstream are requested by BUILT-IN drivers at
+	# t=0.9-1.2 s and t=0.61 s, before any filesystem exists, so they cannot
+	# take this route: the owner's copies travel in the initramfs instead,
+	# listed by the device package's -nonfree-firmware subpackage (see build()
+	# above and PROVENANCE.md).
+	#
+	# Without the import the WLAN driver probes and dies at
+	# kalFirmwareImageMapping, which is the intended, visible failure.
+}
+
+sha512sums="
+3023390e33c8cfc665a3c0789aa7db90c848211fb7c369483dcaf54ed1f9ccedd8b9f01babf269bb35709f04ef66bdbcdcfd083a36d155779b62e0531b460a85  linux-amazon-biscuit-20951722df6ae1f6fecbfcea0a7d585118a06f3f.tar.gz
+04ffd4b74036fb1573a5f72b8fc647acded28ba05d98c570795deeb68d3e7cb4fc248e58034ed83ceb9e8d0a4c35ee0505f9a5b50969d1dc8709e7ffa691b28f  0001-pwrap-mt8163-skip-mt2701-gps-init.patch
+06024c0fcee94f17616cfe290f25b5ff777f95c6af551e348f32b92a77a094386b76040c20529303b1a0b6751ccc142bcef652d09e695eff83df2774d11073e1  0002-mt6323-regulator-probe-synchronous.patch
+dc75fe5bc58ed03d4b68e854aefe03159552420058fe615f29e187bb6ab3be8bb3871d96849f69ca59ad08f469ca5d593ba900fbe35fbaf27a5f15b7a0eafb4d  0003-mt6323-skip-initial-buck-vsel-query.patch
+a3a95fe9de413c8eaedccb8034948fb34da1ffe6327f9037c870c9bc586d927cd2c6a4dd628db9bbe207b92d8dbf1e1c210e459b08e6763ce8adf76423fdb360  0005-mt8163-biscuit-emmc-regulators-boot-on.patch
+591afb4ab7b92813ed27dc8f7c62c59cf64e48d75508abc4132a904176a04d33bd4e10a6c6f6f40cd611f4c2a970ebe8eab8323a35220e1689f23c53ea603937  0006-mt8163-mmc-init-diagnostics.patch
+39d47a2e630f45752e1b3828efc597259ebbab20df2409ba90b8c669f862c2f0cd65f462c422b45708aaa187bcbd0c3924bbf1d77ae9ce434ed151a4fc64a4cf  0009-mt8163-apmixed-pass-device-to-pll-helper.patch
+94053c6d540fdab3a83cfabffc9e7ffc50e0440ddb368cdf0d15f701d4808f68d6c704909badf8c50c116ee3ea840f4f77e18c6e3dd5bc32a5a5c8a9e881d6fa  0010-mt8163-psci-cpuon-diagnostics.patch
+6c8fbb3f2775cf14deb9bd843caf94187b0e0912be4e7bc1fce41a008ae6b4835cb82c4334dc91c3196f61684476a367eb1eb809707747fbc3a01ce0d77e68f2  0011-mt8163-psci-enable-ca53-coherency.patch
+3cb7095c30b12174d4932507c21d7f3e2d2a244c387d84d4996efc73a35114da29db9ac96bc988f595d0787afd0f03ddfb9a70015fbe32ea883008cdc19985ea  0012-mt8163-psci-power-state-diagnostics.patch
+fa28119738ce8328f30d2e781158dfe7eae97a8c1955ca5fd8f16bdaf6992eb34cb0eecdc017d7e697146c4c854a74ff9511de96a9f687577015ded7684ea093  0013-mt8163-custom-secondary-cpu-boot.patch
+c390dfea4ed27e8a3befd170de8f4c834067aff44b539132117269c4546e27a69e5ee865ba3b5ea20ce9ae483898e74e2ef120aa14cd0922b26f967db1385655  0014-mt8163-musb-late-probe-diagnostics.patch
+9e7c1c02dfa6832ff843ce4ec0ed023eb7c86e1e4e084050909ea351170a2ad1c23dcc348c405899861f5ac2b730c81bb9d1f71f62ce3cb2e01398bb776e74ac  0015-mt8163-biscuit-enable-afe-probe.patch
+d724a048fb88a0a2b9f1660d34babe42558e18e85cc986fd478ac551da7c5f018bbddfca0b55ffbb67a53b0ec0cdf9e6f1ccdb2bed2f04f82796c8ee7e9f8732  0016-mt8163-biscuit-tlv320-codec-probe.patch
+95a00c287d1261b1f578229cbff85eb784985a29cd3ba4b367db5db36ec85347ad6234d0e044a78e99bc005beab407659be4b18cefbd8b2e928f01ed969e1ef4  0017-mt8163-biscuit-tlv320-1v8-supplies.patch
+d89dff7ed7887cfaebdc17e35b344f9f4b0400ce299f1ad211f7800468594b6d7139703016b90e4eaaed7d18792e92113b63b3b93afa23207d0f32f352e26d53  0018-mt8163-biscuit-tlv320-reset-active-low.patch
+62d6d366127277f9cc5fbbe4a91f38453b0a6ded496364a3aa691bd73f89e3867644dfc0b12ab561c9cc0c4f91e7c9a0d9888844ed37fdc8b4d799a192a0064f  0019-mt8163-biscuit-machine-card.patch
+39a6e79da7a24f00804e8874c9c8241cbbad294d3af54868232895f676dbf5dd41bdc56971df8b6e154f336f47262da0d57aa48da5a19b6cac36555801995223  0020-mt8163-biscuit-aw8736-speaker-amp.patch
+fc03291fce1f15cfdb31af2326783b9569f495e24ce56deca3d2f2c168a34a4b65a80975035ad0c6ecebab29e94ac932d3e0c67bfb84d8617634c16366e8b0b6  0021-mt8163-biscuit-i2s1-pinctrl-mclk.patch
+a2cfde531513c3ed037e852c35e3b3ab753478d4c5d8d3c45530d2da45806332952908db4b8e4a1f8d4198396922a1dbdd2005eb5ca172a59cc1cfc9cda17ecc  0022-mt8163-biscuit-enable-cmmclk.patch
+18091227e433f1990df25aba26b96b4c8ba40e060846924971fc1e7601a3a9a7c5af8f9c1deda3dbbe703abe6fcff018df214b72131bee1efff741f73f2c90c2  0023-mt8163-biscuit-cmmclk-diagnostics.patch
+c5323acee417741e48af1794db509e43f054cd5235879d802240545179bb3b61df24506f5e93514ed90f18015541d66dd323808e8f205fa7c2975fef08ce6c7b  0024-mt8163-biscuit-camtg-parent-order.patch
+89942467126588b7791cc6ebe038eb1c140fa607f14889af35c12cf5b890f27b0c213dc74d09450eaaf9f06607ab0c951f1ac0b221c14d19ea2cf1713ea45afa  0025-mt8163-biscuit-seninf-register-readback.patch
+e8c3d2c09781203d5095d6a3dfe4d703d9cf7b6d2d40c60aa3f90a507eb22a34b9d2b568b31c335b52ca0b79d7d17d49687659a6d99eeb3ed77ec641586f232e  0026-mt8163-biscuit-isp-power-domain.patch
+b5bbb0970e4e195a2496a552ece8706284e684984e785b9337b8d16bd4af969e9b3ceed9f94339aa5413f41d946d54100a95a36b5d92b486735031f317b1e8ff  0027-mt8163-biscuit-seninf-mmio-fix.patch
+abf5c2ebe779ca95c1a1e5dd428ff9d6964f6bae60f9a7c772f187ae62c044207766230a011baac5720ef21adb31fb0794048d51f1912fc48f0a9ecb9b007b9d  0028-mt8163-biscuit-seninf-gates.patch
+9af42680f6767fa9b6bcc386236e5f344ee7326e2eb0d727acea03a957bb89fa67f72e1ab1e6cc6feb5f2fb89e6c0c57c3171e5894c65889e1c6f5497be536fc  0029-mt8163-biscuit-enable-mmsys.patch
+b0826a764c5525f20dc6062de3074e7a0a226b6d3dd3f0b31a6162ff21a55d91733ccc9ca0c443b09c91b5da9412a71194617c43e7f81338a993d83a75d60ac5  0030-mt8163-mmsys-of-match.patch
+4e79d1ff5d063f20308e0ccbf5953890b7e96b175b981b6ef2972e1a22ce6d5399554f6e36e21550117bcad4f36daa0ae7a970eddacd57eadc2215ddf3b50372  0031-mt8163-mmsys-simple-probe.patch
+b34b5b61585b3e6a103b79e646905db3f683e899fa9eb51eebe3b604467ad5e921c22205fccee5385719b8ce069c07fff0f861e8bff9e9319dcba43bffd3c354  0032-mt8163-biscuit-seninf-top-gate.patch
+051540daa5d11d582fd2dc005d1c408d34fb687e92ebcb7d17533aea027e84f025feed9c7488cb45965c84084a30f7b4e26d66de0fb8b11934fe50d8d232b302  0033-mt8163-biscuit-evt-speaker-routing.patch
+38e2e1a65ede81141080ccb19043ee66af5ea8325ab47b5c1507df07719b4bdbbe2533cbca7e2443cc3d22f24e72a67fb54ed88b30b2fcddce0825bda8959a4a  0034-mt8163-biscuit-mfp2-amp-unmute.patch
+c887a04d7e6c86cd1c9d7bfae7db8b7f1b6de1db6f12fe82f3ae6fce3a23565170f69103cda5b42487ebe446590943f10c09d651356301337d98dd9c9b7c5793  0036-mt8163-biscuit-vendor-tlv320-48k-clock.patch
+89e72b218510ff7bdc4e93808c3bac34c1fc47c465be9e12c2ca4846343be634753a02f6c44da64827d63de8e6c207cf296202e99b1f927e47d7ec1c60d036a6  0037-tlv320-vendor-48k-post-hwparams.patch
+2e805eb8c3c4f41ee909a68f5f4fc6497768e5df55df2b5ca1fbea94e99d3fa92cc8b882425c7158f616982246dc4b2676735c3c4121f17e748f49df9b231be0  0039-regmap-enable-debugfs-writes.patch
+1726e00153b6c94e4b5f96ed82ea7429fcc7f83cbfa88ba32e2349581b34b0f12c1a02d2409e6e27869b207dfc50dbf89abd95c0132de6ae7921393210c2d1f2  0044-mt6323-biscuit-always-on-rails.patch
+c464f792cb670c9603e70c963dae56236bfa86d69be5bbb4573c2a0496817ac5bfb20719fe3f779cc1ef4412f5445de9a530d411737583093341e261067fa82a  0045-mt6323-regulator-bind-dt-constraints.patch
+b830b8f9e047bae7373c2d2c4787001190c90a98f4f46f4ec2252bf3d97e9118415256994d96d96b8fc8cd8156e01af40117cb2553a5638293ed7823d8a9e08e  0047-mt8163-i2s1-con1-ports-and-normal-clock.patch
+ee067a15c8311a990025ecc8b60d35a4932bebe151f8a618a42e6544ba6d1b4637d0979a50664f49367f89e0809a96fd6aa77261f549db69feaeb2470ec1311f  0048-mt8163-i2s1-enable-adda-dl-src.patch
+73e9c3d73065e11e24e45432a82466977224f3b072fcf71ee1b92ebddb03578c3881bc47264cb75263c161a40b7430b7d31e0749d71eddd122fb1234c9843486  0049-mt8163-i2s1-con3-and-24bit-at-start.patch
+6b07338c29f3f795493516d5738157e7a440e5c8a344553687305e7e42c004092baff2b8a1f6c2f448d9e9b938b3e20b7eb2f1ff2426b66f52b4f9cff3fbe830  0050-mt8163-biscuit-spi-dough-node.patch
+a473101126d792d2c6e90417247adb45ec77aeaa69061dfd1ad4eb408d1eae1e9d0f731b45cf6331e2abfb861de3a307fe2b6b3a2fdba42c925fef7e609e2499  0051-misc-dough-fpga-driver.patch
+39d2a61b9759c0ad12b9f5400bcd1e240a2486f2be715b9d650cf5f87e55cdc98798742f8973d328e02f7a7404be440b629b08f72ad78863797bc60a4041cf96  0052-tlv320adc3xxx-optional-reset.patch
+1718dfd624cc64159a43d3caf0c0567ddc3df328999be8e33e43684032e73e5913436d1ff3716370989e491cf45e5074a821a1042e7d4896455830749aff1b57  0053-mt8163-biscuit-mic-capture-link.patch
+336a4b2086d2d9e8af32119d1fd49bf0c5a2cb1aa3715bc696bf969fe35200e2dfd4ecec03cec61aeaa3fab758ac826aa43098067634b36e481df4bd1bcfb9a4  0054-tlv320adc3xxx-tdm-slots.patch
+937de1e40ed61503d6b9b942522c9af161c0c21eaa46c80dacff69a3861f56c7c3b8303b16f8b9e5881585dac91f5d69d769857fb5c52269193189ea9536657b  0055-mt8163-biscuit-mic-tdm-frame.patch
+3284296dae05c4b89d0731399f353a8e172a7e04828205018b93418a52a64cbf2300712e3880206e36ef8e163b6934c6f22fbf5787901e0c1296a22b4d41fa28  0056-misc-mt8163-consys-driver.patch
+21009b8276ee7b0a028a967a1f6b6b8d5dd0eebfe1bd635f7d5efabf89be023c0b7cc501f73299758780ba797a23057b5d219535694229d77324fcb2325d2ef8  0057-mt8163-biscuit-consys-node.patch
+366f627849990e1d36401ae9a7d0668303d5dc7500ba40d113e5a05249b980d15dd9b7258526e5c9252127cb12b89b759338fa8544105cd42936aebde5e6ab40  0058-mt8163-consys-emi-window.patch
+db50344e82590829f03fb74e5f6588c4f8180386c0383f6df3bce84e2a9e7657cfcbd0d783e4b34fe0299b3aeb64e1d8c5412007945bdb2e805fd86fd785c9dd  0059-misc-mt8163-btif-driver.patch
+d6e324216396d9ba77962e694040e205be8a4a368849863f669ee3203dd17ecc874b5d3abae68dc084fafe9dcc601694c40991053c8f7a3ba7fda7216d3764ad  0060-mt8163-biscuit-consys-emi-and-btif.patch
+b6f56747316d8a2ab804d2aeac502b7577f33eb5bc6c336b098d49836e4822e723d3bfbf94683d445cf479a62dd57c12c3175f69ae815512c26cc0d7699e9e49  0063-mt8163-consys-emi-mpu-region13.patch
+74d931d0e025043a15ecb3006aab5c54b194efcec6c01bf80b33b0613d0f3f6a16c22725b10aee1a32719c485d2d0d7fb1bb53c2918ae093a33e51c1cbe11d09  0064-mt8163-consys-wifi-reset-pins.patch
+53516781042758dfb9428382e00aacb0ee9716896b0c910b6e9923636f9d4fb723ad3c34c661cada7fe2e075dac059e0e1cae6fe31489f7682c7fd5612dfa76b  0065-mt8163-btif-dma-client-api.patch
+c2f67d52c7524080a7449757c585110f435f4ee2c04cc3667b02de1163e21431e4fa475c30067a4ad2cb304acc3262046e089332999549fa80dcbe041dfa247d  0066-mt8163-stp-wmt-hci.patch
+dddacb914d0c30a364ab86de55b0c5f2aed3096d023a76e424c831856cd4d3b92982bf8e95ab9151dc1cdb34032c14a9f85dd0683558868cee01698d19e3c1d3  0067-mt8163-btif-deferred-activation.patch
+77b111909ca037bc333306751e8c97c692a7f73d5fa1abea522a76e2a5db4b271621261043fd2d83152c97b4b7f19d7057109db4cc730ac099daa176cd6a54e8  0068-mt8163-btif-write-zero-success.patch
+55504555e62d8dd4fac3bc3a543bc63ab8fba150429f4c6dc5a613260b0567126b545d5d41c0b8bbd2f8e7fc49e946bd4b3ce460ea9405804b79e43590e877db  0069-mt8163-btif-wmt-transport-trace.patch
+d4ea5dc52e978876d4b6e15605221d557c2c46e9356dcf8576049ded8d80a8ea4fe7c8d2d059408bdee2c12c8240beafa18687aadf2d9c91e32a00593ee7ed03  0070-mt8163-btif-stock-tx-irq-semantics.patch
+9162d81d3efb7b3840f3d5285b14fd2374b828bcf474de7e0eaa8802cdb56cefe48ac4630c71b911db90c428b0fbe2852c9cef343c98aeb55f11d567c7545305  0071-mt8163-btif-core-rx-gate.patch
+0fae21c0839726e2d8f61bc6be1380d480107df625b439e9f6b2423364bf390014568113bbf193daf80ce5f392b06288d2af6d6d544fa76cd4f4e409da5c87a2  0072-mt8163-consys-stock-power-order.patch
+1fd79d76f8961cf5d4066e5a8d2efaa860afb515cf7c64aa0e2202e6b8fc96b549f1aedcf3115da6575556ac8856ab3e2eb897f6b650ca71f112aa7e29510605  0073-mt8163-stp-stock-wmt-hw-check-and-bt-paldo.patch
+7fb61adb117b4be22e384edf1a070dcfe3be7033d0fb18ba527df2268e1e6ac62a7dd5471ad7475a14c5104f4dca562ad3ab4eaa2d4637f26fdc5226d2942370  0074-mt8163-consys-clear-shared-emi.patch
+1001dc213aa99a780a970b23ac5db79703c0101d9b6bc30e7ffc525f5912a77e19a7e034b143b7f378012174837bd993b3baf7634d0c47ab4e598f0ba858b9ab  0075-mt8163-biscuit-consys-fixed-pool.patch
+190eef31b5d985d7c973ff0b1533edc3bc73a5732633fa21b9ed4463ae9c5d6d895a5ad212231f447353657e641e395ead91c9beaec5a44db6463bc92b0a7920  0076-mt8163-btif-stock-wake-before-wmt.patch
+f9552ac07ce52ff1b435e996a2967c985ec1727e0337dda74c045b288b3d78f20646bfc113e4ed04921f57810d42b39ecdf74903d77c9a8cc7adcbc5add36a1c  0077-mt8163-stp-mandatory-to-full.patch
+58d85671c2567157164c04fc9d10b0fb6781ac133fe3afc0807b48d8ccb29fea60caf67b69e5242aa288aad8c2d8c828def2db94fec6f51fc9229a231bc93a78  0078-mt8163-consys-stock-settle-before-btif.patch
+ffdb23c40da0404147e6ac9ec4c5d4026cfeee9e8a2f87eae0d694941e4aff1a5a08bdaa09aa1c0f82dbbeefc055a6d739491fb666c65320a944b91b0977da69  0079-mt8163-stp-fw-message-rx.patch
+ad5d432b2d59440d45c9133b719f5c5e51d11a4c678f29d8512996c1715fb2c05f9cd06cc690d08a340dcf8e57f3eb170259f25f58a247b1a3a3e931e287b89e  0080-mt8163-btif-stock-tx-publication.patch
+d8d740477fc9959672fa14762434bcb2e4d07238a3a61b390762e602986538d02686a4be51374c7702fedb2d296d08d724297c133e5b703a5dc5a738d46a77c8  0081-mt8163-stp-patch-mcu-clock.patch
+3d5dbc0bd2328b2a5d6cf728d7edcb363e97193dff0cedf6db990214ad7e9eb7f181b54c15ff036bb5a69097b36a6e31f48d727a8ef9315499184445ce44c29d  0082-mt8163-stp-power-on-dlm.patch
+ae999ca09dafa7936a94488cbf7e88c9a271b617243984905f9c324301cc3892ae6a95ade809a2c12adaaae8a9a013070d3184d30fd211c55e0713efb91473e1  0083-mt8163-stp-fw-emi-dlm-diagnostics.patch
+9e6ed986a4bbf41b6219ae83accb672e766a25c6346fc5c779b102495bb728d7831583dea235aaf6e7d8f99a0aad02f6a5bdecf4e64e71508e8e309469685ea0  0084-mt8163-stp-patch-address-align.patch
+da1dbd749f64a34fa97e19757f8c0085e84f98edb692d052008a3b9dcde705145bb5932822e5a8b83965b8a9409d6167d90c444cb6ee67b727537f59eda77f47  0085-mt8163-hci-extfeat-page2-quirk.patch
+878d2b70a72b3833cd324bce8891ad5e6196d0d18cd446ced0efb473c093b1eeebbbb67355d58a30474647456fca43440c3de63ec29e781c09a179ea6239f607  0086-mt8163-stp-rf-calibration.patch
+cee63ca4fa48db0f25c9df0bb42d82b7c5b3153174fab594707e31e9cc1a509d4adff53f70c06e5240355f37d92faeef52109a785f31c7009cd14e03108b78bc  0087-mt8163-stp-antenna-select.patch
+4692adb77a59ca72f7d63ccee4454df5d4bd0a777e6d98a43ada5f78166f7e1ea9cec18c9fc591b0f8684a41297f0a1582e2f2233b3bd00fe25df76acbffd2b0  0088-mt8163-stp-wmt-packet-match.patch
+e6ec052d09d33700d914a8a778cdb98ede4ccd95f361e880a676f5302cdbc79454fd866c466e9e5ed67b0d32f1c1e5208c824ad2401576be62eff3eebe832ad5  0089-mt8163-hci-le-event-mask.patch
+bcdc458179868e4a447c4e1ea3736fc9915c624e5762a78fd7ec1d4411b82d756da24b59197b45ad8b111aeec6de8a8f38c588676e84e7445582d6902c824a3d  0090-mt8163-stp-tx-backpressure.patch
+6066e3e93b6c774876c168112c30785670a6c202a3908645c7d3b451e024cd86253ed4a6d2f2a49b5f6e3ba51a6966a205afa44d6fd74768049341931eab874d  0091-mt8163-biscuit-output-select-jack-and-amp-lifecycle.patch
+2f810beeb0d59b0d86d15a6c605207ef906b0616a6f38739c44922f6451b2f350a4d51ad0b91b781fe4366ed6bdf96c770373ffa6046aebe349ac7cf5af6787d  0092-mt8163-biscuit-jack-gpio-desc.patch
+8fe39f89979de8e96ad74314649fbcc3bf9e341a5433155488ad778282aa53272829c305eac5caf440af6acb3d35619972947705a2ef65583e9230569c5fc676  0093-mt8163-biscuit-hold-codec-output.patch
+5c34360e1da2cb134f0fd22070653d9a890b5931f4aec493c03431eea4bcb86edd83517deeed48330f407d53616cc0e94ac77972acd028bf76e375bf5db778ee  0094-mt8163-biscuit-amp-ordering.patch
+4cd93bf01f97766d79ab489ecb9035670e07019b75195761208f68c97dea6572eca475672cf91fcf6db27bc1e45eb89432bd10fa22c99d7ebb0736cf1cff005b  0095-mt8163-biscuit-buttons.patch
+011908788ea72fd8148128ded5f37a93a37d8d80771860c28c33217276b3a83651d4b71bddb93615805418b0564fe838f142426f40f8f2e5d3586ef3a5b6ac90  0096-mt8163-biscuit-mute-led.patch
+5329a4d5502b5281c40dbb484185b0b9abb50348744b6f43b662c26936250f859abb7156c013edf495e598d1f1f1460d14bd9ceb871490586f9c6d8498930e15  0097-mt8163-stp-bdaddr-from-idme.patch
+1f8f1041a0553d1caf321b07f0789bf1d464e988bf4bfd2a7fb0759452185a6404849c08f2b91a131dda6c7a713a700db24c7e089a445b9f1fcdfeca6c4a051f  0098-mt8163-biscuit-enable-thermal.patch
+1bb8d3c4396d50e2489346decb56d403405183d87c87aa7feadb142a7e1616366fe1ce9e29145ea7d75aa315b3e8bc23fef68ed0d5b295357b93356eec92f210  0099-mt8163-stp-wifi-func-on.patch
+8a8b34d2baa7c2dc237f7a562b864f4b45c7abb601c4d0d7b8a170519644f1a94e7f5668d61d4a89bc49c0cea4c8158a989fdf65617a4587fb987ba859e4ba40  0100-mt8163-biscuit-enable-auxadc.patch
+1fba3b3199358ce14ac8bbd2c195a75eae48dd7e4b5a2de8674e7e9e00eabb2a87fee50dbabca63bfe7d3f3ea32a4f39a47392497ef7a2e8dc20a4eae986cf80  0101-mt8163-cpu-cooling-cells.patch
+fe64b332cab67539985faf9a0d54150cac3a7b8230588886c3761588c01a6487f3e0202d40e0b11c70182d0d5382768771924ea87ebdc77e57b4387cb0bd8956  0102-mt8163-biscuit-wifi-dt-node.patch
+3899e59433437e8c45db10e81cd40cb40d0fd9e709c13853948166cacab372c0a0d51f6e13d51d6c7fdd5af5ff709ecdb1bf063bfa9765a5cf25bb16d8c4272c  0103-mt8163-consys-refcount-bt-paldo.patch
+932c5690fa9d90e1416e634aa988edeb2488071c354802111a3d97d351251a0d8846fe1515c92cd15d031f83d20f7e5a6f442dd4e6c1a66cf3d9ad74f579a53b  0104-mt8163-stp-skip-ilm-patch.patch
+a68e673577fd964925929a4e79a774878493dde72b7cfad4a8f1121c924187b2a3de88ef924fa755d5b78885886560c4b02e78c8decf56a7e0414158f41d9851  0105-mt8163-stp-wifi-func-runtime.patch
+885c1931dc5901113f1d1fcc12c384cdebcdc80ad61e676dca961fcc49df262203470c2909df850bb45df533c6f029af84a0d7b82795fe263a568310bc96a9d8  0106-mt8163-stp-bringup-retry.patch
+a63c4f205b9329de7e6ace511a84e814a2c4b2eef1a1abe105de517335035f4f77733f27e8bf0f3fe7ec446ed34c2a8dc555b79868b5ca788fbfb6a70d5e89a2  0107-mt8163-consys-full-assert-dump.patch
+51538ecd9489215600a463e3faf567a28317f95726f6fdffd6a5191bcbe8864ca565b42030a0c1c7521739ea7b9d2bfa71f90a770b0d68b890875ef10c4010e7  0109-mt8163-stp-log-rf-calibration-event.patch
+3ac819ebd9ba5dac25624f18895852ac990b860361b6491e20b8e2a13a19fc522ac69c7925d05729d4a1451bd4f4df6f950b1e6fc71cd22747566a98f644fd3e  0110-mt8163-stp-deferred-bringup.patch
+92bf9793d2b97f5e55d3404ac52283fe3cc538a767b7b571e8851e7c68f8a76a09d318ece5eb210ac29b3239971fcb4fa16a75c2e22ceb21cfb239a165d2b61a  0111-mt8163-stp-bt-withhold-and-fm-strap.patch
+3e1edbfbb58f80899a6fcc79aa0da1b35d6864d23629d58548249d5d102dca149cd64cea28e220f54a7a3a7ab5f57de2dc8a01296658326311f4deca9ce4be22  0112-mt8163-stp-enable-bt-after-wifi.patch
+184e78b1656e119b089b240bef2ce2185e14a6d96b31bff8f0bc0fad723e2e7cb795726047ee2ff9be5933b98ce0177fa0a03f70742dad5dd6a8c654d3b0c9f1  0113-mt8163-stp-wmt-coex-config.patch
+6a725dcabcb1076c0ea1856691c07272c4108778660b4ab808b410da66a91f13ff92905f3efab139f00979fa78d7af8e6f284b6192f057b46b6bd3ba1c1696a0  0114-tlv320adc3xxx-biquad-and-prb.patch
+a93cba7d032014ffa70c1b81423cb5666cf268f684d77ce4157012e63313114552e3001ee6571c70aec4ca189d26fe56a05a4a5bef5f690f0c0aa56485be084d  0115-tlv320adc3xxx-bclk-without-pll.patch
+d6e746d638179c26e725e19596050f8ceacabe142ead26f974cbb2dcffd384c8320e4b1d061547c4e3f217c18a13f466d54c4d18be1185266a72034f9f925af0  0116-mt8163-biscuit-aw8736-mode3-gain.patch
+ba19d77e7dad7f92cc316c698a43218a8183cd939dff35c7d6a266eb483e11f3c8ac0d94a16b1f2ba92861843c4c0146bd072833aee91fc72453ca7ef664a7e4  0117-mt8163-rtc-clamp-implausible-time.patch
+77efd210bfd7e6c37500df313058832cca13116dc46a6cb79c67282ac5b255346496c4217333d417a8f92b2fd16abe1be346abecbdb3d6a92c3e40211ea51976  0120-mt8163-biscuit-bluetooth-sco-audio.patch
+c9ca1694c05ddb2ed72aff3aa839c0b7bb7607163071bb96362dbee25ba0a3ed416fc2275d5d2111a6362b60be48e2c74cb6ef50334eb5f58daadf3c837050c2  0121-musb-isoc-in-dma-diagnostic.patch
+cb75d8d6f0be8fd83c10743b6ce233f0626476f0cd4f3167b5ff22f16453efb8b40982201382236c522a7b926c47ee4d9889595ebc8d620fa6cebf784c6a882e  0122-dough-capture-timing-diagnostics.patch
+1b8e99591cd91c9a3c262633227ff66c47387797b98afe2837ed907f6fc5955d16565691b06f1ccaf81bb88c66bf064b9763b17b8cf9a8f558d9768420a1074b  0123-mt8163-biscuit-ramoops.patch
+5db6f83aace6ca9281a0c6374c0c03c89cb834de5fa13cfd9c9507c15bd396c204aa91ec227fbd5b2f674278c8921696cdc1c480b852addd1b7b05ebadb03498  0124-bluetooth-accept-acl-as-peripheral.patch
+3a19e82da05c37f901c0ae7efd7c75f0f8e54abff492242bdc644a5527a71141c6f5c7272474c3fa1177f2bbd0745ba4ab83d7ffad57f7febf0defe7a113cf06  linux-amazon-biscuit.pre-install
+3a19e82da05c37f901c0ae7efd7c75f0f8e54abff492242bdc644a5527a71141c6f5c7272474c3fa1177f2bbd0745ba4ab83d7ffad57f7febf0defe7a113cf06  linux-amazon-biscuit.pre-upgrade
+c92922821c8753dd56d99be8b1ace2694bf7d089423e27446e1517a9e6a8dfe9d40e7666650d197a6654b9c30338793c88990030a90d48efad0d2c46eb9badb1  mt6625l-wlan-20260823.tar.gz
+"

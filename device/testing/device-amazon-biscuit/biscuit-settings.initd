@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+
+description="Biscuit device settings web UI"
+command="/usr/bin/python3"
+command_args="/usr/bin/biscuit-settings.py"
+command_background=true
+pidfile="/run/biscuit-settings.pid"
+output_log="/var/log/biscuit-settings.log"
+error_log="/var/log/biscuit-settings.log"
+
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+
+# No net dependency on purpose. The socket binds 0.0.0.0, so it is happy to
+# start before wlan0 exists and simply begins accepting once the interface
+# arrives. Waiting for the network here would put this service in the same
+# start_pre deadlock that the `local` runlevel ordering already caused once.
+depend() {
+    need localmount
+    after biscuit-ring
+}

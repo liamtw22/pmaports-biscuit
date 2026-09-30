@@ -1,0 +1,23 @@
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -109,4 +109,20 @@
+ 
+ &afe {
+         status = "okay";
+ };
++
++/*
++ * Amazon's Biscuit wiring: TLV320AIC32x4 on I2C2 at 0x18.
++ * Probe the codec only; a machine card and audio routing follow separately.
++ */
++&i2c2 {
++        status = "okay";
++
++        tlv320_codec: tlv320aic32x4@18 {
++                compatible = "ti,tlv320aic32x4";
++                reg = <0x18>;
++                reset-gpios = <&pio 51 0>;
++                clocks = <&clk26m>;
++                clock-names = "mclk";
++        };
++};

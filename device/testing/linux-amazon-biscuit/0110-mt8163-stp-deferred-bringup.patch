@@ -1,0 +1,200 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -215,6 +215,13 @@
+ 	MT8163_STP_MODE_FULL,
+ };
+ 
++enum mt8163_stp_bringup_state {
++	MT8163_STP_BRINGUP_OFF,
++	MT8163_STP_BRINGUP_RUNNING,
++	MT8163_STP_BRINGUP_READY,
++	MT8163_STP_BRINGUP_FAILED,
++};
++
+ struct mt8163_stp {
+ 	struct device *dev;
+ 	struct device *consys_dev;
+@@ -260,6 +267,9 @@
+ 			 MT8163_STP_TRAILER_LEN];
+ 	size_t full_tx_len;
+ 	bool hci_registered;
++	struct platform_device *pdev;
++	struct mutex bringup_lock;
++	enum mt8163_stp_bringup_state bringup_state;
+ 	bool bt_paldo_enabled;
+ 	bool fw_assert_seen;
+ 	u8 trace_rx;
+@@ -1030,6 +1040,16 @@
+  */
+ static struct mt8163_stp *stp_for_param;
+ 
++/*
++ * 0 (default): bring up CONSYS during probe, as this port always has.
++ * 1: probe registers only; bring-up runs when bringup_now is written,
++ *    which wifi.start does immediately before loading the WLAN module.
++ */
++static bool bringup_deferred;
++module_param(bringup_deferred, bool, 0444);
++MODULE_PARM_DESC(bringup_deferred,
++		 "1: defer CONSYS bring-up until bringup_now is written");
++
+ static int wifi_func_set(const char *val, const struct kernel_param *kp)
+ {
+ 	static const u8 off_cmd[] = { 0x01, 0x06, 0x02, 0x00, 0x03, 0x00 };
+@@ -1732,10 +1752,98 @@
+ 	return ret;
+ }
+ 
++/*
++ * The whole bring-up as one synchronous, idempotent unit.
++ *
++ * Serialised by bringup_lock; a call once READY returns success without
++ * touching the hardware, so wifi.start may trigger it unconditionally.
++ * Timestamps are boot-relative so early and deferred runs can be compared
++ * directly against the WLAN driver's own WIFI_START log line.
++ */
++static int mt8163_stp_do_bringup(struct mt8163_stp *stp)
++{
++	unsigned int attempt;
++	ktime_t t0;
++	int ret = 0;
++
++	mutex_lock(&stp->bringup_lock);
++
++	if (stp->bringup_state == MT8163_STP_BRINGUP_READY) {
++		mutex_unlock(&stp->bringup_lock);
++		return 0;
++	}
++
++	stp->bringup_state = MT8163_STP_BRINGUP_RUNNING;
++	t0 = ktime_get();
++	dev_warn(stp->dev, "BISCUIT-BRINGUP start mode=%s boot_ms=%lld\n",
++		 bringup_deferred ? "deferred" : "early",
++		 ktime_to_ms(ktime_get_boottime()));
++
++	for (attempt = 1; ; attempt++) {
++		ret = mt8163_stp_bringup(stp, stp->pdev);
++		if (!ret)
++			break;
++		/* A missing BTIF is a dependency problem, not a flaky one. */
++		if (ret == -EPROBE_DEFER)
++			goto out;
++		if (attempt >= MT8163_STP_BRINGUP_ATTEMPTS) {
++			dev_err(stp->dev,
++				"CONSYS bring-up failed after %u attempts (%d)\n",
++				attempt, ret);
++			goto out;
++		}
++		dev_warn(stp->dev,
++			 "CONSYS bring-up attempt %u failed (%d); power-cycling and retrying\n",
++			 attempt, ret);
++		msleep(MT8163_STP_BRINGUP_BACKOFF_MS * attempt);
++	}
++
++	ret = mt8163_stp_hci_register(stp);
++	if (ret) {
++		mt8163_stp_bringup_unwind(stp);
++		goto out;
++	}
++
++	dev_warn(stp->dev,
++		 "BISCUIT-BRINGUP ready mode=%s took_ms=%lld boot_ms=%lld\n",
++		 bringup_deferred ? "deferred" : "early",
++		 ktime_to_ms(ktime_sub(ktime_get(), t0)),
++		 ktime_to_ms(ktime_get_boottime()));
++
++out:
++	stp->bringup_state = ret ? MT8163_STP_BRINGUP_FAILED :
++				   MT8163_STP_BRINGUP_READY;
++	mutex_unlock(&stp->bringup_lock);
++	return ret;
++}
++
++/* Write 1 to run bring-up now and block until it is READY (or has failed). */
++static int bringup_now_set(const char *val, const struct kernel_param *kp)
++{
++	struct mt8163_stp *stp = stp_for_param;
++	bool go;
++	int ret;
++
++	ret = kstrtobool(val, &go);
++	if (ret)
++		return ret;
++	if (!go)
++		return 0;
++	if (!stp)
++		return -ENODEV;
++	return mt8163_stp_do_bringup(stp);
++}
++
++static const struct kernel_param_ops bringup_now_ops = {
++	.set = bringup_now_set,
++};
++module_param_cb(bringup_now, &bringup_now_ops, NULL, 0200);
++MODULE_PARM_DESC(bringup_now,
++		 "write 1 to perform CONSYS bring-up synchronously now");
++
+ static int mt8163_stp_probe(struct platform_device *pdev)
+ {
+ 	struct mt8163_stp *stp;
+-	unsigned int attempt;
+ 	int ret;
+ 
+ 	stp = devm_kzalloc(&pdev->dev, sizeof(*stp), GFP_KERNEL);
+@@ -1755,36 +1863,34 @@
+ 	if (ret)
+ 		return ret;
+ 
++	stp->pdev = pdev;
++	mutex_init(&stp->bringup_lock);
++	stp->bringup_state = MT8163_STP_BRINGUP_OFF;
++
+ 	ret = mt8163_stp_get_phandle_device(&pdev->dev, "mediatek,consys",
+ 					    &stp->consys_dev);
+ 	if (ret)
+ 		goto err_fifo;
+-	for (attempt = 1; ; attempt++) {
+-		ret = mt8163_stp_bringup(stp, pdev);
+-		if (!ret)
+-			break;
+-		/* A missing BTIF is a dependency problem, not a flaky one. */
+-		if (ret == -EPROBE_DEFER)
+-			goto err_consys_dev;
+-		if (attempt >= MT8163_STP_BRINGUP_ATTEMPTS) {
+-			dev_err(&pdev->dev,
+-				"CONSYS bring-up failed after %u attempts (%d)\n",
+-				attempt, ret);
+-			goto err_consys_dev;
+-		}
++
++	platform_set_drvdata(pdev, stp);
++	stp_for_param = stp;
++
++	/*
++	 * Deferred mode touches no hardware here: no CONSYS acquire, no BTIF,
++	 * no client registration, no patch download, no calibration, no BT
++	 * enable. Bluetooth therefore stays down until bringup_now is written.
++	 */
++	if (bringup_deferred) {
+ 		dev_warn(&pdev->dev,
+-			 "CONSYS bring-up attempt %u failed (%d); power-cycling and retrying\n",
+-			 attempt, ret);
+-		msleep(MT8163_STP_BRINGUP_BACKOFF_MS * attempt);
++			 "BISCUIT-BRINGUP deferred: probe registered only, awaiting bringup_now (boot_ms=%lld)\n",
++			 ktime_to_ms(ktime_get_boottime()));
++		return 0;
+ 	}
+ 
+-	ret = mt8163_stp_hci_register(stp);
+-	if (ret) {
+-		mt8163_stp_bringup_unwind(stp);
++	ret = mt8163_stp_do_bringup(stp);
++	if (ret)
+ 		goto err_consys_dev;
+-	}
+ 
+-	platform_set_drvdata(pdev, stp);
+ 	dev_info(&pdev->dev, "Bluetooth HCI registered after WMT bootstrap\n");
+ 	return 0;
+ 

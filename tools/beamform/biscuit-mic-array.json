@@ -1,0 +1,141 @@
+{
+  "_comment": [
+    "Microphone array definition for the Amazon Echo Dot 2nd gen (biscuit).",
+    "Everything here is measured on hardware, not inferred. How each value",
+    "was measured follows.",
+    "",
+    "Geometry: steel rule on PCB 30-002149 REV 01. Three independent readings",
+    "agreed (centre-to-outer 36.5, opposite pair 72.0 centre-to-centre, and",
+    "75.0 edge-to-edge less a 3 mm package). Adjacent outer pair also 36 mm,",
+    "which equals the radius and is the defining property of a regular hexagon.",
+    "",
+    "Channel map: occlusion test with a continuous 1 kHz tone, measured in the",
+    "tone bin (Goertzel) to reject the broadband noise floor. Each mic was",
+    "covered and compared against an uncovered capture taken seconds earlier.",
+    "MK1-MK3 showed -17 to -19 dB drops with 21-25 dB margins; MK4-MK7 were",
+    "confirmed the same way after switching to paired baselines.",
+    "",
+    "Frame: +x is the white silkscreen arrow, angles counterclockwise, viewed",
+    "from the COMPONENT SIDE of the board. Viewed from the other face the",
+    "handedness mirrors and every steering angle with it.",
+    "",
+    "Note no microphone sits on the arrow axis - it bisects the MK4/MK5 edge."
+  ],
+  "board": "PCB 30-002149 REV 01",
+  "board_diameter_mm": 78.5,
+  "radius_mm": 36.0,
+  "radius_tolerance_mm": 0.4,
+  "geometry": "regular hexagon, one centre element",
+  "reference_axis": "white silkscreen arrow = 0 degrees, +x",
+  "capture": {
+    "device": "hw:0,2",
+    "rate_hz": 16000,
+    "format": "S24_3LE",
+    "channels": 8,
+    "_note": [
+      "Capture is dead after boot until UCM fires _enadev Mic - alsactl",
+      "restores control values but never re-fires DAPM, so the mixer looks",
+      "correct while the path is unpowered. It also needs a playback stream",
+      "running: the dough FPGA aggregates the TDM mics onto SPI and gates",
+      "capture on its own DAC reference. Failure mode is a bare EIO naming",
+      "neither cause."
+    ],
+    "enable": [
+      "alsaucm -c mt8163-biscuit set _verb HiFi set _enadev Mic",
+      "aplay -D hw:0,0 -f S16_LE -c 2 -r 48000 /dev/zero &"
+    ]
+  },
+  "microphones": [
+    {
+      "channel": 0,
+      "label": "MK1",
+      "angle_deg": 150,
+      "x_mm": -31.18,
+      "y_mm": 18.0,
+      "idme_cal": 16384
+    },
+    {
+      "channel": 1,
+      "label": "MK2",
+      "angle_deg": 210,
+      "x_mm": -31.18,
+      "y_mm": -18.0,
+      "idme_cal": 16384
+    },
+    {
+      "channel": 2,
+      "label": "MK3",
+      "angle_deg": 270,
+      "x_mm": 0.0,
+      "y_mm": -36.0,
+      "idme_cal": 16384
+    },
+    {
+      "channel": 3,
+      "label": "MK4",
+      "angle_deg": 330,
+      "x_mm": 31.18,
+      "y_mm": -18.0,
+      "idme_cal": 16384
+    },
+    {
+      "channel": 4,
+      "label": "MK5",
+      "angle_deg": 30,
+      "x_mm": 31.18,
+      "y_mm": 18.0,
+      "idme_cal": 16384
+    },
+    {
+      "channel": 5,
+      "label": "MK6",
+      "angle_deg": 90,
+      "x_mm": 0.0,
+      "y_mm": 36.0,
+      "idme_cal": 16384
+    },
+    {
+      "channel": 6,
+      "label": "MK7",
+      "angle_deg": null,
+      "x_mm": 0.0,
+      "y_mm": 0.0,
+      "idme_cal": 16384
+    }
+  ],
+  "reference_channel": {
+    "channel": 7,
+    "purpose": "speaker/DAC loopback for acoustic echo cancellation",
+    "evidence": [
+      "exactly zero for all acoustic input, including taps",
+      "full level whenever the speaker plays",
+      "0.0 dB drift between captures while every acoustic channel drifts 0.5-3 dB",
+      "consistent with the 4th TLV320ADC3101 (i2c 0x1b) having one mic (MK7)",
+      "and its second input wired to the speaker feedback"
+    ]
+  },
+  "idme_calibration": {
+    "_comment": [
+      "Per-unit factory gains live in each Echo's idme (miccal.N, Q14, 16384 = unity).",
+      "The shipped weights are computed at unity; the device applies its own",
+      "calibration at runtime. The values below are therefore all unity, not any",
+      "one unit's calibration."
+    ]
+  },
+  "acoustics": {
+    "speed_of_sound_m_s": 343,
+    "mm_per_sample_at_16k": 21.4,
+    "max_delay_samples_opposite": 3.36,
+    "delay_samples_adjacent": 1.68,
+    "spatial_aliasing_hz": 4760,
+    "_note": [
+      "Delays are fractional - integer sample shifts will not steer correctly.",
+      "The array aliases above ~4.76 kHz; that is the price of the large",
+      "aperture (mics at 92% of board radius), which buys good low-frequency",
+      "directivity in exchange. Fine for speech and wake word.",
+      "",
+      "Steering: tau_i = -(x_i*cos(phi) + y_i*sin(phi)) / c, times 16000 for",
+      "samples at 16 kHz."
+    ]
+  }
+}

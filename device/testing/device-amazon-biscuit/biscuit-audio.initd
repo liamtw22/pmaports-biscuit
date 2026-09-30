@@ -1,0 +1,28 @@
+#!/sbin/openrc-run
+# Audio input: the mute button and 3.5 mm jack output switching.
+#
+# It is a service rather than a local.d script because it has to come back
+# after every reboot, not only after a flash.
+
+name="biscuit-audio"
+description="Mute button (KEY_MUTE -> mic array + LED) and jack output switching"
+
+command="/usr/bin/python3"
+command_args="/usr/bin/biscuit-audio.py"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/biscuit-audio.log"
+error_log="/var/log/biscuit-audio.log"
+
+depend() {
+	need localmount
+	after alsa modules
+}
+
+start_pre() {
+	if [ ! -r /usr/bin/biscuit-audio.py ]; then
+		eerror "biscuit-audio.py is not installed"
+		return 1
+	fi
+	return 0
+}

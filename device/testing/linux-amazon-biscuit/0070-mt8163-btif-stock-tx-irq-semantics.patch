@@ -1,0 +1,153 @@
+diff --git a/drivers/misc/mt8163-btif.c b/drivers/misc/mt8163-btif.c
+index d9f5f97..158a65e 100644
+--- a/drivers/misc/mt8163-btif.c
++++ b/drivers/misc/mt8163-btif.c
+@@ -92,6 +92,49 @@ struct mt8163_btif {
+ 	u8 trace_rx;
+ };
+ 
++/*
++ * MT8163's APDMA virtual-FIFO status registers are asymmetric.  The vendor
++ * driver clears TX-done by writing that bit low, while it acknowledges the RX
++ * done/threshold bits by writing them high.  Treating both sides as W1C leaves
++ * TX-done asserted forever and causes an interrupt storm.
++ */
++static void mt8163_btif_tx_irq_enable(struct mt8163_btif_dma *tx, bool enable)
++{
++	u32 value = readl(tx->base + DMA_INT_EN);
++
++	if (enable)
++		value |= DMA_TX_INT_DONE;
++	else
++		value &= ~DMA_TX_INT_DONE;
++	writel(value, tx->base + DMA_INT_EN);
++}
++
++static void mt8163_btif_tx_irq_ack(struct mt8163_btif_dma *tx)
++{
++	u32 value = readl(tx->base + DMA_INT_FLAG);
++
++	writel(value & ~DMA_TX_INT_DONE, tx->base + DMA_INT_FLAG);
++}
++
++static void mt8163_btif_rx_irq_enable(struct mt8163_btif_dma *rx, bool enable)
++{
++	u32 value = readl(rx->base + DMA_INT_EN);
++
++	if (enable)
++		value |= DMA_RX_INT_THRESHOLD | DMA_RX_INT_DONE;
++	else
++		value &= ~(DMA_RX_INT_THRESHOLD | DMA_RX_INT_DONE);
++	writel(value, rx->base + DMA_INT_EN);
++}
++
++static void mt8163_btif_rx_irq_ack(struct mt8163_btif_dma *rx)
++{
++	u32 value = readl(rx->base + DMA_INT_FLAG);
++
++	writel(value | DMA_RX_INT_THRESHOLD | DMA_RX_INT_DONE,
++	       rx->base + DMA_INT_FLAG);
++}
++
+ struct mt8163_btif *mt8163_btif_get(struct device *dev)
+ {
+ 	if (!dev)
+@@ -186,6 +229,9 @@ int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len)
+ 		goto out;
+ 	}
+ 
++	/* Keep the completion handler out of a concurrent flush while queuing. */
++	mt8163_btif_tx_irq_enable(tx, false);
++
+ 	wpt = readl(tx->base + DMA_VFF_WPT);
+ 	offset = wpt & DMA_PTR_MASK;
+ 	wrap = wpt & DMA_PTR_WRAP;
+@@ -209,8 +255,11 @@ int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len)
+ 	valid = readl(tx->base + DMA_VFF_VALID) & DMA_PTR_MASK;
+ 	if (valid && valid < BTIF_TX_FIFO_THRESHOLD)
+ 		writel(DMA_ENABLE, tx->base + DMA_FLUSH);
+-	if (!btif->trace_tx++)
++	mt8163_btif_tx_irq_enable(tx, true);
++	if (!btif->trace_tx) {
++		btif->trace_tx = 1;
+ 		mt8163_btif_dump_state(btif, "first-tx-queued");
++	}
+ 
+ 	/*
+ 	 * This API reports only success (0) or a negative errno.  In particular,
+@@ -253,7 +302,14 @@ static int mt8163_btif_dma_setup(struct mt8163_btif *btif,
+ 	writel(0, dma->base + DMA_VFF_RPT);
+ 	writel(dma == &btif->tx ? DMA_VFIFO_SIZE - 7 :
+ 		DMA_VFIFO_SIZE * 3 / 4, dma->base + DMA_VFF_THRE);
+-	writel(dma->int_enable, dma->base + DMA_INT_EN);
++	if (dma == &btif->tx) {
++		/* Stock leaves TX quiet until a command has been queued. */
++		mt8163_btif_tx_irq_ack(dma);
++		mt8163_btif_tx_irq_enable(dma, false);
++	} else {
++		mt8163_btif_rx_irq_ack(dma);
++		mt8163_btif_rx_irq_enable(dma, true);
++	}
+ 	writel(DMA_ENABLE, dma->base + DMA_EN);
+ 
+ 	value = readl(btif->base + BTIF_DMA_EN);
+@@ -277,10 +333,12 @@ static void mt8163_btif_rx_consume(struct mt8163_btif_dma *rx)
+ 		valid = readl(rx->base + DMA_VFF_VALID);
+ 		rpt = readl(rx->base + DMA_VFF_RPT);
+ 		wpt = readl(rx->base + DMA_VFF_WPT);
+-		if (loops == 1 && btif->trace_rx++ < 4)
++		if (loops == 1 && btif->trace_rx < 4) {
++			btif->trace_rx++;
+ 			dev_warn(btif->dev,
+ 				 "BTIF RX drain: valid=%#x wpt=%#x rpt=%#x\n",
+ 				 valid, wpt, rpt);
++		}
+ 		if (!valid && rpt == wpt)
+ 			break;
+ 
+@@ -322,24 +380,36 @@ static irqreturn_t mt8163_btif_dma_irq(int irq, void *data)
+ static irqreturn_t mt8163_btif_dma_irq(int irq, void *data)
+ {
+ 	struct mt8163_btif_dma *dma = data;
+-	u32 status;
++	u32 status, valid, left;
+ 
+ 	status = readl(dma->base + DMA_INT_FLAG);
+ 	if (!status)
+ 		return IRQ_NONE;
+ 
+-	if (dma->btif->trace_irq++ < 4)
++	if (dma->btif->trace_irq < 4) {
++		dma->btif->trace_irq++;
+ 		dev_warn(dma->btif->dev, "BTIF %s DMA IRQ %d: status=%#x\n",
+ 			 dma->name, irq, status);
++	}
+ 
+-	/* MT8163 APDMA DMA_INT_FLAG is write-one-to-clear. */
+-	writel(status, dma->base + DMA_INT_FLAG);
+-
+-	if (dma == &dma->btif->rx)
++	if (dma == &dma->btif->rx) {
++		mt8163_btif_rx_irq_enable(dma, false);
++		mt8163_btif_rx_irq_ack(dma);
+ 		mt8163_btif_rx_consume(dma);
+-	else if ((readl(dma->base + DMA_VFF_LEFT) & DMA_PTR_MASK) ==
+-		 DMA_VFIFO_SIZE)
+-		writel(0, dma->base + DMA_INT_EN);
++		mt8163_btif_rx_irq_enable(dma, true);
++		return IRQ_HANDLED;
++	}
++
++	valid = readl(dma->base + DMA_VFF_VALID) & DMA_PTR_MASK;
++	left = readl(dma->base + DMA_VFF_LEFT) & DMA_PTR_MASK;
++	if (valid && valid < BTIF_TX_FIFO_THRESHOLD) {
++		/* Continue a sub-threshold transfer, as the vendor handler does. */
++		writel(DMA_ENABLE, dma->base + DMA_FLUSH);
++	} else if (left == DMA_VFIFO_SIZE) {
++		/* TX done: clear its W0C flag before masking the source. */
++		mt8163_btif_tx_irq_ack(dma);
++		mt8163_btif_tx_irq_enable(dma, false);
++	}
+ 
+ 	return IRQ_HANDLED;
+ }

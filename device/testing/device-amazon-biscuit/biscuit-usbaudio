@@ -1,0 +1,349 @@
+#!/bin/sh
+# Bridge the processed call microphone and speaker through PipeWire.
+# 51-biscuit-usb-gadget.conf keeps host-clocked gadget nodes below the local
+# nodes in driver priority. USB must not clock the Echo when the host is idle.
+# Recreate our links when a gadget/local node is replaced; never retain links
+# to disappeared object IDs or move them onto an unrelated default device.
+set -u
+export XDG_RUNTIME_DIR=/run/pipewire
+export PULSE_RUNTIME_PATH=/run/pipewire/pulse
+
+LOG=/var/log/biscuit-usbaudio.log
+OWNER=biscuit-usbaudio-$$
+modules=""
+previous=""
+retry=0
+
+log() { echo "$(date '+%H:%M:%S') biscuit-usbaudio: $*" >> "$LOG"; }
+pactl_() { pactl "$@" 2>/dev/null; }
+
+owned_ids() {
+    pactl_ list short modules | awk -v owner="$OWNER-" \
+        '$2 == "module-loopback" && index($0, "media.name=" owner) { print $1 }'
+}
+
+stop_watcher() {
+    # Kill the subshell FIRST, then its `amixer events` child.
+    #
+    # Killing only the subshell orphans the amixer, whose `while read` pipeline
+    # goes on running under init; and a SIGKILL from the supervisor runs no
+    # trap at all. FOUR watchers had accumulated before this was noticed -
+    # three from earlier versions of this script, still applying the OLD
+    # mapping and racing the new one, which looked exactly like the new
+    # conversion being wrong. The log had been right the whole time.
+    if [ -n "${watcher:-}" ]; then
+        kill "$watcher" 2>/dev/null || true
+        watcher=
+    fi
+    if [ -n "${dwatcher:-}" ]; then
+        kill "$dwatcher" 2>/dev/null || true
+        dwatcher=
+    fi
+    rm -f "$PUSH_MARK" 2>/dev/null || true
+    kill_event_watchers
+}
+
+kill_event_watchers() {
+    # This script is the only thing that runs `amixer -c N events`, so any that
+    # exist are ours, including ones orphaned by an instance the supervisor
+    # killed outright. Matched through /proc rather than pkill so the card
+    # number is checked and nothing else named amixer is touched.
+    for _d in /proc/[0-9]*; do
+        _p=${_d#/proc/}
+        [ "$(cat "$_d/comm" 2>/dev/null)" = amixer ] || continue
+        # /proc/PID/cmdline separates arguments with NULs, so a pattern with
+        # a space in it - "-c 2" - can never match, and the sweep silently
+        # killed nothing while reporting nothing wrong. comm plus the events
+        # argument is specific enough: this script is the only thing on the
+        # device that runs amixer events.
+        grep -qa -- "events" "$_d/cmdline" 2>/dev/null || continue
+        kill "$_p" 2>/dev/null || true
+    done
+}
+
+cleanup() {
+    stop_watcher
+    # A restarted server can reuse module IDs. Check the unique ownership tag
+    # before unloading, rather than trusting a remembered ID alone.
+    for id in $(owned_ids); do
+        pactl_ unload-module "$id" || true
+    done
+    modules=""
+}
+trap 'exit 0' INT TERM
+trap cleanup EXIT
+applied=
+watcher=
+
+# ---------------------------------------------------------------------------
+# The host's volume and mute
+# ---------------------------------------------------------------------------
+#
+# The UAC2 gadget records what the host asks for in card 2's mixer and then
+# does nothing with it. f_uac2's controls are informational - proven by setting
+# both volumes to 0 and both switches to off mid-stream, which changed the
+# loudness not at all - and nothing else on the device read them, so moving the
+# Windows slider did nothing whatsoever.
+#
+# Routed to THE DEVICE VOLUME, exactly as biscuit-sendspin-volume routes
+# sendspin's. The first version of this attenuated the loopback's own sink
+# input instead, which is the very mistake that hook was written to prevent:
+# the volume ring did not light because biscuit-audio never heard about the
+# change, and there were two attenuations in series so the DSP's per-volume
+# loudness compensation was applied for the wrong level. biscuit-audio is meant
+# to be the ONLY thing that attenuates.
+#
+# The two scales are NOT the same and must be converted. Passing the value
+# through, as the first version did, put a 2% host slider at 60% on the device:
+#
+#   the control is dB       0..100 spans the -100..0 dB the gadget advertises
+#   the host is amplitude   Windows sends 20*log10(slider), 6 dB per halving
+#   the device is loudness  biscuit-dsp's taper is 10*log2(vol/100),
+#                           VOL_DB_PER_HALVING = 10, i.e. 10 dB per halving
+#
+# So match the ATTENUATION the host asked for, not the number it is expressed
+# in: 10*log2(v/100) = control-100, giving v = 100 * 2^((c-100)/10). A 2%
+# slider asks for -34 dB; pass-through delivered -3.9 dB.
+#
+# A muted host becomes volume 0, which lights the muted step, rather than the
+# device mute command - the host is setting a level here, not taking over the
+# Echo's own mute state.
+GADGET_CARD=${BISCUIT_UAC2_CARD:-2}
+HOST_VOL_NUMID=7        # PCM Capture Volume:  host -> device, the speaker path
+HOST_SW_NUMID=6         # PCM Capture Switch
+AUDIO_CTL=/run/biscuit-audio/control
+
+# The other direction: the Echo's own buttons moving the host's slider.
+#
+# This works because f_uac2 implements the optional AC interrupt IN endpoint -
+# afunc_notify() builds a uac2_interrupt_data_msg and queues it on int_ep - and
+# u_audio_volume_put() calls agdev->notify() whenever the gadget's ALSA control
+# changes from the device side. So writing the control here IS the notification;
+# no kernel change was needed. Verified against 7.0.0-rc6 source and then on the
+# wire: sweeping the control moved the Windows slider with biscuit-usbaudio
+# stopped, so nothing else could have done it.
+#
+# publish_volume() in biscuit-audio.py says this file is what anything following
+# the device volume should read, rather than guessing from the codec register,
+# whose policy ceiling makes the percentage the only portable figure. There is
+# no inotifywait on the device, so it is polled.
+DEVICE_VOL=/run/biscuit-audio/volume
+DEVICE_MUTE=/run/biscuit-audio/muted
+PUSH_MARK=/run/biscuit-usbaudio.pushed
+DEVICE_POLL=0.4
+
+ctl_value() {
+    amixer -c "$GADGET_CARD" cget numid="$1" 2>/dev/null |
+        sed -n 's/.*: values=\([0-9a-z]*\)/\1/p' | head -1
+}
+
+apply_host_volume() {
+    vol=$(ctl_value "$HOST_VOL_NUMID")
+    sw=$(ctl_value "$HOST_SW_NUMID")
+    case "$vol" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$vol" -le 100 ] 2>/dev/null || return 0
+    # Our own push arriving back through `amixer events`. The round trip is NOT
+    # identity and cannot be left to cancel itself out: the control is 1 dB per
+    # step over 0..100 while the device is 0..100 on a 10 dB-per-halving taper,
+    # so near the top several device levels share one control step and 99 would
+    # be dragged to 100. Compared before the mute collapse below, because that
+    # rewrites vol and would never match what was written.
+    if [ "$vol$sw" = "$(cat "$PUSH_MARK" 2>/dev/null)" ]; then
+        return 0
+    fi
+    [ "$sw" = off ] && vol=0
+    [ -p "$AUDIO_CTL" ] || return 0
+    [ "$vol$sw" != "$applied" ] || return 0
+    # dB the host asked for -> the device's own loudness scale.
+    dev=$(awk -v c="$vol" 'BEGIN {
+        v = (c <= 0) ? 0 : 100 * 2 ^ ((c - 100) / 10)
+        if (v > 100) v = 100
+        printf "%d", v + 0.5
+    }')
+    # Non-blocking, like the sendspin hook: opening a FIFO for writing blocks
+    # until a reader exists, and biscuit-audio being down must not wedge this.
+    ( timeout 2 sh -c "printf 'volume %s\\n' '$dev' > '$AUDIO_CTL'" ) >/dev/null 2>&1 &
+    log "host control $vol ($((vol - 100)) dB) switch $sw -> device volume $dev"
+    applied="$vol$sw"
+}
+
+unity_sink_input() {
+    # Undo the earlier design. A sink input left attenuated would sit in series
+    # with the device volume and quietly halve everything.
+    id=$(pactl_ list sink-inputs | awk -v tag="$OWNER-speaker" '
+        /^Sink Input #/ { id = substr($3, 2) }
+        index($0, "media.name = \"" tag "\"") { print id; exit }')
+    [ -n "$id" ] || return 0
+    pactl_ set-sink-input-volume "$id" 65536
+    pactl_ set-sink-input-mute "$id" 0
+}
+
+push_device_volume() {
+    # Device volume -> the host's control. The inverse of apply_host_volume's
+    # curve: v = 100 * 2^((c-100)/10) solved for c.
+    # `read` reports FAILURE at end-of-file without a trailing newline - which
+    # is exactly how biscuit-audio writes these, `"%d" % pct` and nothing else -
+    # while still assigning the variable. Testing its status silently skipped
+    # every push with the value sitting correctly in $dvol. Validate the value.
+    dvol=''
+    dmute=''
+    read -r dvol 2>/dev/null < "$DEVICE_VOL" || true
+    read -r dmute 2>/dev/null < "$DEVICE_MUTE" || true
+    case "$dvol" in ''|*[!0-9]*) return 0 ;; esac
+    case "$dmute" in ''|*[!0-9]*) dmute=0 ;; esac
+    [ "$dvol/$dmute" != "${pushed:-}" ] || return 0
+
+    c=$(awk -v v="$dvol" 'BEGIN {
+        if (v <= 0) { print 0; exit }
+        c = 100 + 10 * log(v / 100.0) / log(2)
+        if (c < 0) c = 0
+        if (c > 100) c = 100
+        printf "%d", c + 0.5
+    }')
+    sw=on
+    [ "$dmute" = 1 ] && sw=off
+
+    # Written BEFORE the cset, because the control-change event can reach the
+    # host watcher while amixer is still running.
+    printf '%s%s' "$c" "$sw" > "$PUSH_MARK" 2>/dev/null || true
+    amixer -c "$GADGET_CARD" cset numid="$HOST_VOL_NUMID" "$c" >/dev/null 2>&1
+    amixer -c "$GADGET_CARD" cset numid="$HOST_SW_NUMID" "$sw" >/dev/null 2>&1
+    log "device volume $dvol mute $dmute -> host control $c ($((c - 100)) dB) switch $sw"
+    pushed="$dvol/$dmute"
+}
+
+watch_device_volume() {
+    # Polled rather than event driven: biscuit-audio publishes a file and there
+    # is no inotifywait here. Only the sleep forks - the read is a builtin - and
+    # 0.4 s is under what reads as lag on a slider.
+    pushed=
+    while :; do
+        push_device_volume
+        sleep "$DEVICE_POLL"
+    done
+}
+
+watch_host_volume() {
+    # Event driven, not polled: a volume slider wants following in
+    # milliseconds, and polling amixer fast enough to feel right would fork
+    # several times a second forever. `amixer events` blocks until the card
+    # reports a change and exits if the card goes away, so the outer loop
+    # re-establishes it after a gadget recompose.
+    while :; do
+        apply_host_volume
+        # Filter in awk, NOT in the shell loop. This card emits about 190
+        # events a second - `Capture Rate` and `Playback Rate` fire on every
+        # period as the gadget clock drifts against the host's - and waking the
+        # shell for each one to run a `case` burned 71 SECONDS of CPU in under
+        # an hour, starving the Bluetooth cast bridge and visibly lagging the
+        # LED ring. Only two numids are interesting.
+        #
+        # awk rather than grep because the image has only BusyBox grep, which
+        # has no --line-buffered: the grep this used exited at once on every
+        # pass, so host volume only followed by the 2 s retry below. Without a
+        # flush a match would sit in the pipe buffer; fflush() sends it now.
+        amixer -c "$GADGET_CARD" events 2>/dev/null |
+            awk -v vol="numid=$HOST_VOL_NUMID," -v sw="numid=$HOST_SW_NUMID," \
+                'index($0, vol) || index($0, sw) { print; fflush() }' |
+            while read -r _line; do
+                apply_host_volume
+            done
+        sleep 2
+    done
+}
+
+link() {
+    # Pulse's loopback asks for one-third of this as its processing interval:
+    # 8 ms leaves refill margin within the codec's playback buffer.
+    id=$(pactl_ load-module module-loopback source="$1" sink="$2" \
+        latency_msec=24 source_dont_move=true sink_dont_move=true \
+        "sink_input_properties=media.name=$OWNER-$3")
+    case "$id" in
+        ''|*[!0-9]*) log "$3: unable to link $1 -> $2"; retry=1; return 1 ;;
+    esac
+    modules="${modules}${modules:+ }$id"
+    log "$3: $1 -> $2 (module $id)"
+}
+
+# USB audio is opt-in. Only a USB mode with a microphone or speaker, chosen on
+# the settings page's USB panel, links the UAC2 function into the gadget
+# (biscuit-usbmode); the default mode is network only. Without that link this
+# bridge stays dormant: no pactl or amixer polling and no volume watchers,
+# only a file test every 2 s. Polling for a gadget that was never composed
+# was the service's whole cost on a device that never uses USB audio.
+UAC2_LINK=${BISCUIT_UAC2_LINK:-/sys/kernel/config/usb_gadget/biscuit-rndis/configs/c.1/uac2.0}
+dormant=
+
+# Sweep before the first link. Anything left from a previous instance would
+# apply its own mapping alongside ours, and the exit path does not run when the
+# supervisor uses SIGKILL.
+kill_event_watchers
+
+while :; do
+    if [ ! -e "$UAC2_LINK" ]; then
+        if [ -z "$dormant" ]; then
+            cleanup
+            previous=""
+            dormant=1
+            log "USB audio is not in the USB mode; dormant until it is chosen"
+        fi
+        sleep 2
+        continue
+    fi
+    if [ -n "$dormant" ]; then
+        dormant=
+        log "USB audio is in the USB mode; bridging"
+    fi
+
+    if ! sinks=$(pactl_ list short sinks) || ! sources=$(pactl_ list short sources); then
+        if [ -n "$previous" ]; then log "audio server unavailable; waiting"; fi
+        cleanup
+        previous=""
+        sleep 2
+        continue
+    fi
+
+    speaker=$(printf '%s\n' "$sinks" | awk '$2 == "biscuit_speaker" {print $1, $2; exit}')
+    microphone=$(printf '%s\n' "$sources" | awk '$2 == "biscuit_mic" {print $1, $2; exit}')
+    usb_out=$(printf '%s\n' "$sources" | awk '$2 ~ /^alsa_input\.platform-musb-hdrc/ {print $1, $2; exit}')
+    usb_in=$(printf '%s\n' "$sinks" | awk '$2 ~ /^alsa_output\.platform-musb-hdrc/ {print $1, $2; exit}')
+    layout="$speaker|$microphone|$usb_out|$usb_in"
+    actual=$(owned_ids | sort -n | tr '\n' ' ')
+    expected=$(printf '%s\n' $modules | sed '/^$/d' | sort -n | tr '\n' ' ')
+
+    if [ "$layout" != "$previous" ] || [ "$actual" != "$expected" ] || [ "$retry" = 1 ]; then
+        cleanup
+        retry=0
+        if [ -n "$usb_out" ] && [ -n "$speaker" ]; then
+            link "${usb_out#* }" "${speaker#* }" speaker || true
+        fi
+        if [ -n "$usb_in" ] && [ -n "$microphone" ]; then
+            link "${microphone#* }" "${usb_in#* }" microphone || true
+        fi
+        previous="$layout"
+        # A new sink input starts at unity; keep it there (see above).
+        unity_sink_input
+        # After a relink the DEVICE's volume goes to the host, not the other
+        # way round. A freshly composed gadget, which is what every switch
+        # into USB audio on the settings page's USB panel makes, starts its
+        # volume control at the maximum (100, 0 dB). Applying that here
+        # jumped the Echo to full volume, and then pushed 100 back to the
+        # host. The device owns the volume, so the host is told the device's
+        # level; a later move of the host's slider still reaches the device
+        # through watch_host_volume. The push is marked, so the watcher's
+        # first apply recognises it rather than undoing it.
+        applied=
+        pushed=
+        push_device_volume
+        if [ -z "${watcher:-}" ] || ! kill -0 "$watcher" 2>/dev/null; then
+            watch_host_volume &
+            watcher=$!
+        fi
+        if [ -z "${dwatcher:-}" ] || ! kill -0 "$dwatcher" 2>/dev/null; then
+            watch_device_volume &
+            dwatcher=$!
+        fi
+        [ -n "$modules" ] || log "waiting for USB gadget and local audio nodes"
+    fi
+    sleep 2
+done

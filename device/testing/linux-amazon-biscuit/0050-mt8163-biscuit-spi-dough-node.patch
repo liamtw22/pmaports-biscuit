@@ -1,0 +1,338 @@
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -207,6 +207,9 @@
+ 
+ 		/* EVT: GPIO122 enables the amplifier; GPIO124 selects speaker DAC. */
+ 		speaker-amp-gpios = <&pio 122 0>;
++		mic-codec = <&mic_adc_a>, <&mic_adc_b>,
++					      <&mic_adc_c>, <&mic_adc_d>;
++		audio-fpga = <&dough_fpga>;
+ 		dacmux-gpios = <&pio 124 0>;
+ 		status = "okay";
+ 	};
+@@ -296,3 +299,324 @@
+ 	regulator-always-on;
+ 	regulator-boot-on;
+ };
++
++&pio {
++	biscuit_spi_pins: biscuit-spi-pins {
++		pins {
++			pinmux = <MT8163_PIN_54_SPI_CK__FUNC_SPI_CLK>,
++				 <MT8163_PIN_55_SPI_MI__FUNC_SPI_MI>,
++				 <MT8163_PIN_56_SPI_MO__FUNC_SPI_MO>;
++		};
++	};
++};
++
++&spi {
++	pinctrl-names = "default";
++	pinctrl-0 = <&biscuit_spi_pins>;
++
++	/*
++	 * A GPIO chip select is required: the controller drives its native
++	 * chip select from hardware for the duration of each transfer, and
++	 * the FPGA needs it held across the reset edge and the bitstream.
++	 */
++	cs-gpios = <&pio 53 GPIO_ACTIVE_LOW>;
++	num-cs = <1>;
++	status = "okay";
++
++	dough_fpga: audio-fpga@0 {
++		compatible = "amzn,dough";
++		reg = <0>;
++		spi-max-frequency = <50000000>;
++		spi-cpol;
++		spi-cpha;
++
++		/*
++		 * CRESET_B. The configuration engine only enters slave SPI
++		 * mode if this is released while the chip select is asserted.
++		 */
++		reset-gpios = <&pio 43 GPIO_ACTIVE_LOW>;
++
++		/*
++		 * The I2S data, frame and bit clock lines. They are only
++		 * claimed while the bitstream is being sent: configuration
++		 * fails unless they are parked in their GPIO function first.
++		 */
++		i2s-gpios = <&pio 72 0>, <&pio 73 0>, <&pio 74 0>;
++	};
++};
++
++/*
++ * The microphone subsystem: four TLV320 ADCs sit on i2c0 together with the
++ * LED ring and the ambient light sensors. Their supply is gated by a GPIO
++ * that the stock firmware simply parks high at boot.
++ */
++&pio {
++	biscuit_i2c0_pins: biscuit-i2c0-pins {
++		pins {
++			pinmux = <MT8163_PIN_75_SDA0__FUNC_SDA0_0>,
++				 <MT8163_PIN_76_SCL0__FUNC_SCL0_0>;
++			bias-disable;
++		};
++	};
++};
++
++&i2c0 {
++	clock-frequency = <100000>;
++	pinctrl-names = "default";
++	pinctrl-0 = <&biscuit_i2c0_pins>;
++	status = "okay";
++
++	/*
++	 * Four stereo ADCs, one per microphone pair. They share the enable
++	 * line modelled as biscuit_mic_enable, so none of them owns a reset
++	 * GPIO of its own. The FPGA aggregates their I2S output.
++	 */
++	mic_adc_a: audio-codec@18 {
++		compatible = "ti,tlv320adc3101";
++		reg = <0x18>;
++		clocks = <&clk26m>;
++		/* The vendor biases the electret microphones at 2.5 V; 2 is
++		 * ADC3XXX_MICBIAS_2_5V. Without this the ADCs read pure zero.
++		 */
++		ti,micbias1-vg = <2>;
++		ti,micbias2-vg = <2>;
++		sound-name-prefix = "Mic A";
++	};
++
++	mic_adc_b: audio-codec@19 {
++		compatible = "ti,tlv320adc3101";
++		reg = <0x19>;
++		clocks = <&clk26m>;
++		/* The vendor biases the electret microphones at 2.5 V; 2 is
++		 * ADC3XXX_MICBIAS_2_5V. Without this the ADCs read pure zero.
++		 */
++		ti,micbias1-vg = <2>;
++		ti,micbias2-vg = <2>;
++		sound-name-prefix = "Mic B";
++	};
++
++	mic_adc_c: audio-codec@1a {
++		compatible = "ti,tlv320adc3101";
++		reg = <0x1a>;
++		clocks = <&clk26m>;
++		/* The vendor biases the electret microphones at 2.5 V; 2 is
++		 * ADC3XXX_MICBIAS_2_5V. Without this the ADCs read pure zero.
++		 */
++		ti,micbias1-vg = <2>;
++		ti,micbias2-vg = <2>;
++		sound-name-prefix = "Mic C";
++	};
++
++	mic_adc_d: audio-codec@1b {
++		compatible = "ti,tlv320adc3101";
++		reg = <0x1b>;
++		clocks = <&clk26m>;
++		/* The vendor biases the electret microphones at 2.5 V; 2 is
++		 * ADC3XXX_MICBIAS_2_5V. Without this the ADCs read pure zero.
++		 */
++		ti,micbias1-vg = <2>;
++		ti,micbias2-vg = <2>;
++		sound-name-prefix = "Mic D";
++	};
++
++	/*
++	 * The ambient light sensor sits under the action button. The vendor
++	 * calls it a tsl2584tsv, which the tsl2583 driver covers.
++	 */
++	light_sensor: light-sensor@29 {
++		compatible = "amstaos,tsl2583";
++		reg = <0x29>;
++	};
++
++	/*
++	 * The twelve segment light ring. It stays off the bus until its
++	 * enable line is raised, which is why it does not answer a scan
++	 * on a freshly booted board.
++	 */
++
++	/*
++	 * The light ring: one ISSI IS31FL3236, thirty six PWM outputs driving
++	 * twelve RGB segments. The vendor driver applies a three channel offset
++	 * before writing, which the labels below fold in instead: segment 0 is
++	 * outputs 4 to 6, and segment 11 wraps back to outputs 1 to 3.
++	 */
++	led_ring: led-controller@3f {
++		compatible = "issi,is31fl3236a";
++		reg = <0x3f>;
++		#address-cells = <1>;
++		#size-cells = <0>;
++
++		led@1 {
++			reg = <1>;
++			label = "biscuit:ring:segment-11:red";
++		};
++		led@2 {
++			reg = <2>;
++			label = "biscuit:ring:segment-11:green";
++		};
++		led@3 {
++			reg = <3>;
++			label = "biscuit:ring:segment-11:blue";
++		};
++		led@4 {
++			reg = <4>;
++			label = "biscuit:ring:segment-00:red";
++		};
++		led@5 {
++			reg = <5>;
++			label = "biscuit:ring:segment-00:green";
++		};
++		led@6 {
++			reg = <6>;
++			label = "biscuit:ring:segment-00:blue";
++		};
++		led@7 {
++			reg = <7>;
++			label = "biscuit:ring:segment-01:red";
++		};
++		led@8 {
++			reg = <8>;
++			label = "biscuit:ring:segment-01:green";
++		};
++		led@9 {
++			reg = <9>;
++			label = "biscuit:ring:segment-01:blue";
++		};
++		led@10 {
++			reg = <10>;
++			label = "biscuit:ring:segment-02:red";
++		};
++		led@11 {
++			reg = <11>;
++			label = "biscuit:ring:segment-02:green";
++		};
++		led@12 {
++			reg = <12>;
++			label = "biscuit:ring:segment-02:blue";
++		};
++		led@13 {
++			reg = <13>;
++			label = "biscuit:ring:segment-03:red";
++		};
++		led@14 {
++			reg = <14>;
++			label = "biscuit:ring:segment-03:green";
++		};
++		led@15 {
++			reg = <15>;
++			label = "biscuit:ring:segment-03:blue";
++		};
++		led@16 {
++			reg = <16>;
++			label = "biscuit:ring:segment-04:red";
++		};
++		led@17 {
++			reg = <17>;
++			label = "biscuit:ring:segment-04:green";
++		};
++		led@18 {
++			reg = <18>;
++			label = "biscuit:ring:segment-04:blue";
++		};
++		led@19 {
++			reg = <19>;
++			label = "biscuit:ring:segment-05:red";
++		};
++		led@20 {
++			reg = <20>;
++			label = "biscuit:ring:segment-05:green";
++		};
++		led@21 {
++			reg = <21>;
++			label = "biscuit:ring:segment-05:blue";
++		};
++		led@22 {
++			reg = <22>;
++			label = "biscuit:ring:segment-06:red";
++		};
++		led@23 {
++			reg = <23>;
++			label = "biscuit:ring:segment-06:green";
++		};
++		led@24 {
++			reg = <24>;
++			label = "biscuit:ring:segment-06:blue";
++		};
++		led@25 {
++			reg = <25>;
++			label = "biscuit:ring:segment-07:red";
++		};
++		led@26 {
++			reg = <26>;
++			label = "biscuit:ring:segment-07:green";
++		};
++		led@27 {
++			reg = <27>;
++			label = "biscuit:ring:segment-07:blue";
++		};
++		led@28 {
++			reg = <28>;
++			label = "biscuit:ring:segment-08:red";
++		};
++		led@29 {
++			reg = <29>;
++			label = "biscuit:ring:segment-08:green";
++		};
++		led@30 {
++			reg = <30>;
++			label = "biscuit:ring:segment-08:blue";
++		};
++		led@31 {
++			reg = <31>;
++			label = "biscuit:ring:segment-09:red";
++		};
++		led@32 {
++			reg = <32>;
++			label = "biscuit:ring:segment-09:green";
++		};
++		led@33 {
++			reg = <33>;
++			label = "biscuit:ring:segment-09:blue";
++		};
++		led@34 {
++			reg = <34>;
++			label = "biscuit:ring:segment-10:red";
++		};
++		led@35 {
++			reg = <35>;
++			label = "biscuit:ring:segment-10:green";
++		};
++		led@36 {
++			reg = <36>;
++			label = "biscuit:ring:segment-10:blue";
++		};
++	};
++};
++
++&{/} {
++
++	biscuit_mic_enable: regulator-mic-enable {
++		compatible = "regulator-fixed";
++		regulator-name = "aic3101-enable";
++		regulator-min-microvolt = <1800000>;
++		regulator-max-microvolt = <1800000>;
++		gpio = <&pio 35 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		regulator-always-on;
++		regulator-boot-on;
++	};
++};
++
++
++/*
++ * Stock holds these two rails on with a consumer apiece, and they are the only
++ * ones this port leaves down. The light ring is the suspected load: its
++ * controllers are visibly driven by the boot loader yet never answer on i2c.
++ */
++&mt6323_vcn18_reg {
++	regulator-always-on;
++};
++
++&mt6323_vcn28_reg {
++	regulator-always-on;
++};
+

@@ -1,0 +1,158 @@
+--- a/sound/soc/codecs/tlv320adc3xxx.c
++++ b/sound/soc/codecs/tlv320adc3xxx.c
+@@ -62,6 +62,12 @@
+ #define ADC3XXX_PLL_AUTO	0 /* Use first available mode */
+ #define ADC3XXX_PLL_ENABLE	1 /* Use PLL for clock generation */
+ #define ADC3XXX_PLL_BYPASS	2 /* Don't use PLL for clock generation */
++/*
++ * Use the PLL, sourced from the bit clock rather than from MCLK. The
++ * frequency passed to set_sysclk is then the bit clock rate. This suits
++ * boards where the codec is a clock consumer with no MCLK of its own.
++ */
++#define ADC3XXX_PLL_BCLK	3
+ 
+ /* Register definitions. */
+ 
+@@ -257,6 +263,8 @@
+ 			 (ADC3XXX_CODEC_CLKIN_PLL_CLK << ADC3XXX_CODEC_CLKIN_SHIFT))
+ #define ADC3XXX_NO_PLL	((ADC3XXX_PLL_CLKIN_ZERO << ADC3XXX_PLL_CLKIN_SHIFT) | \
+ 			 (ADC3XXX_CODEC_CLKIN_MCLK << ADC3XXX_CODEC_CLKIN_SHIFT))
++#define ADC3XXX_USE_PLL_BCLK	((ADC3XXX_PLL_CLKIN_BCLK << ADC3XXX_PLL_CLKIN_SHIFT) | \
++				 (ADC3XXX_CODEC_CLKIN_PLL_CLK << ADC3XXX_CODEC_CLKIN_SHIFT))
+ 
+ /*  Analog PGA control bits */
+ #define ADC3XXX_LPGA_MUTE		0x80
+@@ -320,6 +328,7 @@
+ 	struct regmap *regmap;
+ 	struct gpio_desc *rst_pin;
+ 	unsigned int pll_mode;
++	unsigned int pll_clkin;
+ 	unsigned int sysclk;
+ 	unsigned int gpio_cfg[ADC3XXX_GPIO_PINS]; /* value+1 (0 => not set)  */
+ 	unsigned int micbias_gpo[ADC3XXX_MICBIAS_PINS]; /* 1 => pin is GPO */
+@@ -511,6 +520,12 @@
+ 	{ 12000000, 88200, 1, 1, 7, 5264, 4, 4, 64 },
+ 	/* 96k rate */
+ 	{ 12000000, 96000, 1, 1, 8, 1920, 4, 4, 64 },
++	/*
++	 * Bit clock sources. Eight 24 bit slots at 16 kHz give 3.072 MHz,
++	 * which is what a four device array on a shared bus produces.
++	 */
++	{ 3072000, 16000, 1, 1, 10, 2400, 1, 3, 64 },
++	{ 6144000, 16000, 5, 1, 48, 0000, 1, 3, 128 },
+ };
+ 
+ static int adc3xxx_get_divs(struct device *dev, int mclk, int rate, int pll_mode)
+@@ -1158,8 +1173,17 @@
+ 	return 0;
+ }
+ 
+-static int adc3xxx_parse_pll_mode(uint32_t val, unsigned int *pll_mode)
++static int adc3xxx_parse_pll_mode(uint32_t val, unsigned int *pll_mode,
++				  unsigned int *pll_clkin)
+ {
++	*pll_clkin = ADC3XXX_PLL_CLKIN_MCLK;
++
++	if (val == ADC3XXX_PLL_BCLK) {
++		*pll_clkin = ADC3XXX_PLL_CLKIN_BCLK;
++		*pll_mode = ADC3XXX_PLL_ENABLE;
++		return 0;
++	}
++
+ 	if (val != ADC3XXX_PLL_ENABLE && val != ADC3XXX_PLL_BYPASS &&
+ 	    val != ADC3XXX_PLL_AUTO)
+ 		return -EINVAL;
+@@ -1230,7 +1254,9 @@
+ 				      ADC3XXX_WLENGTH_MASK, iface_len);
+ 	if (adc3xxx_divs[i].pll_p) { /* If PLL used for this mode */
+ 		adc3xxx_setup_pll(component, i);
+-		snd_soc_component_write(component, ADC3XXX_CLKGEN_MUX, ADC3XXX_USE_PLL);
++		snd_soc_component_write(component, ADC3XXX_CLKGEN_MUX,
++					adc3xxx->pll_clkin == ADC3XXX_PLL_CLKIN_BCLK ?
++					ADC3XXX_USE_PLL_BCLK : ADC3XXX_USE_PLL);
+ 		if (!adc3xxx->use_pll) {
+ 			snd_soc_dapm_add_routes(dapm, adc3xxx_pll_intercon,
+ 						ARRAY_SIZE(adc3xxx_pll_intercon));
+@@ -1254,11 +1280,17 @@
+ 	/* AOSR */
+ 	snd_soc_component_update_bits(component, ADC3XXX_ADC_AOSR,
+ 				      ADC3XXX_AOSR_MASK, adc3xxx_divs[i].aosr);
+-	/* BDIV N Value */
+-	/* BCLK is (by default) set up to be derived from ADC_CLK */
+-	bdiv = (adc3xxx_divs[i].aosr * adc3xxx_divs[i].madc) / (2 * width);
+-	snd_soc_component_update_bits(component, ADC3XXX_BCLK_N_DIV,
+-				      ADC3XXX_BDIV_MASK, bdiv);
++	/*
++	 * BDIV N Value. Only meaningful when this device drives the bit
++	 * clock; as a consumer it takes the clock as it arrives, and may
++	 * be deriving its own clocks from it.
++	 */
++	if (adc3xxx->master) {
++		bdiv = (adc3xxx_divs[i].aosr * adc3xxx_divs[i].madc) /
++			(2 * width);
++		snd_soc_component_update_bits(component, ADC3XXX_BCLK_N_DIV,
++					      ADC3XXX_BDIV_MASK, bdiv);
++	}
+ 
+ 	return 0;
+ }
+@@ -1286,7 +1318,8 @@
+ 	struct adc3xxx *adc3xxx = snd_soc_component_get_drvdata(component);
+ 	int ret;
+ 
+-	ret = adc3xxx_parse_pll_mode(clk_id, &adc3xxx->pll_mode);
++	ret = adc3xxx_parse_pll_mode(clk_id, &adc3xxx->pll_mode,
++				    &adc3xxx->pll_clkin);
+ 	if (ret < 0)
+ 		return ret;
+ 
+@@ -1408,20 +1441,27 @@
+ 		return -ENOMEM;
+ 	adc3xxx->dev = dev;
+ 
+-	adc3xxx->rst_pin = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
++	/*
++	 * The reset line is optional: a board may tie it to a supply rail,
++	 * or share a single line between several of these devices, in which
++	 * case no one instance can own it.
++	 */
++	adc3xxx->rst_pin = devm_gpiod_get_optional(dev, "reset", GPIOD_OUT_LOW);
+ 	if (IS_ERR(adc3xxx->rst_pin)) {
+ 		return dev_err_probe(dev, PTR_ERR(adc3xxx->rst_pin),
+ 				     "Failed to request rst_pin\n");
+ 	}
+ 
+-	adc3xxx->mclk = devm_clk_get(dev, NULL);
++	/*
++	 * Optional: a board may clock the PLL from the bit clock instead,
++	 * in which case there is no MCLK to acquire.
++	 */
++	adc3xxx->mclk = devm_clk_get_optional(dev, NULL);
+ 	if (IS_ERR(adc3xxx->mclk)) {
+ 		/*
+-		 * The chip itself supports running off the BCLK either
+-		 * directly or via the PLL, but the driver does not (yet), so
+-		 * having a specified mclk is required. Otherwise, we could
+-		 * use the lack of a clocks property to indicate when BCLK is
+-		 * intended as the clock source.
++		 * Running the PLL from the bit clock is selected with the
++		 * ADC3XXX_PLL_BCLK clock id, so an absent clocks property is
++		 * not an error; only a real lookup failure is.
+ 		 */
+ 		return dev_err_probe(dev, PTR_ERR(adc3xxx->mclk),
+ 				     "Failed to acquire MCLK\n");
+@@ -1468,9 +1508,11 @@
+ 	adc3xxx->type = (uintptr_t)i2c_get_match_data(i2c);
+ 
+ 	/* Reset codec chip */
+-	gpiod_set_value_cansleep(adc3xxx->rst_pin, 1);
+-	usleep_range(2000, 100000); /* Requirement: > 10 ns (datasheet p13) */
+-	gpiod_set_value_cansleep(adc3xxx->rst_pin, 0);
++	if (adc3xxx->rst_pin) {
++		gpiod_set_value_cansleep(adc3xxx->rst_pin, 1);
++		usleep_range(2000, 100000); /* Requirement: > 10 ns (datasheet p13) */
++		gpiod_set_value_cansleep(adc3xxx->rst_pin, 0);
++	}
+ 
+ 	/* Potentially set up pins used as GPIOs */
+ 	adc3xxx_init_gpio(adc3xxx);

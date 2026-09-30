@@ -1,0 +1,111 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -168,6 +168,12 @@
+ };
+ static const u8 wmt_antenna_select_evt[] =
+ 	{ 0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01 };
++/* Stock chip-bootstrap step 15, init_table_5_1 "configure FM comm". */
++static const u8 wmt_fm_strap_cmd[] =
++	{ 0x01, 0x05, 0x02, 0x00, 0x02, 0x02 };
++static const u8 wmt_fm_strap_evt[] =
++	{ 0x02, 0x05, 0x02, 0x00, 0x00, 0x02 };
++
+ static const u8 wmt_bt_on_cmd[] = { 0x01, 0x06, 0x02, 0x00, 0x00, 0x01 };
+ static const u8 wmt_bt_on_evt[] = { 0x02, 0x06, 0x01, 0x00, 0x00 };
+ 
+@@ -1045,6 +1051,22 @@
+  * 1: probe registers only; bring-up runs when bringup_now is written,
+  *    which wifi.start does immediately before loading the WLAN module.
+  */
++/*
++ * 1: withhold the Bluetooth function-on and HCI registration, leaving
++ * everything else - CONSYS, patches, DLM, calibration, Wi-Fi function-on -
++ * untouched. Bluetooth stays down for the life of the boot.
++ */
++static bool defer_bt;
++module_param(defer_bt, bool, 0444);
++MODULE_PARM_DESC(defer_bt,
++		 "1: do not enable Bluetooth or register HCI during bring-up");
++
++/* 1: send stock's FM strap during bootstrap. Off by default. */
++static bool fm_strap;
++module_param(fm_strap, bool, 0444);
++MODULE_PARM_DESC(fm_strap,
++		 "1: send stock's FM strap command (01 05 02 00 02 02)");
++
+ static bool bringup_deferred;
+ module_param(bringup_deferred, bool, 0444);
+ MODULE_PARM_DESC(bringup_deferred,
+@@ -1329,16 +1351,45 @@
+ 	else
+ 		dev_warn(stp->dev, "WMT antenna selection applied\n");
+ 
++	/*
++	 * Stock sets the FM strap unconditionally as bootstrap step 15; we never
++	 * have. It configures FM transport rather than Wi-Fi, so it is parity
++	 * housekeeping, and it is non-fatal for the same reason antenna
++	 * selection is.
++	 */
++	if (fm_strap) {
++		ret = mt8163_stp_wmt_xfer(stp, wmt_fm_strap_cmd,
++					  sizeof(wmt_fm_strap_cmd),
++					  wmt_fm_strap_evt,
++					  sizeof(wmt_fm_strap_evt));
++		if (ret)
++			dev_warn(stp->dev,
++				 "WMT FM strap rejected (%d); continuing bootstrap\n",
++				 ret);
++		else
++			dev_warn(stp->dev, "WMT FM strap applied\n");
++	}
++
+ 	ret = mt8163_consys_bt_paldo_set(stp->consys_dev, true);
+ 	if (ret)
+ 		return dev_err_probe(stp->dev, ret, "failed to enable BT PALDO\n");
+ 	stp->bt_paldo_enabled = true;
+ 
+-	ret = mt8163_stp_wmt_xfer(stp, wmt_bt_on_cmd,
+-				  sizeof(wmt_bt_on_cmd), wmt_bt_on_evt,
+-				  sizeof(wmt_bt_on_evt));
+-	if (ret)
+-		return dev_err_probe(stp->dev, ret, "WMT Bluetooth enable failed\n");
++	/*
++	 * BT-withhold A/B. The PALDO above stays on: it is a shared VCN33 supply
++	 * that Wi-Fi needs too, so dropping it would change more than one thing.
++	 */
++	if (defer_bt) {
++		dev_warn(stp->dev,
++			 "BISCUIT-BTHOLD withholding BT function-on\n");
++	} else {
++		ret = mt8163_stp_wmt_xfer(stp, wmt_bt_on_cmd,
++					  sizeof(wmt_bt_on_cmd), wmt_bt_on_evt,
++					  sizeof(wmt_bt_on_evt));
++		if (ret)
++			return dev_err_probe(stp->dev, ret,
++					     "WMT Bluetooth enable failed\n");
++	}
+ 
+ 	/*
+ 	 * Wi-Fi stage 1, diagnostic only.
+@@ -1798,10 +1849,16 @@
+ 		msleep(MT8163_STP_BRINGUP_BACKOFF_MS * attempt);
+ 	}
+ 
+-	ret = mt8163_stp_hci_register(stp);
+-	if (ret) {
+-		mt8163_stp_bringup_unwind(stp);
+-		goto out;
++	if (defer_bt) {
++		dev_warn(stp->dev,
++			 "BISCUIT-BTHOLD skipping HCI registration (Bluetooth stays down)\n");
++		ret = 0;
++	} else {
++		ret = mt8163_stp_hci_register(stp);
++		if (ret) {
++			mt8163_stp_bringup_unwind(stp);
++			goto out;
++		}
+ 	}
+ 
+ 	dev_warn(stp->dev,

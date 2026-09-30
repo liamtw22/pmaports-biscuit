@@ -1,0 +1,12 @@
+--- a/drivers/regulator/mt6323-regulator.c
++++ b/drivers/regulator/mt6323-regulator.c
+@@ -408,9 +408,8 @@
+ 
+ static struct platform_driver mt6323_regulator_driver = {
+ 	.driver = {
+ 		.name = "mt6323-regulator",
+-		.probe_type = PROBE_PREFER_ASYNCHRONOUS,
+ 	},
+ 	.probe = mt6323_regulator_probe,
+ 	.id_table = mt6323_platform_ids,
+ };

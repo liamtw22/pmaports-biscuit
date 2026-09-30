@@ -1,0 +1,21 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -1268,6 +1268,17 @@
+ 				       sizeof(wmt_rf_calibration_evt));
+ 	if (ret)
+ 		return dev_err_probe(stp->dev, ret, "WMT RF calibration failed\n");
++
++	/*
++	 * Log the raw event. Stock ignores its payload and so do we (the mask
++	 * above only enforces the header and length), but the returned values
++	 * have never been looked at - and the firmware aborts at a fixed
++	 * address on some boots. Record it per boot so clean and failing boots
++	 * can be correlated. Acceptance logic is deliberately unchanged.
++	 */
++	dev_warn(stp->dev, "WMT RF calibration event: %*ph (len %zu)\n",
++		 (int)min_t(size_t, stp->wmt_rx_len, sizeof(stp->wmt_rx)),
++		 stp->wmt_rx, stp->wmt_rx_len);
+ 	dev_warn(stp->dev, "WMT RF calibration completed\n");
+ 
+ 	mt8163_consys_bt_paldo_set(stp->consys_dev, false);

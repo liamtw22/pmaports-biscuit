@@ -1,0 +1,1537 @@
+# Reference: <https://postmarketos.org/devicepkg>
+maintainer="liamtw22 <31185529+liamtw22@users.noreply.github.com>"
+pkgname=device-amazon-biscuit
+pkgdesc="Amazon Echo Dot (2nd gen)"
+pkgver=6
+pkgrel=295
+# The public release this build is: the name on the release page, the install
+# zip and the settings page. pkgrel is the build and keeps counting, because
+# apk orders upgrades by it and a release name like 1.0 would sort below the
+# 6-r2xx builds already installed. Each public build gets a new name - v1.0.1
+# for fixes, v1.1 for features - and the installer refuses a name already
+# given to another build (installer/zip/releases.json).
+_release="v1.0"
+url="https://github.com/liamtw22/pmaports-biscuit"
+# Core is our own code (MIT) plus two vendored pieces that keep their own
+# licences: TweetNaCl-js (public domain, Unlicense) for the setup and settings
+# pages, and aioesphomeapi's two generated protobuf modules (MIT) for the
+# Bluetooth proxy. The -voice and -sendspin bundles set their own license=
+# below. See NOTICE and PROVENANCE.md at the repository root.
+license="MIT AND Unlicense"
+arch="aarch64"
+options="!check !archcheck !tracedeps"
+# alsa-utils supplies amixer, aplay, alsaucm and arecord. biscuit-audio.py
+# drives the mixer through amixer, so without it the audio service crashes at
+# start and there is no way to play anything.
+#
+# It was missing from this list for a long time and nobody noticed, because the
+# rootfs build chroot had it installed by hand from an earlier debugging
+# session and every image inherited it by accident. Rebuilding that chroot from
+# scratch is what exposed it - worth doing periodically, since an image is only
+# as reproducible as its declared depends.
+#
+# py3-jeepney (105 KiB, pure Python) is the D-Bus client the ACTIVE half of the
+# proxy uses to drive BlueZ GATT - connect, read, write, subscribe. Only the
+# active half needs it, and that is off by default, but it is a dependency
+# rather than an optional import because a proxy that cannot connect when the
+# switch is flipped is worse than 105 KiB.
+#
+# py3-protobuf (1.3 MB) is the ONLY dependency biscuit-btproxy needs to speak
+# the ESPHome API to Home Assistant. Advertisements come off the HCI monitor
+# socket using nothing but the standard library, and the two generated _pb2
+# modules are vendored in btproxy/ rather than pulling in aioesphomeapi, which
+# would drag in noiseprotocol, cryptography and an async client the proxy does
+# not use. That is what keeps the proxy in this package instead of behind the
+# ~100 MB voice bundle - it is useful on a device that never runs the assistant.
+#
+# util-linux-misc supplies chrt, which biscuit-dsp.initd and
+# biscuit-mic-stream.sh use to put the playback and capture paths on
+# SCHED_FIFO. Measured: without it the beamformer sits on the run queue
+# 19.5% of the time under load and arecord drops periods, while the DSP at
+# FIFO 50 is untouched. It reaches every image today only because
+# postmarketos-initramfs happens to require it - a transitive guarantee
+# through a package that has nothing to do with audio. If that ever changes
+# the audio path silently degrades rather than failing, which is precisely
+# how alsa-utils went unnoticed above.
+#
+# NOTE: everything between the quotes below is a shell string, so a "#" line in
+# there is not a comment - it becomes a dependency literally named "#" and the
+# build fails with "dependency not found: #". Comments go here instead.
+# NOTE: no comments inside depends= - abuild takes a '#' line as a literal
+# package name and the build dies with "dependency not found: #".
+#
+# pipewire-alsa: provides libasound_module_pcm_pipewire.so, which is what makes
+# the ALSA device `default` resolve to PipeWire. WITHOUT IT THE DEVICE HAS NO
+# WORKING AUDIO OUTPUT AT ALL - every earcon fails with "cannot open audio
+# device default (No such device or address)" - and it fails SILENTLY, because
+# sndfile-play exits 0 regardless. It was only ever installed by hand as part
+# of the voice-bundle recipe, so every core-only device shipped mute.
+#
+# wireless-regdb: without /lib/firmware/regulatory.db the kernel falls back to
+# its built-in world domain, which marks every 5 GHz rule PASSIVE-SCAN and
+# ignores `iw reg set` entirely - the region a user picks during setup would do
+# nothing at all. See 51-biscuit-regdb.files for why the package alone is not
+# enough and the database has to reach the initramfs.
+#
+# py3-pynacl: the setup portal boxes the Wi-Fi passphrase and the new account
+# password in the browser before they cross the open setup AP. PyNaCl is the
+# server half; TweetNaCl (vendored, nacl-fast.min.js) is the browser half. Two
+# audited implementations of one primitive, rather than anything hand-rolled.
+#
+# openssh-keygen: biscuit-persist calls `ssh-keygen -A` to create the host
+# identity before sshd would, so the very first boot's keys are the ones
+# that reach the persistent store. Declared rather than inherited - the
+# -voice subpackage relied on exactly this kind of ambient dependency for
+# nine revisions and crash-looped on a clean install.
+#
+# cmd:sudo, NOT sudo: we ship /etc/sudoers.d/10-biscuit-wheel, which is the
+# whole of remote administration on this device, and an inert sudoers file is
+# invisible - there is no error, sudo simply is not there. But this image
+# installs sudo-rs, not sudo, and both own /usr/bin/sudo; depending on the
+# real package would drag in a conflicting second implementation. The virtual
+# cmd:sudo is satisfied by whichever one is present.
+#
+# pipewire-tools: pw-record, which biscuit-btcast.sh pipes into aplay. Without
+# it the Bluetooth cast bridge cannot start at all, and says only "bridge did
+# not start" because both halves of that pipeline discard stderr. It was never
+# declared, so casting worked only on a device where it had been installed by
+# hand and was silently broken on every clean image.
+depends="
+	cmd:sudo
+	linux-amazon-biscuit
+	mtk-mkimage
+	mkbootimg
+	postmarketos-base
+	alsa-ucm-conf
+	alsa-utils
+	util-linux-misc
+	py3-protobuf
+	py3-jeepney
+	libsndfile
+	i2c-tools
+	bluez
+	bluez-openrc
+	bluez-alsa
+	bluez-alsa-openrc
+	bluez-alsa-utils
+	sbc
+	wpa_supplicant
+	wpa_supplicant-openrc
+	iw
+	chrony
+	chrony-openrc
+	openssh-keygen
+	py3-pynacl
+	wireless-regdb
+	hostapd
+	hostapd-openrc
+	dnsmasq
+	dnsmasq-openrc
+	python3
+	avahi
+	avahi-openrc
+	dbus
+	dbus-openrc
+	pipewire
+	pipewire-pulse
+	pipewire-tools
+	pipewire-alsa
+	wireplumber
+	mpv
+	libgcc
+"
+# speexdsp-dev: biscuit-call-dsp is a SpeexDSP echo canceller. It was absent
+# here and the package built anyway, because nothing built call-dsp from source
+# before - the shipped binary came from an ad-hoc script outside this APKBUILD.
+makedepends="devicepkg-dev alsa-lib-dev sbc-dev patch speexdsp-dev"
+source="
+	deviceinfo
+	05-boot-rw.hook
+	dtb-mtk-wrap.hook
+	kernel-cmdline.conf
+	asound.conf
+	pulse-daemon-biscuit.conf
+	pulse-default-biscuit.pa
+	ucm2/HiFi.conf
+	ucm2/mt8163_biscuit.conf
+	wifi.start
+	zz-boot-done.start
+	biscuit-als.py
+	biscuit-ring.py
+	biscuit-audio.py
+	biscuit-btring.py
+	biscuit-als.initd
+	biscuit-ring.initd
+	biscuit-audio.initd
+	biscuit-btring.initd
+	biscuit-btaudio.sh
+	biscuit-btaudio.initd
+	biscuit-setup.sh
+	biscuit-earcon-map.py
+	biscuit-earcon
+	biscuit-earcon-args
+	biscuit-silence.wav
+	biscuit-miccal.py
+	biscuit-settings.py
+	biscuit-netcfg.py
+	biscuit-btcast.sh
+	biscuit-btproxy.py
+	biscuit-btproxy-bluez.py
+	biscuit-btproxy-active.py
+	biscuit-btproxy.initd
+	biscuit-btproxy.avahi.service
+	btproxy/api_pb2.py
+	btproxy/api_options_pb2.py
+	btproxy/__init__.py
+	biscuit-btcast.initd
+	biscuit-timesync.py
+	biscuit-timesync.initd
+	50-biscuit-httpdate.conf
+	90-biscuit-audio-slew.conf
+	biscuit-settings.initd
+	biscuit-btid.initd
+	biscuit-setup.initd
+	biscuit-dsp.c
+	biscuit-dsp.initd
+	biscuit-mic-coeff.py
+	biscuit-mic-coeff.initd
+	biscuit-persist.initd
+	biscuit-persist-account
+	biscuit-wheel-nopasswd
+	biscuit-firstboot.initd
+	biscuit-sshd.conf
+	biscuit-growroot.initd
+	biscuit-factory-reset.sh
+	snd-aloop.conf
+	mbcl.conf
+	user-eq.conf
+	biscuit_eq.py
+	biscuit-portal.py
+	nacl-fast.min.js
+	biscuit-apps.json
+	biscuit-reset.conf
+	biscuit-pkgjob.sh
+	biscuit-boot-update
+	pair-session.sh
+	device-amazon-biscuit.post-install
+	device-amazon-biscuit.post-upgrade
+	device-amazon-biscuit.pre-upgrade
+	biscuit-ring-priorities.json
+	biscuit-profile-assets.json
+	biscuit-setup-chime.wav
+	biscuit-import-assets
+	30-biscuit-firmware.files
+	mdev-persistent-storage
+	50-device-amazon-biscuit-mdev.files
+	51-biscuit-regdb.files
+	usb-rndis.initd
+	udhcpd-usb.conf
+	biscuit-beamform.c
+	biscuit-fireos6-frontend.tar.gz
+	biscuit-fireos6-open-array.patch
+	biscuit-btcall.c
+	biscuit-call-dsp.c
+	biscuit-echo-reference.c
+	biscuit-echo-reference.h
+	biscuit-cvsd.h
+	biscuit-btcall.initd
+	biscuit-mic-stream.sh
+	biscuit-mic-hub.py
+	biscuit-mic-hub.initd
+	biscuit-direction.py
+	biscuit-direction.initd
+	biscuit-usbaudio
+	biscuit-usbaudio.initd
+	51-biscuit-usb-gadget.conf
+	52-biscuit-no-stream-restore.conf
+	ramoops.conf
+	biscuit-usbmode
+	biscuit-apk-cache-clean
+	biscuit-logcap
+	biscuit-audio-clock.py
+	biscuit-audio-clock.initd
+	biscuit-audio-policy.py
+	biscuit-call-pump.py
+	biscuit-mic-client.py
+	biscuit-mic-restart.py
+	biscuit_call_profile.py
+	biscuit-mic-direct.sh
+	biscuit-beam-weights.bin
+	biscuit-apk.rsa.pub
+	biscuit-beam-weights-stock.bin
+	interfaces
+	wlan-defer.conf
+	biscuit-voice-venv.tar.gz
+	biscuit-sendspin-venv.tar.gz
+	biscuit-sendspin.initd
+	biscuit-sendspin-watchdog.sh
+	biscuit-sendspin-watchdog.initd
+	biscuit-sendspin-volume.sh
+	biscuit-sendspin-stream.sh
+	biscuit_sendspin_viz.py
+	sendspin-visualizer-roles.diff
+	sendspin-media-commands.diff
+	sendspin-client-visualizer.diff
+	biscuit-sendspin-server.py
+	biscuit-lva-processed-mic-profile.patch.txt
+	biscuit-lva-wake-agc-direct-input.patch.txt
+	biscuit-peripheral-discovery.patch.txt
+	biscuit-peripheral-command-events.patch.txt
+	biscuit-lva-device-master-volume.patch.txt
+	biscuit-lva-entity-master-volume.patch.txt
+	biscuit-lva-quiet-broadcast-warning.patch.txt
+	lva-src/peripheral_api.py
+	lva-src/entity.py
+	lva-src/__main__.py
+	lva-src/satellite.py
+	lva-src/qualification_v1.py
+	lva-src/peripheral_transport.py
+	lva-src/mpv_player.py
+	lva-src/libmpv.py
+	biscuit-va-leds.py
+	biscuit-ring-fx.py
+	biscuit_ring_config.py
+	biscuit_services.py
+	biscuit_system.py
+	biscuit-voice-assistant.initd
+	biscuit-voice-assistant-wait.sh
+	biscuit-va-leds.initd
+	biscuit-pipewire.initd
+	biscuit-mic-pump.initd
+	10-biscuit-sink.conf
+	tflite-aarch64-musl.tar.gz
+	biscuit-voice.requirements.lock
+	biscuit-voice.lock.sha256
+	qual-capture.py
+	qual-analyse.py
+"
+
+builddir="$srcdir"
+
+subpackages="
+	$pkgname-voice:voice
+	$pkgname-sendspin:sendspin
+	$pkgname-pulseaudio:pulseaudio
+	$pkgname-nonfree-firmware:nonfree_firmware
+"
+
+build() {
+	devicepkg_build $startdir $pkgname
+	# Real-time beamformer. Built here rather than shipped as a binary so it
+	# is reproducible from source and matches the target's libc.
+	${CC:-gcc} $CFLAGS $LDFLAGS -O2 -pthread -o biscuit-beamform \
+		"$srcdir"/biscuit-beamform.c -lm
+
+	# Bluetooth call audio. C rather than a script because CVSD is a per-bit
+	# codec at 64 kbit/s in BOTH directions - 128000 bit iterations per second
+	# of wall clock, continuously, on this SoC. A Python loop would not hold
+	# real time and the call would break up.
+	# -lsbc: mSBC decoding. libsbc is already on the device because
+	# bluez-alsa links it, but declare it anyway - an undeclared build
+	# dependency that happens to be present in the chroot has bitten this
+	# package three times, and each time it shipped an image broken in a
+	# way the build itself could not see.
+	${CC:-gcc} $CFLAGS $LDFLAGS -O2 -I"$srcdir" -o biscuit-btcall \
+		"$srcdir"/biscuit-btcall.c -lasound -lsbc -lm
+
+	# The call path's echo canceller. The RUNNING r164 package installs this
+	# binary and this tree had neither the binary nor its source, so a build
+	# from here produced a device with no call DSP at all.
+	#
+	# PROVENANCE ESTABLISHED. A prebuilt binary in live-echo-reference-20260911
+	# is byte-identical to the deployed /usr/bin/biscuit-call-dsp
+	# (sha256 7c4774be...), and that directory's build.json records the same
+	# hash - so these three files, not the rejected-polynomial-experiment copy
+	# beside them, are what shipped. The two variants have identical string AND
+	# function sets, so only the hash separates them.
+	#
+	# It needs biscuit-echo-reference.c for er_reader_open/process/close and
+	# -I"$srcdir" for its header; without either it compiles and then fails to
+	# link, which is how the missing pieces were found.
+	#
+	# VERIFIED in the real aarch64-musl chroot (pmbootstrap buildroot, Alpine
+	# gcc 15.2.0). This line builds cleanly and the result produces
+	# BYTE-IDENTICAL output to the deployed binary over 30 s of real 8-channel
+	# capture - 960,000 bytes, cmp clean.
+	#
+	# VERIFIED AGAIN from the PACKAGE, which is the artefact that actually
+	# ships: the binary extracted from device-amazon-biscuit-6-r151.apk (67312
+	# bytes, stripped by abuild, against 75336 unstripped) was run on the device
+	# beside the deployed one over 3750 frames. Output sha256 1cde8535... from
+	# both. Every deterministic stderr counter matches too; the sole difference
+	# is echo-reference max_us (52 vs 39), which is wall-clock timing. Checking
+	# the chroot object alone would not have covered abuild's strip.
+	#
+	# The ELFs are NOT identical (75336 vs 74280 bytes) and cannot be: the
+	# shipped binary was never built by this package. It came from an ad-hoc
+	# script using aarch64-linux-gnu-gcc with -O3 -mcpu=cortex-a53 -nostdinc
+	# -nostdlib -no-pie and hand-passed crt objects. Identical DSP output across
+	# that toolchain gap is the stronger result, and it holds because this path
+	# takes no -ffast-math, so IEEE semantics survive -O2 vs -O3.
+	${CC:-gcc} $CFLAGS $LDFLAGS -O2 -I"$srcdir" -o biscuit-call-dsp \
+		"$srcdir"/biscuit-call-dsp.c "$srcdir"/biscuit-echo-reference.c \
+		-lspeexdsp -lm
+
+	# Fire OS 6 derived assistant DSP, the second selectable microphone profile.
+	# Built here for the same reason the beamformer is: reproducible from source
+	# and matched to the target libc, rather than a binary dropped in by hand.
+	#
+	# Its AEC step-size schedule is OUR curve, compiled in as the default. The
+	# Fire OS 6 one is not redistributable and is loaded at run time from
+	# aec_vss_table.bin in the assets directory when the owner imports it.
+	#
+	# vad/dnn_vad.c dlopen()s the TensorFlow Lite runtime already shipped for
+	# microWakeWord, so it needs -ldl and the result MUST stay dynamically
+	# linked: a statically linked musl binary cannot dlopen at all, and the
+	# VAD would silently fall back to the energy prototype on every boot.
+	# Stock vad_lite.tflite is owner-imported and is never packaged.
+	${CC:-gcc} $CFLAGS $LDFLAGS -O2 -std=c11 -pthread -o biscuit-mic-fireos6 \
+		"$srcdir"/biscuit-fireos6/src/frontend.c \
+		"$srcdir"/biscuit-fireos6/src/aec.c \
+		"$srcdir"/biscuit-fireos6/adaptive/adaptive.c \
+		"$srcdir"/biscuit-fireos6/controls/stock_policy.c \
+		"$srcdir"/biscuit-fireos6/controls/group_policy.c \
+		"$srcdir"/biscuit-fireos6/controls/ara_metrics.c \
+		"$srcdir"/biscuit-fireos6/reference/bounded_reference.c \
+		"$srcdir"/biscuit-fireos6/reference/legacy_bridge.c \
+		"$srcdir"/biscuit-fireos6/vad/dnn_vad.c \
+		-ldl -lm
+
+	# A statically linked build would still succeed here and then fail in a way
+	# nothing reports: musl static binaries cannot dlopen at all, so the DNN VAD
+	# would fall back to the energy prototype on every boot, silently, costing
+	# detections with no error anywhere. Assert the interpreter is present.
+	#
+	# Read it from the ELF program header with scanelf (pax-utils, which abuild
+	# itself depends on). The old test, `grep -q ld-musl` over the binary, was a
+	# coin toss: busybox grep sees the file as "lines" split at 0x0a bytes, and
+	# the interpreter string sits right behind the GNU build-id note, whose bytes
+	# are a hash. r265 passed; r266 failed with a correctly dynamic binary
+	# (scanelf: /lib/ld-musl-aarch64.so.1), and grep -c on the host found it.
+	case "$(scanelf -qi biscuit-mic-fireos6)" in
+	/lib/ld-musl-*) ;;
+	*)
+		error "biscuit-mic-fireos6 is statically linked; dnn_vad dlopen() cannot work"
+		return 1
+		;;
+	esac
+
+	# Playback DSP: speaker correction, per-volume loudness, compressor and
+	# limiter. -ffast-math is wanted here - a fixed-size float pipeline with
+	# no NaN or denormal paths, and the 1024-tap FIR is the hot loop.
+	#
+	# It also WRITES the echo reference that biscuit-call-dsp reads, through
+	# struct er_writer in biscuit-echo-reference.h - so it needs that
+	# translation unit and -I"$srcdir", exactly as the call DSP does.
+	#
+	# This tree's biscuit-dsp.c carried NEITHER: it was an older revision with
+	# no echo-reference code at all, so a package built from it produced a
+	# playback DSP that never published a reference and a canceller with
+	# nothing to cancel against. Found by diffing the strings of the built
+	# binary against the deployed one - /run/biscuit-dsp/echo-reference and the
+	# two echo-reference log formats were present on the device and absent from
+	# the build.
+	#
+	# PROVENANCE, settled the same way biscuit-call-dsp's was: the prebuilt
+	# biscuit-dsp in live-echo-reference-20260911 is byte-identical to the
+	# deployed /usr/bin/biscuit-dsp (sha256 cd1905b0..., 76528 bytes) and that
+	# directory's build.json records the same hash, so its biscuit-dsp.c is what
+	# shipped. That is the file now here.
+	${CC:-gcc} $CFLAGS $LDFLAGS -O2 -ffast-math -I"$srcdir" -o biscuit-dsp \
+		"$srcdir"/biscuit-dsp.c "$srcdir"/biscuit-echo-reference.c \
+		-lasound -lm
+}
+
+# pre-upgrade keeps the speaker correction curve of a device upgrading from
+# r293 or older: that release shipped it, this one does not (it is Amazon's
+# EQ_50.cfg, now owner-imported), and only a PRE-upgrade script still sees
+# the old file. See device-amazon-biscuit.pre-upgrade.
+install="$pkgname.post-install $pkgname.post-upgrade $pkgname.pre-upgrade"
+
+package() {
+	devicepkg_package $startdir $pkgname
+    install -Dm755 "$srcdir"/mdev-persistent-storage "$pkgdir"/usr/lib/mdev/persistent-storage
+    install -Dm644 "$srcdir"/50-device-amazon-biscuit-mdev.files "$pkgdir"/usr/share/mkinitfs/files/50-device-amazon-biscuit-mdev.files
+    install -Dm644 "$srcdir"/51-biscuit-regdb.files "$pkgdir"/usr/share/mkinitfs/files/51-biscuit-regdb.files
+	install -Dm755 "$srcdir"/05-boot-rw.hook "$pkgdir"/etc/boot-deploy/hooks/05-boot-rw.hook
+	install -Dm755 "$srcdir"/dtb-mtk-wrap.hook "$pkgdir"/etc/boot-deploy/hooks/10-dtb-mtk-wrap.hook
+	# LED and button services. Without these a flashed device has a dark ring
+	# and dead volume/mute keys, which is what happened after every flash until
+	# now. led.start/led.stop are deliberately gone: they drove
+	# /sys/bus/i2c/devices/0-003f/{boot_animation,frame}, which this kernel does
+	# not expose, so they were exit-0 no-ops. biscuit-ring owns the ring now,
+	# and two writers would fight over the same LEDs.
+	local _svc
+	for _svc in biscuit-als biscuit-ring biscuit-audio biscuit-btring; do
+		install -Dm755 "$srcdir/$_svc.py" "$pkgdir/usr/bin/$_svc.py"
+		install -Dm755 "$srcdir/$_svc.initd" "$pkgdir/etc/init.d/$_svc"
+		# biscuit-ring goes in BOOT, not default. In default it was one of 55
+		# services starting at t+10s and was not up until t+21s, while boot
+		# finishes around t+34s - so the "while booting" animation had no
+		# window at all. From the boot runlevel it is up at t+7s. Measured.
+		local _rl=default
+		[ "$_svc" = biscuit-ring ] && _rl=boot
+		install -d "$pkgdir/etc/runlevels/$_rl"
+		ln -sf "/etc/init.d/$_svc" "$pkgdir/etc/runlevels/$_rl/$_svc"
+	done
+
+	# The layer and priority tables ONLY - no artwork. Stock's 283 animations are
+	# Amazon assets that cannot be redistributed; the shipped defaults are
+	# biscuit-ring-fx effects, rendered per activity into /opt/persist/led-fx.
+	# This table is what orders one animation over another, and without it
+	# everything lands on layer 0 - which is how a muted microphone once masked
+	# every other animation on the ring. It used to be a tarball holding stock's
+	# own layer_config_common.json plus an alias map into it; that file was
+	# Amazon's, verbatim, so it is gone and this is ours. biscuit-ring.initd
+	# checks the directory exists, so create it even though one file goes in it.
+	# Expected content of the owner-imported stock audio assets: HASHES ONLY, no
+	# vendor content. biscuit-mic-stream.sh checks these before it execs the chain
+	# and the settings layer reads the same file, so the page cannot say a profile
+	# is available when the thing that starts it would refuse.
+	# The USB link's DHCP server config, as a template: usb-rndis substitutes the
+	# interface it actually detected, because the kernel does not always give the
+	# RNDIS function usb0. Committed months ago and never listed in source=, so it
+	# was never installed and no udhcpd ever ran - see the note in usb-rndis.initd.
+	install -Dm644 "$srcdir"/udhcpd-usb.conf \
+		"$pkgdir"/usr/share/biscuit/udhcpd-usb.conf
+
+	install -Dm644 "$srcdir"/biscuit-profile-assets.json \
+		"$pkgdir"/usr/share/biscuit/biscuit-profile-assets.json
+	# Ours, generated by tools/make_setup_chime.py: the setup page's device check
+	# plays it when the owner's own earcons are not installed yet.
+	install -Dm644 "$srcdir"/biscuit-setup-chime.wav \
+		"$pkgdir"/usr/share/biscuit/biscuit-setup-chime.wav
+	# The owner's own importer. The assets it installs are Amazon's and are
+	# NOT shipped - only their hashes, in the manifest above. This runs ON
+	# the device: the version it replaces ran on a developer's laptop and
+	# copied in over SSH with a hard-coded key path and IP, which no owner
+	# can use.
+	install -Dm755 "$srcdir"/biscuit-import-assets \
+		"$pkgdir"/usr/bin/biscuit-import-assets
+
+	install -d "$pkgdir"/usr/share/biscuit-ring/led-resources
+	install -Dm644 "$srcdir"/biscuit-ring-priorities.json \
+		"$pkgdir"/usr/share/biscuit-ring/led-resources/biscuit-ring-priorities.json
+
+	# Bring Wi-Fi up at boot. Not the networking + wpa_supplicant services:
+	# busybox ifupdown does not wait for association before running the DHCP
+	# client, so the lease request loses the race and the interface comes up
+	# with no address. This waits for wpa_state=COMPLETED, and reloads the
+	# driver and retries once if association fails - which is the only thing
+	# that reliably clears a wedged supplicant. It is what keeps the device
+	# reachable when it is not plugged into the development host.
+	install -Dm755 "$srcdir"/wifi.start "$pkgdir"/etc/local.d/wifi.start
+
+	# Bluetooth speaker support.
+	#
+	# Four things must all hold or A2DP silently fails, and each was a manual
+	# repair after every flash before this: the adapter must advertise the
+	# loudspeaker device class (set by the post-install, since only
+	# /etc/bluetooth/main.conf carries it), a pairing agent must be registered
+	# or the phone reports a bogus PIN error, the peer must be TRUSTED or BlueZ
+	# times out authorising the A2DP service and drops the link, and
+	# bluealsa-aplay must run or the decoded stream never reaches the speaker.
+	install -Dm755 "$srcdir"/biscuit-btaudio.sh "$pkgdir"/usr/bin/biscuit-btaudio.sh
+
+	# Casting this device's audio to a paired Bluetooth speaker. The bridge
+	# taps biscuit_speaker.monitor, so nothing upstream needs reconfiguring.
+	install -Dm755 "$srcdir"/biscuit-btcast.sh "$pkgdir"/usr/bin/biscuit-btcast.sh
+	install -Dm755 "$srcdir"/biscuit-btcast.initd "$pkgdir"/etc/init.d/biscuit-btcast
+	ln -sf /etc/init.d/biscuit-btcast "$pkgdir"/etc/runlevels/default/biscuit-btcast
+
+	# Bluetooth LE proxy for Home Assistant. The service lives under /usr/lib
+	# rather than /usr/bin because it is not a command anyone runs by hand: it
+	# ships with two vendored protobuf modules that have to sit importable
+	# beside it, and a package directory keeps them together.
+	#
+	# In the default runlevel unconditionally, and enabled-or-idle from
+	# /opt/persist/btproxy.env. Keeping "enabled" in the config rather than in
+	# a runlevel symlink means :8080 and Home Assistant toggle one thing, not
+	# two that can disagree - the split that made biscuit-mic-pump confusing.
+	install -Dm755 "$srcdir"/biscuit-btproxy.py 		"$pkgdir"/usr/lib/biscuit-btproxy/biscuit-btproxy.py
+	# Installed under their import names: the service does
+	# sys.path.insert(0, its own directory) and imports them as `bluez` and
+	# `active`, so the source filenames carry the biscuit- prefix only to keep
+	# the package directory navigable.
+	install -Dm644 "$srcdir"/biscuit-btproxy-bluez.py 		"$pkgdir"/usr/lib/biscuit-btproxy/bluez.py
+	install -Dm644 "$srcdir"/biscuit-btproxy-active.py 		"$pkgdir"/usr/lib/biscuit-btproxy/active.py
+	install -Dm644 "$srcdir"/api_pb2.py 		"$pkgdir"/usr/lib/biscuit-btproxy/aioesphomeapi_min/api_pb2.py
+	install -Dm644 "$srcdir"/api_options_pb2.py 		"$pkgdir"/usr/lib/biscuit-btproxy/aioesphomeapi_min/api_options_pb2.py
+	install -Dm644 "$srcdir"/__init__.py 		"$pkgdir"/usr/lib/biscuit-btproxy/aioesphomeapi_min/__init__.py
+	install -Dm755 "$srcdir"/biscuit-btproxy.initd "$pkgdir"/etc/init.d/biscuit-btproxy
+	ln -sf /etc/init.d/biscuit-btproxy "$pkgdir"/etc/runlevels/default/biscuit-btproxy
+	# Advertised over mDNS so Home Assistant offers it instead of needing an IP.
+	install -Dm644 "$srcdir"/biscuit-btproxy.avahi.service 		"$pkgdir"/etc/avahi/services/biscuit-btproxy.service
+
+	# Timekeeping. chrony is installed and enabled already, but away from a
+	# network that permits NTP it has no source at all - it never syncs, so
+	# rtcsync never writes the RTC and a power cut leaves the clock 43 years
+	# out. This feeds it Home Assistant's HTTP Date header as a reference
+	# clock, which keeps chrony the single authority.
+	install -Dm755 "$srcdir"/biscuit-timesync.py "$pkgdir"/usr/bin/biscuit-timesync.py
+	install -Dm755 "$srcdir"/biscuit-timesync.initd "$pkgdir"/etc/init.d/biscuit-timesync
+	install -Dm644 "$srcdir"/50-biscuit-httpdate.conf "$pkgdir"/etc/chrony/conf.d/50-biscuit-httpdate.conf
+	# Caps chronyd's slew at 500 ppm. Without it a correction can drag the
+	# system clock fast enough to disturb the audio clock the capture and
+	# playback graphs are disciplined against. Also missed at import.
+	install -Dm644 "$srcdir"/90-biscuit-audio-slew.conf \
+		"$pkgdir"/etc/chrony/conf.d/90-biscuit-audio-slew.conf
+	ln -sf /etc/init.d/biscuit-timesync "$pkgdir"/etc/runlevels/default/biscuit-timesync
+	install -Dm755 "$srcdir"/biscuit-btaudio.initd "$pkgdir"/etc/init.d/biscuit-btaudio
+	ln -sf /etc/init.d/biscuit-btaudio "$pkgdir"/etc/runlevels/default/biscuit-btaudio
+
+	# First-boot Wi-Fi setup: an open network, a captive portal, and the join.
+	#
+	# NOT symlinked into a runlevel, and that is deliberate - nothing should
+	# broadcast an open network on every boot. wifi.start starts it on demand
+	# when no network is configured or when the saved credentials stop working,
+	# and the same "rc-service biscuit-setup restart" is what a button handler or
+	# Home Assistant would call - restart, not start, because OpenRC keeps the
+	# one-shot marked started after a session and refuses a second start.
+	#
+	# The AP runs on p2p0, registered through /proc/net/wlan/p2p_mode with mode
+	# 0. Mode 1 registers ap0, which looks like the obvious choice for an access
+	# point and fails silently: hostapd reaches AP-ENABLED with state=ENABLED
+	# and freq=2437 while the device radiates nothing, because
+	# p2pStateInit_IDLE fails its eIntendOPMode == OP_MODE_ACCESS_POINT test and
+	# the AP never re-acquires the channel. Needs kernel r218 or later.
+	# Playback DSP. Everything that plays audio opens pcm."default", which
+	# asound.conf points at the snd-aloop loopback; biscuit-dsp drains that,
+	# applies the chain, and writes the codec. One insertion point, so nothing
+	# else had to change.
+	#
+	# UNLIKE biscuit-setup, THIS ONE IS IN THE DEFAULT RUNLEVEL, and must be:
+	# with "default" pointing at the loopback there is no path to the codec
+	# without it and playback is silent. supervise-daemon respawns it.
+	#
+	# The correction and the limiter are a package deal. The owner's imported
+	# speaker curve (EQ_50.cfg, never shipped here) applies up
+	# to +24 dB between 120 and 300 Hz, which needs the compressor behind it or
+	# it risks the driver; biscuit_direct in asound.conf bypasses both together
+	# and is the only supported bypass.
+	install -Dm755 biscuit-dsp "$pkgdir"/usr/bin/biscuit-dsp
+	install -Dm755 "$srcdir"/biscuit-dsp.initd "$pkgdir"/etc/init.d/biscuit-dsp
+	install -d "$pkgdir"/etc/runlevels/default
+	ln -sf /etc/init.d/biscuit-dsp "$pkgdir"/etc/runlevels/default/biscuit-dsp
+
+	# The converters only accept coefficient memory while the ADC is fully
+	# powered down, so a chip that is busy when the UCM fires silently keeps
+	# no filter for the whole session - and amixer cannot tell, because it
+	# reports the regmap cache rather than the chip. This checks the hardware
+	# directly after boot and rewrites any converter that missed.
+	install -Dm755 "$srcdir"/biscuit-mic-coeff.py "$pkgdir"/usr/bin/biscuit-mic-coeff.py
+	install -Dm755 "$srcdir"/biscuit-mic-coeff.initd "$pkgdir"/etc/init.d/biscuit-mic-coeff
+	ln -sf /etc/init.d/biscuit-mic-coeff "$pkgdir"/etc/runlevels/default/biscuit-mic-coeff
+
+	# Wi-Fi credentials, Bluetooth pairings and the device name live on
+	# partition 14, not the rootfs, so an update flash keeps them and a
+	# factory reset can erase them. This MUST be a service rather than an
+	# /etc/fstab entry: fstab is on the rootfs that a flash replaces, so
+	# mounts written there survive a reboot and vanish on exactly the
+	# occasion they exist for. That was tried, and it lost a user's network
+	# on the first flash after setup.
+	#
+	# Retire the shipped default account (user / 147147) once setup has made
+	# the owner's, and until then keep its published password off SSH except
+	# over USB. Guarded by /opt/persist/provisioned, and in the BOOT runlevel:
+	# it must finish before biscuit-setup offers to create the real account,
+	# and before sshd could accept a login with the old one.
+	install -Dm755 "$srcdir"/biscuit-firstboot.initd "$pkgdir"/etc/init.d/biscuit-firstboot
+	install -d "$pkgdir"/etc/runlevels/boot
+	ln -sf /etc/init.d/biscuit-firstboot "$pkgdir"/etc/runlevels/boot/biscuit-firstboot
+
+	# boot runlevel, not default: it has to be up before wpa_supplicant and
+	# bluetoothd read the state it provides.
+	install -Dm755 "$srcdir"/biscuit-persist.initd "$pkgdir"/etc/init.d/biscuit-persist
+
+	# Rebuilds the owner account after a flash. Called by biscuit-persist at
+	# boot and by the :8080 password form, so it lives in /usr/bin rather than
+	# being inlined in the init script.
+	install -Dm755 "$srcdir"/biscuit-persist-account "$pkgdir"/usr/bin/biscuit-persist-account
+
+	# Bluetooth call audio bridge and its service.
+	install -Dm755 biscuit-btcall "$pkgdir"/usr/bin/biscuit-btcall
+	install -Dm755 "$srcdir"/biscuit-btcall.initd "$pkgdir"/etc/init.d/biscuit-btcall
+	install -d "$pkgdir"/etc/runlevels/default
+	ln -sf /etc/init.d/biscuit-btcall "$pkgdir"/etc/runlevels/default/biscuit-btcall
+
+	# Mode 0440 is not decoration: sudo ignores any file in sudoers.d that is
+	# group- or world-writable, and does so without saying anything, so a wrong
+	# mode here looks exactly like the rule not existing.
+	install -Dm440 "$srcdir"/biscuit-wheel-nopasswd \
+		"$pkgdir"/etc/sudoers.d/10-biscuit-wheel
+	# SSH policy: no login at all from the open setup network, and no
+	# password login for the shipped default account (user / 147147) except
+	# over USB while that password is live. The runtime halves live in
+	# /run/biscuit-sshd, written by biscuit-setup.sh and biscuit-firstboot.
+	install -Dm644 "$srcdir"/biscuit-sshd.conf \
+		"$pkgdir"/etc/ssh/sshd_config.d/40-biscuit.conf
+	install -d "$pkgdir"/etc/runlevels/boot
+	ln -sf /etc/init.d/biscuit-persist "$pkgdir"/etc/runlevels/boot/biscuit-persist
+	# Grow the root filesystem to fill its partition. pmOS resizes the
+	# PARTITION at first boot but the FILESYSTEM resize routinely does not
+	# take on this device - after r231 a 929 MiB partition held a 558 MiB
+	# filesystem. Without this the planned repartition (3371 MiB) would
+	# appear to do nothing at all.
+	install -Dm755 "$srcdir"/biscuit-growroot.initd "$pkgdir"/etc/init.d/biscuit-growroot
+	ln -sf /etc/init.d/biscuit-growroot "$pkgdir"/etc/runlevels/boot/biscuit-growroot
+
+	install -Dm755 "$srcdir"/biscuit-factory-reset.sh "$pkgdir"/usr/bin/biscuit-factory-reset
+	install -Dm644 "$srcdir"/snd-aloop.conf "$pkgdir"/etc/modprobe.d/snd-aloop.conf
+
+	# The speaker correction curve is NOT shipped: it is Amazon's EQ_50.cfg.
+	# The owner imports it from their own backup (profile "speaker" in
+	# biscuit-profile-assets.json) and biscuit-dsp reads it from
+	# /opt/persist/biscuit/assets/speaker; /etc/biscuit/eq/speaker.fir, when
+	# present, still wins over it. Without either the speaker plays flat.
+
+	# Editable config. Under /etc because these are meant to be edited; the
+	# user EQ ships empty and mbcl.conf ships the factory dynamics.
+	install -Dm644 "$srcdir"/mbcl.conf "$pkgdir"/etc/biscuit/mbcl.conf
+	install -Dm644 "$srcdir"/user-eq.conf "$pkgdir"/etc/biscuit/user-eq.conf
+	# The EQ as the settings page and Home Assistant see it lives in
+	# /opt/persist/eq.json; the two files above are only what the DSP reads.
+	# biscuit-dsp.initd re-derives them from eq.json on every start, so a reset
+	# or a reflash cannot leave the page and the DSP disagreeing. Core, because
+	# biscuit-dsp is.
+	install -Dm644 "$srcdir"/biscuit_eq.py "$pkgdir"/usr/bin/biscuit_eq.py
+
+	install -Dm755 "$srcdir"/biscuit-setup.sh "$pkgdir"/usr/bin/biscuit-setup.sh
+
+	# Earcons. The activity->sound table is CORE, not part of the assistant
+	# bundle: boot, Wi-Fi, setup and Bluetooth all play sounds on a device
+	# with no assistant installed, so biscuit-earcon must be able to resolve
+	# one without importing biscuit-va-leds.
+	install -Dm755 "$srcdir"/biscuit-earcon-map.py "$pkgdir"/usr/bin/biscuit-earcon-map.py
+	install -Dm755 "$srcdir"/biscuit-earcon "$pkgdir"/usr/bin/biscuit-earcon
+	install -Dm755 "$srcdir"/biscuit-earcon-args "$pkgdir"/usr/bin/biscuit-earcon-args
+	# 50 ms of digital silence. The assistant takes each of its sounds as a
+	# file path and falls back to its own bundled sound when the flag is left
+	# out, so "Silent" has to be a real file it can play. Not in the earcon
+	# directory, so it is never offered as a sound of its own.
+	install -Dm644 "$srcdir"/biscuit-silence.wav "$pkgdir"/usr/share/biscuit/silence.wav
+	# NO EARCONS ARE SHIPPED. Stock's are Amazon recordings that each owner
+	# extracts from their own device, so the package carries the table and the
+	# player and no audio. biscuit-earcon-map.earcon_dirs() resolves, in order,
+	# /opt/persist/earcon (what the owner extracted), this directory (a stock
+	# pack, if one is ever installed separately) and the eleven sounds that
+	# linux-voice-assistant brings with it, which are the redistributable
+	# default. With none of them present the device is silent, which is the
+	# intended outcome rather than a failure.
+	install -d "$pkgdir"/usr/share/biscuit/earcon
+
+	# Per-capsule factory mic calibration, read from IDME.
+	install -Dm755 "$srcdir"/biscuit-miccal.py "$pkgdir"/usr/bin/biscuit-miccal.py
+
+	# The settings page on :8080, behind the device account.
+	install -Dm755 "$srcdir"/biscuit-settings.py "$pkgdir"/usr/bin/biscuit-settings.py
+	# Wi-Fi, Bluetooth and account backends the settings page loads as a
+	# module. Not in the agent: none of it is exposed to Home Assistant.
+	install -Dm755 "$srcdir"/biscuit-netcfg.py "$pkgdir"/usr/bin/biscuit-netcfg.py
+	# Vendored rather than fetched from a CDN: the setup AP has no internet by
+	# definition, so a remote reference would simply fail at the one moment it
+	# is needed. v1.0.3, byte-identical from cdnjs and unpkg.
+	install -Dm644 "$srcdir"/nacl-fast.min.js "$pkgdir"/usr/share/biscuit/nacl-fast.min.js
+	install -Dm755 "$srcdir"/biscuit-settings.initd "$pkgdir"/etc/init.d/biscuit-settings
+	install -d "$pkgdir"/etc/runlevels/default
+	ln -sf /etc/init.d/biscuit-settings "$pkgdir"/etc/runlevels/default/biscuit-settings
+
+	# Bluetooth device identity, ensured before bluetoothd starts.
+	install -Dm755 "$srcdir"/biscuit-btid.initd "$pkgdir"/etc/init.d/biscuit-btid
+	ln -sf /etc/init.d/biscuit-btid "$pkgdir"/etc/runlevels/default/biscuit-btid
+	install -Dm755 "$srcdir"/biscuit-portal.py "$pkgdir"/usr/bin/biscuit-portal.py
+	install -Dm755 "$srcdir"/biscuit-setup.initd "$pkgdir"/etc/init.d/biscuit-setup
+	# The optional apps, for the setup portal's checkboxes and the settings
+	# page's Apps list: one file, so the two cannot describe an app differently.
+	install -Dm644 "$srcdir"/biscuit-apps.json "$pkgdir"/usr/share/biscuit/apps.json
+	# Which public release this build is, for the settings page and the
+	# installer's zip name. The build is written beside it, so a reader can
+	# tell the file belongs to the package it came with.
+	printf 'release=%s\nbuild=%s-r%s\n' "$_release" "$pkgver" "$pkgrel" \
+		> "$pkgdir"/usr/share/biscuit/release
+	# What each reset option erases: read by biscuit-persist, which carries a
+	# reset out at boot, and shown by the settings page before one is chosen.
+	install -Dm644 "$srcdir"/biscuit-reset.conf "$pkgdir"/usr/share/biscuit/reset.conf
+	# Runs apk in the background for the :8080 Apps page. Detached because a
+	# 100 MB install takes minutes, which no browser will wait for.
+	install -Dm755 "$srcdir"/biscuit-pkgjob.sh "$pkgdir"/usr/bin/biscuit-pkgjob.sh
+	# Writes the boot image a kernel or initramfs update builds to boot_a and
+	# boot_b, which no package does; the Updates page runs it on request.
+	install -Dm755 "$srcdir"/biscuit-boot-update "$pkgdir"/usr/bin/biscuit-boot-update
+
+	# Manual pairing window, for re-pairing without waiting for the service's
+	# 15-second trust sweep.
+	install -Dm755 "$srcdir"/pair-session.sh "$pkgdir"/usr/bin/biscuit-pair-session
+
+
+	# Tell the room the device has finished booting: stock's boot_success, a
+	# cyan ring that fades out. The Echo has no screen, so without this there
+	# is no way to know it is up. zz- so it runs last in local.d, after
+	# wifi.start, which makes it mean "booted and on the network".
+	install -Dm755 "$srcdir"/zz-boot-done.start "$pkgdir"/etc/local.d/zz-boot-done.start
+
+	# ALSA configs
+	install -Dm644 "$srcdir"/asound.conf "$pkgdir"/etc/asound.conf
+	install -Dm644 -t "$pkgdir"/usr/share/alsa/ucm2/MediaTek/mt8163_biscuit/ \
+		"$srcdir"/HiFi.conf \
+		"$srcdir"/mt8163_biscuit.conf
+	mkdir -p "$pkgdir"/usr/share/alsa/ucm2/conf.d/mt8163-biscuit/
+	ln -s ../../MediaTek/mt8163_biscuit/mt8163_biscuit.conf \
+		"$pkgdir"/usr/share/alsa/ucm2/conf.d/mt8163-biscuit/mt8163-biscuit.conf
+
+	install -Dm755 "$srcdir"/usb-rndis.initd \
+		"$pkgdir"/etc/init.d/usb-rndis
+	install -d "$pkgdir"/etc/runlevels/default
+	ln -s /etc/init.d/usb-rndis \
+		"$pkgdir"/etc/runlevels/default/usb-rndis
+
+	# Bluetooth at boot. The bluez and bluez-alsa packages install their init
+	# scripts but do not enable them, so a freshly flashed device had the
+	# software present and no bluetoothd running - hci0 exists (that is the
+	# kernel side) but nothing can pair or play to it. bluealsa is what makes
+	# the speaker usable as an A2DP sink, which is the point of the device.
+	ln -s /etc/init.d/bluetooth \
+		"$pkgdir"/etc/runlevels/default/bluetooth
+	ln -s /etc/init.d/bluealsa \
+		"$pkgdir"/etc/runlevels/default/bluealsa
+
+	# Time sync at boot. The MT8163 RTC is not battery backed and comes up
+	# reading 2069, which makes every CA certificate look expired and breaks
+	# TLS device-wide - apk over https, pip, and anything talking to Home
+	# Assistant. Measured on hardware: chronyd steps that 43-year error about
+	# 10 s after the network is up. Nothing needing TLS should start before it.
+	ln -s /etc/init.d/chronyd \
+		"$pkgdir"/etc/runlevels/default/chronyd
+
+	# mDNS at boot. Home Assistant, the Wyoming satellite and Music
+	# Assistant all discover over mDNS, and stock ships avahi for the same
+	# reason. dbus comes with it because avahi will not start without one.
+	ln -s /etc/init.d/dbus \
+		"$pkgdir"/etc/runlevels/default/dbus
+	ln -s /etc/init.d/avahi-daemon \
+		"$pkgdir"/etc/runlevels/default/avahi-daemon
+
+	# hostapd and dnsmasq are installed but deliberately NOT enabled in any
+	# runlevel. They exist for the first-boot setup AP, which biscuit-setup
+	# starts on demand; nothing should broadcast an open network every boot.
+	#
+	# Two corrections to what this comment used to say. "iw list" reporting AP
+	# mode is misleading: it concatenates two wiphys, and wlan0's (phy0) does
+	# NOT support AP - only phy1 does. And stock does not use hostapd for this;
+	# its setup network is a wpa_supplicant P2P GO on p2p0 serving a Jetty
+	# server (seen tracing stock's own setup on an Echo running Fire OS). We
+	# use hostapd, but on the same p2p0 interface, which is what actually
+	# radiates.
+
+	# Microphone array: the beamformer, the wrapper that sets up the two
+	# things capture silently needs (UCM _enadev Mic to fire DAPM, and a
+	# playback stream for the FPGA's DAC reference), and the computed
+	# weights. The weights are derived from measured geometry and a
+	# diffuse-field model. The stock-profile filterbank prototype is kept in a
+	# separate, device-recovered asset so its provenance and purpose are clear.
+	install -Dm755 biscuit-beamform "$pkgdir"/usr/bin/biscuit-beamform
+	# The alternative microphone profile. Its own vendor configuration is NOT
+	# shipped: release-work-20260916/profiles/import_profile_assets.py installs
+	# it from the owner's firmware into /usr/share/biscuit/fireos6, and the
+	# settings agent refuses to select the profile until it verifies.
+	install -Dm755 biscuit-mic-fireos6 "$pkgdir"/usr/bin/biscuit-mic-fireos6
+	# The Fire OS 5 chain's two vendor files are deliberately NOT shipped.
+	# They are Amazon's: biscuit-stock-fbf.cfg carries its own header,
+	# "generated on Mar 6 2019 from Knight AFE beamformer config files", and
+	# they are the coefs_FBF.cfg and coefs_FilterBank_640.cfg that .gitignore
+	# names. They were only ever here because RENAMING them off coefs_*.cfg
+	# stopped the ignore pattern matching.
+	#
+	# Fire OS 6 was already correct - only our own frontend is packaged, never
+	# its assets - so Fire OS 5 was the one-sided exception. Removing them
+	# needs no new mechanism: biscuit-va-leds already lists both in
+	# MIC_PROFILE_ASSETS, and mic_profile_unavailable() already greys out a
+	# profile whose assets are absent. The profile now reports 'needs stock
+	# files this device does not have', exactly as Fire OS 6 does.
+	install -Dm755 "$srcdir"/biscuit-mic-stream.sh \
+		"$pkgdir"/usr/bin/biscuit-mic-stream.sh
+	# The hub owns the single capture and tees it to every branch. It was
+	# absent from this package entirely, so a flash produced a device whose
+	# microphone chain had no owner.
+	install -Dm755 "$srcdir"/biscuit-mic-hub.py \
+		"$pkgdir"/usr/bin/biscuit-mic-hub.py
+	# And its service, which was missed when the script above was imported -
+	# found by diffing the built package against the r164 apk still in the
+	# device's own cache, not by reading anything. Without it the hub has a
+	# script and no way to start: this file is what pins it off CPU 0 with
+	# taskset, gives it SCHED_FIFO 44, orders it after biscuit-dsp,
+	# biscuit-audio, biscuit-mic-coeff and biscuit-audio-clock, and creates
+	# /run/biscuit-mic 0750 - the directory biscuit-mic-stream.sh now puts its
+	# capture FIFO in. Its runlevel symlink is added to the loop below.
+	install -Dm755 "$srcdir"/biscuit-mic-hub.initd \
+		"$pkgdir"/etc/init.d/biscuit-mic-hub
+
+	# The acoustic direction observer. It binds the socket biscuit-mic-hub
+	# sends its windows to and publishes /run/biscuit-direction/state, which
+	# is what biscuit_ring_config.direction() reads. WITHOUT IT that read
+	# always returns {} and the ring's 'Point at speaker' / 'Point at noise'
+	# render as background only - which is exactly how direction tracking was
+	# silently dead: the observer was written and tested on Device 1, but was
+	# never added to this file, so no build has ever contained it.
+	install -Dm755 "$srcdir"/biscuit-direction.py \
+		"$pkgdir"/usr/bin/biscuit-direction.py
+	install -Dm755 "$srcdir"/biscuit-direction.initd \
+		"$pkgdir"/etc/init.d/biscuit-direction
+
+	# Ten more files the RUNNING package (r164) installs that this tree did not
+	# reference at all. A build from here produced a device with no USB audio
+	# gadget, no audio clock, no audio policy - which pins the FPGA SPI IRQ and
+	# the capture reader to specific CPUs at SCHED_FIFO, so microphone timing
+	# depends on it - and none of the Bluetooth call path.
+	install -Dm755 "$srcdir"/biscuit-usbaudio \
+		"$pkgdir"/usr/bin/biscuit-usbaudio
+	install -Dm755 "$srcdir"/biscuit-usbmode \
+		"$pkgdir"/usr/bin/biscuit-usbmode
+	install -Dm755 "$srcdir"/biscuit-audio-clock.py \
+		"$pkgdir"/usr/bin/biscuit-audio-clock.py
+	install -Dm755 "$srcdir"/biscuit-audio-policy.py \
+		"$pkgdir"/usr/bin/biscuit-audio-policy.py
+	install -Dm755 "$srcdir"/biscuit-call-pump.py \
+		"$pkgdir"/usr/bin/biscuit-call-pump.py
+	install -Dm755 "$srcdir"/biscuit-mic-client.py \
+		"$pkgdir"/usr/bin/biscuit-mic-client.py
+	install -Dm755 "$srcdir"/biscuit-mic-restart.py \
+		"$pkgdir"/usr/bin/biscuit-mic-restart.py
+	# The qualification harness (3.13/3.5). It lived only on the device for
+	# its whole life, so a flash silently removed the instrument the sitting
+	# depends on - the same unpackaged-file trap as the earlier clean install.
+	install -Dm755 "$srcdir"/qual-capture.py "$pkgdir"/usr/bin/qual-capture.py
+	install -Dm755 "$srcdir"/qual-analyse.py "$pkgdir"/usr/bin/qual-analyse.py
+	install -Dm755 "$srcdir"/biscuit_call_profile.py \
+		"$pkgdir"/usr/bin/biscuit_call_profile.py
+	install -Dm755 biscuit-call-dsp "$pkgdir"/usr/bin/biscuit-call-dsp
+	install -Dm755 "$srcdir"/biscuit-usbaudio.initd \
+		"$pkgdir"/etc/init.d/biscuit-usbaudio
+	# The WirePlumber rules that keep the USB gadget from ever clocking the
+	# graph (priority.driver -1000) and give its capture 512 frames of
+	# headroom. The host can stop its isochronous clock without removing the
+	# ALSA card, and an endpoint that does that must not be driving the Echo's
+	# microphone or speaker. Third file missed at import.
+	install -Dm644 "$srcdir"/51-biscuit-usb-gadget.conf \
+		"$pkgdir"/etc/wireplumber/wireplumber.conf.d/51-biscuit-usb-gadget.conf
+	install -Dm644 "$srcdir"/52-biscuit-no-stream-restore.conf \
+		"$pkgdir"/etc/wireplumber/wireplumber.conf.d/52-biscuit-no-stream-restore.conf
+	install -Dm644 "$srcdir"/ramoops.conf \
+		"$pkgdir"/etc/modules-load.d/ramoops.conf
+	install -Dm755 "$srcdir"/biscuit-audio-clock.initd \
+		"$pkgdir"/etc/init.d/biscuit-audio-clock
+	install -Dm755 "$srcdir"/biscuit-mic-direct.sh \
+		"$pkgdir"/usr/bin/biscuit-mic-direct.sh
+	install -Dm644 "$srcdir"/biscuit-beam-weights.bin \
+		"$pkgdir"/usr/share/biscuit/biscuit-beam-weights.bin
+	# The package feed's PUBLIC key. Shipped so biscuit-persist can put it
+	# back into /etc/apk/keys after a flash, which replaces the rootfs and
+	# would otherwise leave the device unable to verify its own updates.
+	install -Dm644 "$srcdir"/biscuit-apk.rsa.pub \
+		"$pkgdir"/usr/share/biscuit/biscuit-apk.rsa.pub
+	# Empties apk's package cache after every transaction. apk-tools 3
+	# predownloads each package into /var/cache/apk and keeps it, which had
+	# filled 1.2 GB of the 3.1 GB root by r271; see the hook itself.
+	install -Dm755 "$srcdir"/biscuit-apk-cache-clean \
+		"$pkgdir"/etc/apk/commit_hooks.d/biscuit-cache-clean
+	# Size-capped file logger for daemons that write their output straight to
+	# a file with nothing to rotate it (biscuit-pipewire's three).
+	install -Dm755 "$srcdir"/biscuit-logcap "$pkgdir"/usr/bin/biscuit-logcap
+	install -Dm644 "$srcdir"/biscuit-beam-weights-stock.bin \
+		"$pkgdir"/usr/share/biscuit/biscuit-beam-weights-stock.bin
+
+	# Loopback stanza. Wi-Fi is brought up by wifi.start, not by the
+	# networking service - but the file still has to parse. Shipping it
+	# empty made ifquery fail, which made networking fail, which silently
+	# blocked every service declaring `need net`. chronyd is one, so the
+	# RTC fix from pkgrel 36 never actually ran and the clock stayed at
+	# 2069 with TLS broken device-wide.
+	install -Dm644 "$srcdir"/interfaces "$pkgdir"/etc/network/interfaces
+
+	# Stop udev autoloading the WLAN driver; wifi.start loads it instead.
+	# Measured: autoload at t~9-16 s produced wlan0 on roughly 1 boot in 4,
+	# deferring it to wifi.start gave 9 in 11. Both radios share one CONSYS
+	# and BT/WMT enables the Wi-Fi function at t~1.7 s, so the early load
+	# catches the chip in a state the firmware download cannot recover from.
+	install -Dm644 "$srcdir"/wlan-defer.conf \
+		"$pkgdir"/etc/modprobe.d/wlan-defer.conf
+	# Home Assistant voice satellite, ring/LED peripheral, its private
+	# aarch64-musl virtualenv, and TFLite runtime. They were previously
+	# hand-installed on the test device, which meant a flash silently deleted
+	# the working configuration and reinstallation selected a moving LVA HEAD.
+	# The archive is intentionally Python 3.14/aarch64-musl specific.
+	install -Dm755 "$srcdir"/biscuit-va-leds.py \
+		"$pkgdir"/usr/bin/biscuit-va-leds.py
+	install -Dm755 "$srcdir"/biscuit-ring-fx.py \
+		"$pkgdir"/usr/bin/biscuit-ring-fx.py
+	# biscuit-ring.py imports this by name. It was on the device owned by NO
+	# package at all - `apk info -W` could not find one - so it existed only
+	# because someone had copied it there by hand, and the first flash would
+	# have left the ring unable to import it.
+	install -Dm644 "$srcdir"/biscuit_ring_config.py \
+		"$pkgdir"/usr/bin/biscuit_ring_config.py
+	# biscuit-va-leds.py and biscuit-settings.py BOTH do
+	# `import biscuit_services as services`, and this module was in no package
+	# at all. The running device had it installed by hand, so nothing showed
+	# until a clean flash: then va-leds died outright, and settings
+	# crash-looped under supervise-daemon while `rc-service status` still
+	# reported "started" and :8080 simply did not answer. A supervised
+	# service reporting started says the SUPERVISOR is up, not the child.
+	install -Dm644 "$srcdir"/biscuit_services.py \
+		"$pkgdir"/usr/bin/biscuit_services.py
+	# Apps, updates and Home Assistant status for the settings page, which
+	# imports it as `system` - the same way, with the same consequence if it
+	# is ever left out.
+	install -Dm644 "$srcdir"/biscuit_system.py \
+		"$pkgdir"/usr/bin/biscuit_system.py
+	install -Dm755 "$srcdir"/biscuit-voice-assistant.initd \
+		"$pkgdir"/etc/init.d/biscuit-voice-assistant
+	install -Dm755 "$srcdir"/biscuit-voice-assistant-wait.sh \
+		"$pkgdir"/usr/bin/biscuit-voice-assistant-wait.sh
+	install -Dm755 "$srcdir"/biscuit-va-leds.initd \
+		"$pkgdir"/etc/init.d/biscuit-va-leds
+	install -Dm755 "$srcdir"/biscuit-pipewire.initd \
+		"$pkgdir"/etc/init.d/biscuit-pipewire
+	install -Dm755 "$srcdir"/biscuit-mic-pump.initd \
+		"$pkgdir"/etc/init.d/biscuit-mic-pump
+	install -Dm644 "$srcdir"/10-biscuit-sink.conf \
+		"$pkgdir"/etc/pipewire/pipewire.conf.d/10-biscuit-sink.conf
+	# biscuit-mic-pump USED to be deliberately absent here, because it opened
+	# its own capture chain and took hw:0,2 before LVA could, leaving the
+	# assistant with no microphone. That objection died with the mic hub: the
+	# pump this tree now carries runs biscuit-call-pump.py, declares
+	# `need biscuit-mic-hub`, and publishes only the call branch while LVA reads
+	# the separate assistant socket. The hub alone owns the hardware PCM.
+	#
+	# The stale pre-hub pump, and the stale pre-hub biscuit-mic-direct.sh beside
+	# it, were still in this tree until they were caught by diffing the built
+	# package against the r164 apk in the device's own cache. Leaving them in
+	# would have produced a device where the hub, the pump and LVA all opened
+	# hw:0,2 against each other.
+	#
+	# The runlevel symlinks are all created here and the assistant's two are
+	# moved into -voice below, because abuild's subpackage functions run after
+	# package() and can only redistribute what package() produced.
+	for _svc in biscuit-pipewire biscuit-voice-assistant biscuit-va-leds \
+		biscuit-usbaudio biscuit-audio-clock biscuit-mic-hub \
+		biscuit-mic-pump biscuit-direction; do
+		ln -sf "/etc/init.d/$_svc" "$pkgdir"/etc/runlevels/default/$_svc
+	done
+
+	install -d "$pkgdir"/usr/lib
+	# This archive is the canonical, syntax-checked live LVA source baseline.
+	# The peripheral discovery, command-event, device-master-volume, and
+	# disconnected-HA wake fixes are already integrated.  Reapplying the old
+	# transition patches here would either fail the build as reversed patches
+	# or risk partially reverting the source that was validated on hardware.
+	#
+	# biscuit-voice.lock.sha256 pins the two voice tarballs and the
+	# requirements lock. It is installed below as the bundle's sha256sums, so
+	# check it here: a repacked tarball with a stale lock fails the build
+	# instead of shipping a manifest that describes some other bundle.
+	( cd "$srcdir" && sha256sum -c biscuit-voice.lock.sha256 ) || {
+		error "biscuit-voice.lock.sha256 does not match the voice tarballs"
+		return 1
+	}
+	tar -xzf "$srcdir"/biscuit-voice-venv.tar.gz -C "$pkgdir"/usr/lib
+	patch -d "$pkgdir"/usr/lib/linux-voice-assistant/lib/python3.14/site-packages \
+		-p1 < "$srcdir"/biscuit-lva-processed-mic-profile.patch.txt
+	# r108: wake-input AGC plus the direct capture command. Verified to
+	# reproduce the validated live files byte-for-byte from this baseline.
+	patch -d "$pkgdir"/usr/lib/linux-voice-assistant/lib/python3.14/site-packages \
+		-p1 < "$srcdir"/biscuit-lva-wake-agc-direct-input.patch.txt
+	# The device-master-volume fix above is described as integrated into the
+	# venv baseline, but only its peripheral_api.py and __main__.py halves
+	# actually are. Without this, entity.py still sets both mpv players to
+	# the device volume percentage, applying the user volume a second time
+	# on a cubic curve - 50% measured -18.06 dB on top of the DSP taper.
+	patch -d "$pkgdir"/usr/lib/linux-voice-assistant/lib/python3.14/site-packages \
+		-p1 < "$srcdir"/biscuit-lva-entity-master-volume.patch.txt
+	# Cosmetic, but it was drowning the log: MediaPlayerEntity warned on every
+	# broadcast command meant for another entity, so ordinary Home Assistant
+	# use produced a warning per switch, number, select and light command.
+	patch -d "$pkgdir"/usr/lib/linux-voice-assistant/lib/python3.14/site-packages \
+		-p1 < "$srcdir"/biscuit-lva-quiet-broadcast-warning.patch.txt
+
+	# The venv baseline plus the four patches above does NOT reproduce what runs
+	# on hardware. Measured: peripheral_api.py, entity.py, __main__.py and
+	# satellite.py all differ, and qualification_v1.py - which the deployed
+	# satellite.py and __main__.py both import - was missing from the package
+	# entirely, so a rebuilt tree could not even start.
+	#
+	# The most serious drift: the deployed __main__.py no longer carries
+	# --peripheral-host/--peripheral-port, because the peripheral WebSocket was
+	# moved off 0.0.0.0:6055 to a root-only Unix socket. Rebuilding from the
+	# baseline alone would REINTRODUCE an unauthenticated network service that
+	# can unmute the microphone and start a listening session.
+	#
+	# These five files are therefore the authority, copied last. They are the
+	# validated live source, and keeping them as plain files rather than
+	# patches means the next drift shows up as a reviewable diff.
+	# peripheral_transport.py implements the root-only unix socket the
+	# peripheral API moved to, replacing the old ws://127.0.0.1:6055. It was
+	# NOT packaged: the hardening shipped peripheral_api.py and __main__.py
+	# but not the module biscuit-va-leds.py imports at line 2708. The device
+	# had it by hand, so it only surfaced on a clean flash, as the SECOND
+	# ModuleNotFoundError after biscuit_services.py.
+	for _f in peripheral_api.py entity.py __main__.py satellite.py \
+		qualification_v1.py mpv_player.py peripheral_transport.py; do
+		# abuild flattens sources into $srcdir by BASENAME, so the lva-src/
+		# prefix belongs in source= and must not appear here.
+		install -Dm644 "$srcdir"/$_f \
+			"$pkgdir"/usr/lib/linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/$_f
+	done
+	# libmpv.py lives one directory deeper, so it cannot join the loop above.
+	#
+	# It and mpv_player.py were BOTH absent from this tree while the device ran
+	# modified copies of them - `apk audit` is what found that. They carry the
+	# ao/ device-prefix fix, without which a bare node name plays silently and
+	# wedges the voice pipeline, and the volume-curve fix, without which mpv's
+	# cubic taper turns device volume 50 into -28 dB instead of -10. A build
+	# from this tree shipped upstream's versions and lost both.
+	install -Dm644 "$srcdir"/libmpv.py \
+		"$pkgdir"/usr/lib/linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/player/libmpv.py
+	# models.py is the one changed LVA file with no lva-src/ copy: the venv
+	# baseline already carries the peripheral registrations and the patches
+	# above add the rest. Apache-2.0 section 4(b) wants a change notice in it,
+	# as the lva-src/ files carry. It goes first, or after a shebang or PEP 263
+	# encoding line if the file ever gains one. Every other file of the package
+	# that has no notice is byte-identical to upstream at b0c53c41c11e.
+	_lvamodels="$pkgdir"/usr/lib/linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/models.py
+	if ! grep -q "MODIFIED FILE" "$_lvamodels"; then
+		cat > "$srcdir"/models.py.notice <<-EOF
+		# SPDX-License-Identifier: Apache-2.0
+		#
+		# MODIFIED FILE. This is a changed copy of
+		# linux_voice_assistant/models.py from OHF-Voice/linux-voice-assistant
+		# at commit b0c53c41c11e,
+		#   https://github.com/OHF-Voice/linux-voice-assistant
+		# licensed under the Apache License 2.0 (LICENSES/Apache-2.0.txt).
+		# Changed by liamtw22 and contributors, 2026, for the Amazon Echo Dot
+		# (2nd gen) postmarketOS port. The upstream copyright is unchanged.
+		# Changes: sensor, switch and number registrations for peripherals;
+		#   the processed-microphone profile; wake-input gain and AGC settings;
+		#   atomic, locked preference saves (biscuit-voice-venv.tar.gz,
+		#   biscuit-lva-processed-mic-profile.patch.txt and
+		#   biscuit-lva-wake-agc-direct-input.patch.txt in pmaports-biscuit).
+		EOF
+		awk 'NR == FNR { n = n $0 "\n"; next }
+			!done && !((FNR == 1 && /^#!/) || (FNR <= 2 && /^#.*coding[:=]/)) { printf "%s", n; done = 1 }
+			{ print }
+			END { if (!done) printf "%s", n }' \
+			"$srcdir"/models.py.notice "$_lvamodels" > "$_lvamodels".new
+		mv "$_lvamodels".new "$_lvamodels"
+		chmod 644 "$_lvamodels"
+	fi
+	# A rebuild that silently drops the socket fix is the failure this guards.
+	if grep -q "peripheral-host" "$pkgdir"/usr/lib/linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/__main__.py; then
+		error "LVA still exposes the peripheral API on a network socket"
+		return 1
+	fi
+	# PROVENANCE: TensorFlow Lite 2.17.0's C API, built by this project for
+	# aarch64/musl, with its Abseil, fft2d, farmhash, cpuinfo and pthreadpool
+	# libraries beside it. Apache-2.0, MIT, BSD-2-Clause and Ooura's licence,
+	# plus Eigen compiled in under the MPL-2.0 (weak copyleft, per file).
+	# Nothing in it is Amazon's. It is built rather than fetched because both
+	# wake engines ship an x86-64/glibc libtensorflowlite_c.so that cannot
+	# load on this target at all. The tarball carries THIRD_PARTY_LICENSES/
+	# with every component's licence, the pinned commits and the build steps.
+	install -d "$pkgdir"/usr/lib/biscuit-tflite
+	tar -xzf "$srcdir"/tflite-aarch64-musl.tar.gz \
+		-C "$pkgdir"/usr/lib/biscuit-tflite
+
+	# Make both wake engines' absolute-path loads resolve to the one verified
+	# aarch64-musl build shipped directly above; the init service exposes its
+	# dependencies through LD_LIBRARY_PATH as well. Their upstream x86-64
+	# glibc copies are no longer in the venv tarball (r294), so pyopen_wakeword
+	# gets a link where it had a file.
+	for _wake_lib in \
+		"$pkgdir"/usr/lib/linux-voice-assistant/lib/python3.14/site-packages/pymicro_wakeword/lib/libtensorflowlite_c.so \
+		"$pkgdir"/usr/lib/linux-voice-assistant/lib/python3.14/site-packages/pyopen_wakeword/lib/libtensorflowlite_c.so; do
+		ln -sf /usr/lib/biscuit-tflite/libtensorflowlite_c.so "$_wake_lib"
+	done
+	# openWakeWord's pretrained wake-word models are CC BY-NC-SA 4.0
+	# (non-commercial) and were removed from the venv tarball in r294; the
+	# assistant runs microWakeWord. A venv rebuilt with pip brings them back,
+	# so refuse to ship them. See THIRD_PARTY_LICENSES/README.txt in the venv.
+	if find "$pkgdir"/usr/lib/linux-voice-assistant \
+		\( -path '*/wakewords/openWakeWord*' -o -name '*_v0.1.tflite' \
+		-o \( -path '*/pyopen_wakeword/models/*' ! -name melspectrogram.tflite \
+		! -name embedding_model.tflite \) \) | grep -q .; then
+		error "openWakeWord pretrained models are back in the voice venv"
+		return 1
+	fi
+	install -Dm644 "$srcdir"/biscuit-voice.requirements.lock \
+		"$pkgdir"/usr/share/doc/$pkgname/voice-bundle/requirements.lock
+	install -Dm644 "$srcdir"/biscuit-voice.lock.sha256 \
+		"$pkgdir"/usr/share/doc/$pkgname/voice-bundle/sha256sums
+
+	# sendspin: the network-speaker application. Same shape as the voice
+	# bundle - an aarch64-musl virtualenv against this image's Python 3.14,
+	# archived rather than pip-installed at build time because Alpine's
+	# builder has no network during build(). It was hand-installed until now,
+	# which meant every flash silently deleted 141 MB of working application.
+	tar -xzf "$srcdir"/biscuit-sendspin-venv.tar.gz -C "$pkgdir"/usr/lib
+	# Ask Music Assistant for the visualiser and colour roles. The daemon
+	# hardcodes [Roles.PLAYER], so nothing ever requested them - the server
+	# supports both and grants them immediately when asked. The roles must
+	# sit on the PLAYER: a standalone visualiser client is granted them too
+	# but never gets a stream/start, so every frame is dropped before the
+	# callback. Measured both ways.
+	#
+	# Named .diff, NOT .patch: abuild's default_prepare applies every
+	# *.patch in source= against $builddir, and this one targets the venv
+	# extracted here in package() instead. As a .patch it failed prepare
+	# with "4 out of 4 hunks ignored" before the build even started.
+	#
+	# --fuzz=0 deliberately: if a sendspin update moves this code the build
+	# must FAIL here rather than quietly shipping a player with no
+	# visualiser, which is exactly the kind of silent regression that is
+	# hard to notice from the outside.
+	install -Dm644 "$srcdir"/biscuit_sendspin_viz.py \
+		"$pkgdir"/usr/lib/sendspin/lib/python3.14/site-packages/biscuit_sendspin_viz.py
+	( cd "$pkgdir"/usr/lib/sendspin/lib/python3.14/site-packages \
+		&& patch -p1 --fuzz=0 < "$srcdir"/sendspin-visualizer-roles.diff )
+	# The server advertises seek and seek_relative, which the vendored
+	# MediaCommand enum does not have; one unknown member discards the
+	# whole server/state message. Same --fuzz=0 reasoning: if an update
+	# adds them upstream this must fail here, not apply somewhere else.
+	( cd "$pkgdir"/usr/lib/sendspin/lib/python3.14/site-packages \
+		&& patch -p1 --fuzz=0 < "$srcdir"/sendspin-media-commands.diff )
+	# The visualiser on the client-initiated path too (r280): the roles
+	# patch attaches it only where the server connects in. Generated against
+	# a tree with both patches above applied, so it goes last.
+	( cd "$pkgdir"/usr/lib/sendspin/lib/python3.14/site-packages \
+		&& patch -p1 --fuzz=0 < "$srcdir"/sendspin-client-visualizer.diff )
+	# Apache-2.0 4(b): a file we changed says so, at the top where it is seen.
+	for _f in aiosendspin/models/controller.py aiosendspin/models/types.py \
+			sendspin/daemon/daemon.py; do
+		sed -i "1i # Modified by liamtw22 and contributors for the Echo Dot 2 port (sendspin-*.diff in pmaports-biscuit)." \
+			"$pkgdir"/usr/lib/sendspin/lib/python3.14/site-packages/$_f
+	done
+	install -Dm755 "$srcdir"/biscuit-sendspin.initd \
+		"$pkgdir"/etc/init.d/biscuit-sendspin
+	# Finds the Music Assistant server over mDNS so sendspin can connect out
+	# to it (2.31, r280). Runs on the venv's Python, which has zeroconf.
+	install -Dm755 "$srcdir"/biscuit-sendspin-server.py \
+		"$pkgdir"/usr/bin/biscuit-sendspin-server
+	# Routes sendspin volume to biscuit-audio, so there is ONE device
+	# volume. Without it sendspin attenuates inside its own stream, the
+	# volume ring never lights, and the slider, Home Assistant and the
+	# actual loudness disagree.
+	install -Dm755 "$srcdir"/biscuit-sendspin-volume.sh \
+		"$pkgdir"/usr/bin/biscuit-sendspin-volume
+	# Stream start/stop: wakes the codec (the DSP releases it after ten
+	# seconds of silence, which swallows the start of the next track) and
+	# shows the music animation on the ring.
+	install -Dm755 "$srcdir"/biscuit-sendspin-stream.sh \
+		"$pkgdir"/usr/bin/biscuit-sendspin-stream
+	# The backstop behind connecting out (2.31): restarts sendspin when it
+	# has had no Music Assistant connection for two minutes, or has crashed,
+	# backing off to hourly.
+	install -Dm755 "$srcdir"/biscuit-sendspin-watchdog.sh \
+		"$pkgdir"/usr/bin/biscuit-sendspin-watchdog
+	install -Dm755 "$srcdir"/biscuit-sendspin-watchdog.initd \
+		"$pkgdir"/etc/init.d/biscuit-sendspin-watchdog
+	ln -sf /etc/init.d/biscuit-sendspin-watchdog \
+		"$pkgdir"/etc/runlevels/default/biscuit-sendspin-watchdog
+	ln -sf /etc/init.d/biscuit-sendspin \
+		"$pkgdir"/etc/runlevels/default/biscuit-sendspin
+
+}
+
+voice() {
+	pkgdesc="Voice assistant for the Amazon Echo Dot (2nd gen)"
+	# The linux-voice-assistant fork (Apache-2.0, modified - lva-src/) and a
+	# virtualenv of third-party packages, each with its own licence text
+	# shipped in the bundle. The copyleft ones are zeroconf (LGPL-2.1+),
+	# autocommand (LGPL-3.0), python-mpv (GPL-2.0+ or LGPL-2.1+), the GCC
+	# runtime bundled in two wheels (GPL-3.0+ with the runtime exception) and
+	# Eigen in the TFLite build (MPL-2.0). The LVA sounds are CC-BY-4.0, and
+	# Ooura's FFT (in TFLite and WebRTC) has its own permissive notice.
+	# PROVENANCE.md enumerates every distribution.
+	license="Apache-2.0 AND MIT AND MIT-0 AND BSD-2-Clause AND BSD-3-Clause AND PSF-2.0 AND MPL-2.0 AND LGPL-2.1-or-later AND LGPL-3.0-only AND (GPL-2.0-or-later OR LGPL-2.1-or-later) AND GPL-3.0-or-later WITH GCC-exception-3.1 AND CC-BY-4.0 AND LicenseRef-Ooura"
+	# An application, not the device. Core is a working Bluetooth speaker with
+	# a settings page; this is what makes it answer to a wake word. Offered as
+	# a checkbox during first-boot setup - see biscuit-apps.json.
+	#
+	# mpv the PLAYER is NOT here: it stays in core by decision, as the obvious
+	# backend if core ever gains a media player of its own. mpv-libs IS here,
+	# and the two are separate packages in Alpine: core's `mpv` installs the
+	# CLI, while the venv's `mpv.py` dlopens libmpv.so and fails at import with
+	# "Cannot find libmpv in the usual places" without it.
+	#
+	# THE VENV IS --system-site-packages, SO SOME IMPORTS RESOLVE OUTSIDE IT.
+	# openblas and libstdc++ were declared because they come in behind numpy and
+	# the TFLite runtime - but the things they sit behind were never declared
+	# themselves, so a clean install of this subpackage crash-looped on
+	# ModuleNotFoundError. Every entry below was verified by REMOVING it and
+	# watching the assistant fail, not by reading the old install recipe:
+	#
+	#   py3-numpy    numpy resolves to /usr/lib/python3.14, not the venv
+	#   py3-aiohttp  likewise
+	#   py3-ifaddr   the venv HAS zeroconf, but zeroconf imports ifaddr, which
+	#                it does not vendor - py3-zeroconf is NOT needed and pulling
+	#                it in was what accidentally satisfied ifaddr before
+	#   mpv-libs     libmpv.so for the player binding
+	#
+	# portaudio is deliberately absent: the recipe this bundle came from listed
+	# it, but nothing in the venv links or imports it - soundcard talks to
+	# PulseAudio through cffi. Verified with readelf and an import sweep.
+	depends="$pkgname=$pkgver-r$pkgrel openblas libstdc++ py3-numpy py3-aiohttp py3-ifaddr mpv-libs"
+
+	# NOT biscuit-va-leds.py. That file is imported as a LIBRARY by
+	# biscuit-settings.py, biscuit-ring.py, biscuit-earcon-map.py,
+	# biscuit-earcon-args and biscuit-netcfg.py - moving it would take the
+	# whole :8080 settings page with it. Only the SERVICE moves: the
+	# peripheral agent talks to the assistant's websocket on 6053/6055 and has
+	# nothing to talk to without it.
+	#
+	# Core keeps working without this subpackage because biscuit-settings
+	# publishes /opt/persist/led-anim.env at start-up, so wifi.start,
+	# biscuit-setup.sh and biscuit-btring still resolve their animation names.
+	amove usr/lib/linux-voice-assistant
+	amove usr/lib/biscuit-tflite
+	amove usr/bin/biscuit-voice-assistant-wait.sh
+	amove etc/init.d/biscuit-voice-assistant
+	amove etc/init.d/biscuit-va-leds
+	amove etc/runlevels/default/biscuit-voice-assistant
+	amove etc/runlevels/default/biscuit-va-leds
+	amove usr/share/doc/$pkgname/voice-bundle
+}
+
+sendspin() {
+	pkgdesc="Network audio speaker (Music Assistant target) for the Echo Dot"
+	# Sendspin (Apache-2.0, patched by the sendspin-*.diff files) and its
+	# virtualenv, each distribution with its own licence text. The copyleft
+	# ones are textual-image (LGPL-3.0+), Unidecode (GPL-2.0+) and orjson's
+	# MPL-2.0 part. Pillow's LICENSE covers the image libraries its wheel
+	# bundles (FreeType, libjpeg, libpng, libtiff and others). PROVENANCE.md
+	# enumerates every distribution.
+	license="Apache-2.0 AND MIT AND MIT-0 AND MIT-CMU AND BSD-2-Clause AND BSD-3-Clause AND MPL-2.0 AND LGPL-3.0-or-later AND GPL-2.0-or-later AND FTL AND IJG AND libpng-2.0 AND libtiff"
+	# An application, not the device - and the largest single component here at
+	# about 141 MB installed. portaudio is its audio backend and nothing in core
+	# uses it, so it comes with this rather than with every install.
+	# py3-zeroconf: the venv is built with include-system-site-packages, so it
+	# resolves this from the system rather than carrying its own copy - and it
+	# was never declared. sendspin crashed on every start with
+	#   ModuleNotFoundError: No module named 'zeroconf'
+	# from aiosendspin.client.listener, which is imported before anything is
+	# logged, so the service looked started and simply never served.
+	#
+	# This does NOT contradict the voice bundle above, which says py3-zeroconf
+	# is not needed. They are different venvs: the VOICE venv vendors zeroconf
+	# and only needs ifaddr behind it; the SENDSPIN venv does not vendor it at
+	# all. Check the venv you are actually shipping, not the other one.
+	# ffmpeg-libs: av is built FROM SOURCE against the distro FFmpeg rather than
+	# installed from the PyPI wheel, which bundles its own copy including
+	# libx264 and libx265 and a --enable-gpl libavcodec. That made this package
+	# a redistributor of GPL binaries with no corresponding source, for three
+	# AUDIO codecs: flac in, flac out, opus out. Linking the distro build instead
+	# leaves the GPL libraries to Alpine, which already ships them here for mpv,
+	# and drops 23 MB from this package.
+	depends="$pkgname=$pkgver-r$pkgrel portaudio py3-zeroconf ffmpeg-libs"
+	amove usr/lib/sendspin
+	amove etc/init.d/biscuit-sendspin
+	amove usr/bin/biscuit-sendspin-volume
+	amove usr/bin/biscuit-sendspin-stream
+	amove etc/runlevels/default/biscuit-sendspin
+	amove usr/bin/biscuit-sendspin-watchdog
+	amove etc/init.d/biscuit-sendspin-watchdog
+	amove etc/runlevels/default/biscuit-sendspin-watchdog
+}
+
+pulseaudio() {
+	pkgdesc="PulseAudio Configuration Files"
+	license="MIT"
+	install_if="$pkgname=$pkgver-r$pkgrel pulseaudio"
+	install -Dm644 "$srcdir"/pulse-daemon-biscuit.conf \
+		"$subpkgdir"/etc/pulse/daemon.conf.d/daemon-biscuit.conf
+	install -Dm644 "$srcdir"/pulse-default-biscuit.pa \
+		"$subpkgdir"/etc/pulse/default.pa.d/default-biscuit.pa
+}
+
+nonfree_firmware() {
+	pkgdesc="Owner-imported vendor firmware in the initramfs"
+	# MIT: this ships only our mkinitfs list. The firmware it names is the
+	# owner's own, imported from their device, and is never in this package.
+	license="MIT"
+	#
+	# This ships NO firmware. It ships the list that tells mkinitfs to put
+	# the owner's own imported firmware into the initramfs cpio, which is
+	# the only place the FPGA and Bluetooth drivers can reach it: they are
+	# built in and ask at t=0.61 s and t=0.93-1.00 s, while the root
+	# filesystem arrives at t=7.4 s. The kernel unpacks the initramfs at
+	# rootfs_initcall, before device_initcall, so a copy in the cpio is in
+	# time and a file on disk is not.
+	#
+	# Installing this alone does nothing useful. The owner must also run
+	#     biscuit-import-assets import <export> --profile firmware
+	# and regenerate the initramfs. Without it the device boots with no
+	# audio and no Bluetooth, which is the intended, visible failure - the
+	# FPGA carries the I2S passthrough.
+	install -Dm644 "$srcdir"/30-biscuit-firmware.files -t \
+		"$subpkgdir"/usr/share/mkinitfs/files
+}
+
+sha512sums="
+aa689eb98eff269fb032d5924af673b1649b014e6c0c50879bf76a60f70c35726d89b36a5124b5d61476051c388f5728760ce26373751164e79880c74f7703a0  deviceinfo
+d8c118cf09078c1ce5c39ccd5fd0294306a02f6adf4c9d84d1a6b00824832f36123161c57ec3d8dd2e15c27eb6819cd51c4a8a63d2871280007c9b997f6219b0  05-boot-rw.hook
+dbc3f0430969098990e685ce7822af28ec9610e86cb395719b50daf3d3cb28f856b498734bbbbf48eca00dd9f03a6a6a57b7e8bb9e281a01d8459813a870dc07  dtb-mtk-wrap.hook
+ab43627d475b8a28caf768e37facb44990300e6a0cee2fca045e4c3f9e64a63308eb0593e60acb162550df145ace60a0d03ce6e85fe62065c9ac3e7d655f3c04  kernel-cmdline.conf
+aa74426dfd73c8ccb807b3b996f1766f97d7e1a0025260bd1f5bd7ad0c2ec3f4786d8dc721bcb3678d74e46231d6fc140fe07f244290ce2c99b8c35746b35649  asound.conf
+acc93ffeaa7dc8e57af7432dba2aee5ec339166064d898d0db1c1d8f0ad887fb6ab986168d145b739cabd04e15f59484ec037487511cc1f0a0e31ab94e6189f7  pulse-daemon-biscuit.conf
+d66d6f2129f8aef4449137a1506fb3b3a1275c98502238537ac4dd0c174145706bac971e7e100d3599c9b8aa9c62319c302884d39aad5ba99c9bdcbe1e54bc23  pulse-default-biscuit.pa
+ba4a172f986f2fca7e7d3a24b944e6772e4d2e1e12f59d881c52aba1f9d79624aae9a8f8bd3322ec5ef019c0b53b43e52516d25caa852fa89daad73bc714e592  HiFi.conf
+1e61dc5b3fb05fd4c83164851617d3da5901f0c29f55478f4559e95b58ab5349dbad3da87ac75797177d8fc3bd943b0e08ddf595421a08e1bdf497afadbe7140  mt8163_biscuit.conf
+e9cb4797a3a2e0c3dc1460601a64dc7c779a04cdf8333ecded2abf20cc0bd8f7119864b18afead824933178c3428658cd89dd5c1fa82abc33e640e6463d2e34f  wifi.start
+429a9aca6077ca11e49cad71b7ce59a9dcee64b06a40b67b82f3e6e039d5e36fea2141950eee145a4685086c3ef93055dc7b42a159cc8cbc77ae698ebd649b46  zz-boot-done.start
+561d7274fe9e20ad110efb3a1b95b84112ba1542d4696b59183753c792564c73a49f5e0a106cda9f1b5dcb73a451a4cb982b491eae802a5cd3700d57c7e3eb2b  biscuit-als.py
+2eb2d145f77414483d78d026efcf4b6860e17212ae95f33ffdc3a4f4a175ca22cf5f1767de03820b3dc0407335bd8b8de08ba4fd2305f4bb7fd9cdadfa3863e8  biscuit-ring.py
+40046a58b1f4dfbad829e67efbfcc290b52336764e3f4118aeebd4f01697c56ac9b3b323fbf1673e15723190fba63ca384a5727ed44f1cd26650e3407c6a271d  biscuit-audio.py
+8cadfae159798599675b0e0feca3e63a4aedd6533f32685b77b66ddfee583898aa87bb4c30594c2402bf00baa587f9446de9b8e9231fe9b7400b488e16037acd  biscuit-btring.py
+a9ec1d0b7866e5f10223ea9d0f6a545e8fdecb39dbaf970e21ad437597a44ecb0c369f5bc3e00b74dd20f0d1de10e768bfb8ce87b272977f292e10002b8c6fe7  biscuit-als.initd
+7056fd952961a88be4480eb84c23b419a9a22a9dc2aeb3bf9c09727d954470af956e6a92131b87c5d4ec94fc4f97578ac0518e82d6844e698920da34f99a8ca4  biscuit-ring.initd
+6f7e45c477accbf00f66c0980f74bab9d04733ef83f36490b0134195e08209bc3a737fe9d992155e91dce840e8177c51b6aa661e2b7754f67e3c716a75c7ffa2  biscuit-audio.initd
+712474e0da0d99f7fda040efc795fa88a30a670a654027a15a17d451b2d23be7b49e37f26edad4d3bf7ae6b55f8552d88ec89a0cc54c32b9177933beb6002ac0  biscuit-btring.initd
+0ddee6b5328058cb73d2b1985e85a064d38c20558c7c6a77c1fa66e38f876d030473bfc65b4100fec9c7bf1fad52c7ce80c2988127fb3158834a83fde85658bf  biscuit-btaudio.sh
+24c2a37b6777080ec6eb6f091d85c1a5c3083f52e1625bce77cb531b8c5349263854ea4afa37fec0797017117906e6ef1254a660f6680f9c1751a28d1e672a1d  biscuit-btaudio.initd
+f2e260df03178abf7cd5642729f6bfe9f32e6e9afe4257be1a6ec427391f6b5494a6067da3b26c362e4cc8e94531ef1368aba714387e52ecff20e6a783a944ba  biscuit-setup.sh
+ce517e42ca7c17ec6dccaa9e1ff7741aa0fe74ef8bfb40198d0c2a02566430f07a4c07d15baaf5561be6aca55125e14c24266e2f0e8a2a4ba4fc1c4366090233  biscuit-earcon-map.py
+859e8ef274932ca8e68ec0515527307af9bd35597f9b2184375231e52dbf4e880978d399e903dc5cd4d025a96248fcbf2de5d920c8b191f3e1c34a67ae6c931d  biscuit-earcon
+841e62f049983c354d153f3873c139f6f4b4a7accc70218cbc134cfc263c48a25a1eebe530c29768dbca9a115948e9e5bb41fd5b09fa44178a3ed38b5f48d4af  biscuit-earcon-args
+9ae3e1c68d51124df1280436ee3325b509738e4251d79c29106d5db995e2af89427694eb6ee7dca0675e01c5e45a223d971bd4a66b6998bc823e4e41f43a0971  biscuit-silence.wav
+03ef53c970e9c9bd8f74dc767052c14dee9c974a7d61805837d12df9954472240a2d5d8ad7163f1e2fa7d146d8b76d457e7984912fe088553b6e92ac870f68e1  biscuit-miccal.py
+b14629d688c93cf3e56028f9ba2d8c8090ebe10f742a93baddfd011e45334ffc3a81864ea3607c317cd42047c8c0336a2ea92cce911bb0beef640573ba1bf8ef  biscuit-settings.py
+98eae1fb2401266a86673615c03aba615a6705ea401f759f53397eb7f3e9d86a5c65f996d519d7ad25ff214fa96b4a7664b4ba5cd2f2b00d89003e5c1f9e6fd8  biscuit-netcfg.py
+7aa697a7d0ece2dfc104ccc9dc6319cb2e95682f2e330146065c39df31dcddd9161877fdaf5959db71a4f10c550b7dc9e6cf51077faf783053fe7cc005b77330  biscuit-btcast.sh
+5169baea2ff90e73f348818acef3ca8c97bfd725f7f170288768adfb26c5da721a25c7b765ea6eca37e4ab42c3ef5151b8d55bb1ed4367fad4465d097f420153  biscuit-btproxy.py
+b46d517a1e9ae68822df2637d31a4aafa744a6c24da747b7f1fc1886ae6e0f6a054d33bd2556389b6ac0640431fad150a45b93a873ab9b9d31cad0df8c263718  biscuit-btproxy-bluez.py
+15487942cd705b64fd33f2adb33cf7f3b1d2828be873b7bdbd42d512b2ad8de8c75e66b275b8abb5a784787415ffc2334246630bf80bc4d4adbf3ab664058861  biscuit-btproxy-active.py
+501ead875e87758469ce1e61560f79f082be1539f7ae323b01a57c9f43513386b92c2efb1d5e59d00e2b37137428cba31d7f384697199416892ab31676f8bd89  biscuit-btproxy.initd
+82e77e62a8bcc97a785e393efcf415a84b67fe8c0b829fe2971399d1afaee45a968b9d5797e028bceaf570109a84f6bd54fba08c2b078483169e0e5a86e4e99c  biscuit-btproxy.avahi.service
+598f3a7091857d6eeb64d185828f8ee08c1e52f3aa665a8ea90fe5adac7a53c4583e2f2a86d271ed6297a24e9b7aac95c5c69f4100da08bcd8de9c5e774200ee  api_pb2.py
+ceb146692bdddb9c3021350c77259d82788ee5ece26b22cf57d7eefed3fd3fcb602125d77b45367422d845b865a2211b4401403f0e71635dc5ce16e91ddc107b  api_options_pb2.py
+1b6238c98996ad32cd09d50fc8828de08fc8ae5dea641260904c65cd49bcc78a7097dcbf1656a40431e2bd29973f1ff12b41503cfb0756bf2865bb5ec82dd824  __init__.py
+5b75ca83b3a9fc170ada3108e3a25362afd563b445722e8855065be277b52e40475ae229674d936f9a53dbfa8c1a59d81ec626a7934c6ef1998b2f9639ab98e7  biscuit-btcast.initd
+49d7563f39613ab04f5171234113e895c979952fb5781baae721044832efc49068ca2bb61e02c70ed244e19da4158d3ad09556b376876661d6067ed13c151938  biscuit-timesync.py
+4b60201a8ae1156c1991008644bf3a509e6c6d5db25a104108ad9d5213c3ca060dd3bc44ddef49513863bf8f68d92dd82035b21c40e54a66a3c6d2ee2f5186fd  biscuit-timesync.initd
+5a4f161ab594ca776c3a6cb534f1769747fc98a82f9c99ec6c7db7311554a475f202fb0661222b65d43fa2bd6acdbd20d7bb2986263bdf00357da75537e7e159  50-biscuit-httpdate.conf
+4b46b3509cce2db5415653717671ef68c41c60630adf371692ea13b098b5229c7b308da025b358c67a03256fde09b9085dfabd7b160b2694905d41aa06367ee0  90-biscuit-audio-slew.conf
+c526b40ab01168a38d756079facc022792ada1a145c90ba3177aa33d4dd075cf387f152da3094909d5a483a25f7edf0c0c3f91bd2c2f661fabc0f37a89ffd878  biscuit-settings.initd
+735f9d33114a39af242e8bb8093f0c1db0338034fa6901a19b9c6ea334c5753c3f20fe10bc5a639433f4b398afb360212eedad5e05609a7398fffc37fdd28f16  biscuit-btid.initd
+89f307f516e9f05ba1ef0d0e84d7d66aa537f818fd515a4094c074d4fea5f43fa12baeb80971eacd1bb64ca3848b4025a1673827d19f1abf906ec2504ee426d1  biscuit-setup.initd
+2880ae53bd7865aa72626c8d2b353d252ae0ad0510cb890eaecd89c4e4acbb52f76bb14e78287930f147eaac22f47ea0a7d30c89387e1a59cc65b3f27aa04722  biscuit-dsp.c
+9c2c4723c008e182bb9361d8d243cb0fb2247034c43207224a6c21484db485b8004096f62b8874b1bed60012ac52f94647bc90001d1201a9750b26c7d2c21e17  biscuit-dsp.initd
+adf094d4b4b203bcff1cce17d28b8acb678b0b07faf831f247d241ad67cd4346500bc4a582a5d25a3bdfa7948a72fc16e48c20af4de97e93297787a74818d0ca  biscuit-mic-coeff.py
+e6cb7f91b733df58fbf3041d06f7b6ca681ae770abd6e3c0447dbc304a4f365a4af2dfc3ec10600bef8ac8b5a7400b05d8bd336498fddb4ae3905c10d8e61c98  biscuit-mic-coeff.initd
+fa3f1469db6d0b7077d29208217353a5ebe7bc28337f4960527ae0416c411b4b61cf00c2d15b275b245ebf858cf6fb4737fdf88f5726225af1a06afa6c337cfd  biscuit-persist.initd
+ad6aa6f4f69a90cb77a6a2586b58f34c1b46f706ec8988507bce6bfd27687c42588b9389d5107fc36b37d5ccc7fc19812bd875f694ab1261d76a7564f15d312b  biscuit-persist-account
+bd9146e4a867ba6b47c7bae345cd44868bdacccbaaceb1cd58bee02daa5970f027fb5891b4252ff657eb50c7cacb6127de33458fd627b611214d6a8dd0d103b3  biscuit-wheel-nopasswd
+7c5552ab4e158cfd1e34ef5991351c0d3f0439e60481055d5dcf73b2d306ebceea9078ef6d75f49726cd17d76f6f05a3656ae9eba0200d77034fd40d9307d909  biscuit-firstboot.initd
+d8d3913ec8affdd53a46b7965d2ca903c95a3f38c136a9acdda9cc5c8517af5fa5f4b3efc529ed3843086d8f5ba912b6fba89c4d214c80d37d6a2f7400d9b35b  biscuit-sshd.conf
+7e520760aea9521c62e66ad979b7520c2596b8cdf5d1f115248ac8bc556f397c98a512b2e3a5592268d51481d7de8067e5acc0d61813608c476343d8fb1505d3  biscuit-growroot.initd
+2691c17516396a918ab716dab5519a32570fe33e9190bc338914bfeefd2312dd4f45c60deabf4bef330b26ac5e0ef2f4d3eb84e474c75f6bdb9bfc9f78a38df3  biscuit-factory-reset.sh
+f32041c30ec81691184497ba3f1dcf1bd20666926eed245d525fcf21ffb382663f887d822b4a063913467a28a832aa957f7b10e05e324b2742d213f8e43adc63  snd-aloop.conf
+36311bbcdda3a4169b621c155fdb21b846812c7e6c765c6e3503bbc5526b6c50c8b68b6a2c33ec0c6339fbed63bd67efa31e1324e083dd0870c9acb12585da11  mbcl.conf
+9f83b3906a4bc94e04227a5cdf47fb0c811ed896b1504fabeecdd2da31b80a35aaa312a45f0a20a2c589538ff38c71f661bf83ff8a0996ac07a2da6288d8c93f  user-eq.conf
+cf5f4d8aa741c6d35d193761f34765a000f1c5b4c56f32e30a6c609d8a2fd6c5aafa17099a1d54b9fea1cdfa945f0fdea797a59866a8a27a7c0e56a8d76cab3b  biscuit_eq.py
+1f6385167b06eede4834ef72cf1cfabd9097ab9ae7f9d1cd06ea717da693995774d29ce632d88c5cf589604e4c416f87ea11e7d77c6bb18f3c7d73a7cf00138b  biscuit-portal.py
+e59783b0829f5e2e2e055cbbec7d85b865c58208d5b99df21297395f4e59a1d14a1129dd07efb81d5a2f7c554393ec44d1e90b70277fe583dce8589b4e1eda1c  nacl-fast.min.js
+749332b60226859af8e8ad619be1d3e61755b9796af9716f6a8e18d95f76b8a9ad31418945f76de5b7351db9848a28f40eafc9d01a90f538b0e5d72755e9f3cd  biscuit-apps.json
+bcbc4188cc5549e0f221727b59cc72a77b98e52cf4c80f4cd0b0c56a99ffbe1d08a58b1acf890af2f26b5da43486550622af3555137d8eaa6f92cb0572b9cfab  biscuit-reset.conf
+39f679bb50f6fd56d1ede56f5a0618785962a28b9de4865b322fcbd726a13939b1ece4c623116e3c94c0e1c56406d7cffdf271213fa2fb63b73fc68078a97998  biscuit-pkgjob.sh
+126132ea25d332c34213e11163f9a9589a928f754d70392d8d977c9baba4c27e6fef67cc9bd7e42df6361d15b606b60704e2f6130cc81191dd71b233ac609749  biscuit-boot-update
+daf9921acb046663b7f6b04f81fc3c8e77900922485e59f4f1473ecc555f4cd542825734c8e262a6616219f03070fbc22ca2095b8059808d6c5b69551a90328a  pair-session.sh
+80f7e76cab618ae6c963a652dc1be35421f1c083ac22317b7be57e7889c4213f8ddd3dde7889a584c6aa56527fecaa5348f3c4f5c9a8900e59e3adbb4e277437  device-amazon-biscuit.post-install
+07ab53b00f3949b3de3a48b13ca63609a6cc2396b46b18bf94a1c4e9ce156da507965deccfbe6804c703702f5e34c0903dca8656c0a87239188098b99d5f1b47  device-amazon-biscuit.post-upgrade
+902c34ab94a28e90e359f7caf292b2b4dc389aa9ccf698fcc10125acc6be2523c035ef56fdde34a6f240e1532b079fb2d455477831aa5aaf96c9f0ba2ef43520  device-amazon-biscuit.pre-upgrade
+6ea110460e9e8ce5ecf007c16380a441c2bb924eb02a06ecdebf94ba779c1782d677fb3c8503cc59ac70c8f2cf717b078a8109485b7780b059128c4d06d64459  biscuit-ring-priorities.json
+2f0bdcbb13c393d0e1e157ebb2b5fbdc2f8dd9cd15fb266b44fa00dd167692871fb32b2f079e0a2629c6b68008bc3ce7ff9e4c28134f8f6ebcb2deca23a1c112  biscuit-profile-assets.json
+25e6690e5f09c73dea2e385f440657d3b41013b9d89524b719e203b7cf3f5ead56a36c71b34fb32f0f6e2d61aa4aabe1c73b7ce252752fe878dfc5075436a08c  biscuit-setup-chime.wav
+169c31234bd6b288dd2385346bd528d7d4cf797d24e6b547122233f7986686dd516068a52a98819e1f9947ebec87b17e3252563d9eeaa5e8eef0af460004f716  biscuit-import-assets
+f74283c61d81699882ee198abcc174875425e7cffacbb67d99a8f11bfc5eaf24c200c7777019ab5c0b0a7939ceb43f6d9c2a27acecc107e67e386d4eb56ada17  30-biscuit-firmware.files
+3d6531ac1f42631f494e8d4bfa89fe09e09430cea0bda9e9dd81cca88121e4c4d883e4bdecfb6a39cdbb53992044a782abf44368569280bbfebe69d59cc27aa8  mdev-persistent-storage
+95847bd4c55dc30cfd2d3e3bd390c9d307cab2ee9e63fbd111496ba16a5b9217f5d597060b77d01023e1a5b596c8814e54799d74b7e936e19a0fcb11c14b98dc  50-device-amazon-biscuit-mdev.files
+ee20ba2e04bd2af46408cd63258324b76279df4bdf448705fb6d91af54259154dab6a6296957847fe133efd11e7a5397fc373a8f77cd110aaa588edc29735519  51-biscuit-regdb.files
+eb20101bf7152234b544c774e1aa42d6bc8a046654f59d399c32a97257d360b33a6c7fd35583692f7a1e17a6d9e0487f8beb87e1fb2a55f2afb7c5e23e2f058a  usb-rndis.initd
+5075a5715fa87d6cbd59da65f89c3df9c2a73ca11a0bdbc80ce18ce14bad54b18d4bb1de8f18e9c4348ecd104734d47789cd76329b72aec6ab8a6da306c766d4  udhcpd-usb.conf
+1186562d3bb2197d6392da0fe1bcd8003f02c25634c96854156a3e8f10eb1616b3ba1b6b928c4051d427982853185aefd22e60a8c52ed4250d559f7a0b237bb4  biscuit-beamform.c
+de584d32e61b9495d6ed41be4af074e76274e6ceec07ac0e5f6278b29fc7090aa602f07f5bd1b2e9614d2b272a7cd648b9dde3159c709f0a184b9b2389a74089  biscuit-fireos6-frontend.tar.gz
+cf056d44eb7a06847271b2a17756e2a2bb1985bda5fcce479777e8b95feec4ab5bee80aef04a1cc03440677888ef21d0b128c7a76ffb9f107ab9e77a639d2d38  biscuit-fireos6-open-array.patch
+c979143df8cb206d06249e777c49a17064cbe7d7bb5e8ab2e0d90310f5527cf84ae0166546ee5c1d23d187666e05cac63b406d62100bcc1f33c7fc34a93aa7b4  biscuit-btcall.c
+bc554edbbb044c77d0fc3462e87ceb8366183e835ac188b66531d96a653e532a7a08514ac70c5fdc36654863151b07a958fe44a73defadd320fcf5c884434b80  biscuit-call-dsp.c
+7812879804f0a37bbf256c721abcfeff5c9a9c2173e31f6220228aa2fc76e2e3aff8906c6ad453edacce1456187d19d9011324a27ceb1fea7bf2ae2714e7b610  biscuit-echo-reference.c
+c3c6a64b85f3a38ae22919afa7040ebbe239b73530df8303717b5c2ca29458040af99b3bcddccba77a3dab80fff24eb8f2cc9ea5fbcdf98f7d266d7250a24408  biscuit-echo-reference.h
+ccea3d9564471dd09504ce559b5b4d39f5b297d7e280ab640d8230cb99e7ede0dc6dc49c6758fa9bbee9e735a0eccbece42960d5536025bb829b6fd4486b84c8  biscuit-cvsd.h
+332d64218b9f998e77cd1a3c567b4687bffa08b4fbfcb0cbc5cfac5ff888515b1383dfe15680aae9886736e855b14b54967623a5cc2cac50c5b7eb45f5554923  biscuit-btcall.initd
+9ad092ff14de01850fe5600212e279aa5575d81e0c0746317eb68a5669513793ea1daeb97f86028e7c811f84be3963d5ed4f7381fd082b880e2c4718364031e5  biscuit-mic-stream.sh
+e2f6eaf49aae4b6820b94dc4a0136bcda6748daba39cb10c83bd111a10b297ddc7ebd37ad81b47329ef1acec19a589520471a2acad21446834f6cff36731d1c2  biscuit-mic-hub.py
+c476a12b7e8cf4fe1333831544c1d6f55c17599aa706f87ba25f6a0ab84645a4accc3b31700ce8f959be9084a3f403b0ac8e16b57e95ff607a1215bb2ee6afb5  biscuit-mic-hub.initd
+52e788e651ecb1c82ad63424d03bfbc543b1836544a84835e29ba3451c4e5dae8ea3b1d6937b220a5b5159a3e26b106464b9e1651fedc4039e35727c9cbb2952  biscuit-direction.py
+051653819326efe05ed5f27e0e7b561a19546d56c4825760c2809cb11bd133753618e329af8b59dadd039de7db606f4fac19c6dc5dc5c586ad8bf33e9f524a5d  biscuit-direction.initd
+5df1ad15d7ba6865291562b700206e5233bf5ca126d489bc44405f3a9b96219647ef4d6b3a7eed7d554c9c64468904ef032b36801f86bd2631dfb5d114f837f5  biscuit-usbaudio
+4b3ed9e80cb36572140ca1b821392024856e0de1e1a918cb73d21dd5b38603fc8ab42299bbd72e88c059ec43ab2c4d14a8c4f1d1bfc61d322ee139a498671c44  biscuit-usbaudio.initd
+58e271f04aea485eb2af905f66b4cfcea55b945432bad1a8a8b77a9ae001dbbd1867cb074c06e67ddbb77963be22bdcf4d19256e9a970fe0ce95a895ad925b64  51-biscuit-usb-gadget.conf
+88720d54da6e9521f519cc3f62be3cc932fe538dcfd8da5ac2851a349da1a65dcbff7cf351294885fc7eeedad0cc0d11613291c6c4058833f301a2baef067e75  52-biscuit-no-stream-restore.conf
+84f424c8fb2a0feb8c638f31a5acaffb8883b075edd0ac71bc5559bf1186e6b17cd4d8ca8e4d7eeaa24c9837130cdb8bcc839703090d819296626491330b1dab  ramoops.conf
+24a2874e7ad218daeabe3a1ee34b6605c368e68ed63162562209c44667239e2f30806104ec098ae0c96443dc4d931d472091f7cae7750e502094f823d9c8d8a6  biscuit-usbmode
+b4da992bf326228c612c1a2cca291fcd1c8f2c3485cfce3a8066d783e24d82867c24fe8344c5ce27d9f45dfd0b5da53af0db792d91acd1d95fbb8768ee983cef  biscuit-apk-cache-clean
+d7655f5f891d2b2cd67d96938f562234f60b3cc10b62971cb13b2ca3369400f4d9fae766e9925fac1a60ada407611e25b8c32a75e3ac3bb16632fe7436b4b440  biscuit-logcap
+7b8f351dc2b97e378f465a641c47f67483de56e026601f394bfce6391431fd8537eab5a842abf6473a29e4e524de08610b756c47e27d7ff6b3905a40feed46c7  biscuit-audio-clock.py
+5b72779e3b15d97521ce232c02ed4e51b29ce69a67286dc9ca521e6ac657bb195bbd8884cd72cfaea3c09be610a657af167c3b4ee4e4da6c8410a36a78dcd417  biscuit-audio-clock.initd
+5ca9aec3528da62f4f8c760778c6ad349600e8143b02c43a066d2c61a2b0c833f5729f1365816c1660c9289bbad1a1f2dd96885050096aa726fb4bffe27a103c  biscuit-audio-policy.py
+5408be5796db729aa77d03d17feddf439a6213c82720865d4a398e512c33cbb4a12a542af70f91adc8ecc09aa7a0654fd828701636baa127b6503b072da8c681  biscuit-call-pump.py
+6945f30ca644439baac6607236111766e7a3a729c72a281cba4d57a8f9a6b64e932d1edc4a5bac1b303ec09849d8f4ace63bbb32d1a7b1045a15f41fd73f282c  biscuit-mic-client.py
+a6b11dbfa56a65e72c1e33ed8305e2408bc4246eada386b0bb8fc379480c3a071927f36265d5af8d456125d668cbd32ab609f2cfd1045896c255b2b7ea298e61  biscuit-mic-restart.py
+241f75a2e118a174b38fd58e5485d7b0b8428b3f0188488ae0cf7666b4c0cedd8448e893fe38e596ec7bc09ec965e096d020523805edcbd95343b2fe109236e9  biscuit_call_profile.py
+a82293043e5387af990228a59ae5de28aa7a425e088f0f49898b9c19798ae714aee53f83d18fe0e2384302dba1833cbe8bc8031e3b3955b37639637a48526431  biscuit-mic-direct.sh
+aa95c3d416b73062178f9021112684cc00e2fcbf276d972d7067adc4c02d8e9f9bbef4ec75c7bfcb5fc6290c08afd08cb10fdf8e775181dc7e676c72c72da46b  biscuit-beam-weights.bin
+92ff0b771b5e6e79d36e37efc5e88c40571dd180cb19efc8a4fd784fd343c83e8b55ff2c12ec303825f540f114b50c75f4398751f83123fa1972f29f9a12d75e  biscuit-apk.rsa.pub
+e53d49b335da2e1255424392a03abbc7cd1b66cccd3cb3836a1c586e5725f08c91502a7e4fb92e59baa1d27a1326bc63aa39a7b819893cfdf64305c45623ceaf  biscuit-beam-weights-stock.bin
+47b4801580ab8cb964bd86e3a37aa96fd8840a3c764d1f6dfe0ec60fd36a979b5b84db060aebd9ca6e7564dcfe01e414242cc80e4bc0f0fd1faa5ca0bf2cdac4  interfaces
+a097a7ebfc11e0ec7723656ef1667e8e4e8b7ed307fd2ae11ff39aea26472a2529e4c45839926c0c9c5278d54e33deb7c07fc799452f0de0126cec5c693c4dee  wlan-defer.conf
+c3f32e88a85cde435532c9a2dc1f047fe352acfb974ebf0ea3c9024cb1d004adac339bc74d0f311a62c862153ad0f4776785f5487a1ce85a48b30cf111352701  biscuit-voice-venv.tar.gz
+e6702e4495d353aa5ed08b71cc7c6085878cc177fd0356e36fd00d0bbc34d4e7b83e220c9c24eb6e71a6d7658f4f6fb3e281a159c47002749978b89bfebb498a  biscuit-sendspin-venv.tar.gz
+80c08408dc9bc7cc445357c49f99308ff3bcf2606c27d54b29d2ef3c40b13f243fa1d0194cf03957ea3e84e9676a2556aa2e483fc1b0cab08ce70651c49f867f  biscuit-sendspin.initd
+b5c24cfe5d75d5dbc3024dd09f67c6bb0e1f531d716cddd2de163eccbbccf19142f3a54d19b0a4011b19a9d35416e022de4c6e48833f76bbea562d3b8c6ec875  biscuit-sendspin-watchdog.sh
+13aa842ddcc869c93cd92614adc5e9583532c65cabeb917dea8c4820a05c399d88bb2df2e8e3914f3b8ecdc0fb405534ce5781a07cb76d6596ef78cfeb5960d3  biscuit-sendspin-watchdog.initd
+9c175690a836c505caffbfc1c2f68d2439c1d9712b390e53d305edd780279ccb2c9b460aa8d8e9ab6a4bbb1cce69189bd4f61f06d0f6f689c1849d3a497bbbe7  biscuit-sendspin-volume.sh
+5aec2adf532fa81c8bc072848bba677e0d955c7817e2ebe74c8d332778a9a2ecfb0629ca4a3e18ae5dcb74f66a1a6f9f4924b3d05af4328562dcb30f020fd359  biscuit-sendspin-stream.sh
+b1afde51f35eaa115fd8b0fcf38d633076eef4c36482c12316cdda154a8c25dd4142a851e87e8347b4a2db1ae0bf6ec7d639be0d8e69685ea4ff67642af52519  biscuit_sendspin_viz.py
+b82e4b7f02db22c49aea53e886beda23c2ac0ac6bd031850b35fc232cbcef6aed1f5228052f1e22198cb6afc87f357a7e9bc619b253a010edd4234ecbee03ce8  sendspin-visualizer-roles.diff
+432e916ba9ffbd2c7ac0337f095791045e0e4f216db6927604b5826fa5eb15382e87738dfd545015759d1c04c56bd86c4ccfd9b47ec2760af1e201aeb581151a  sendspin-media-commands.diff
+fc7584549ebf438f8c0b49ac4a5bd64612e4b7b917edc01456ccca89a9927bd9e1a60156daad1e698aca0a90e31f60d20f8abc518d9e19040c71e515190ca07e  sendspin-client-visualizer.diff
+8e57e0a0bb909b6be7fdb2b121f8237d2f9d026c365d1c8930a3c86bdf1594a53ec88a8927dedd5db5260007c1a915a2a2ae068f7d5899fa9abbcb18b7bfcfef  biscuit-sendspin-server.py
+86a38319681429d0c69f62b04838814e7b625bf8e51862f96946dfb028b2fc947ab93bd567e455f5e50ee9df15914f803238ab2894890f6f4e4f73100dc902de  biscuit-lva-processed-mic-profile.patch.txt
+a856b17731c50bb3646c8a89e96f61301cf5a321dec669f9bf37c39cd9e30070e97ced8f45e87200489bb01c8809a9e2b9b7fa2ae8e2c30c0b18fd39c6eb2ca9  biscuit-lva-wake-agc-direct-input.patch.txt
+419ef67aef68f217e65b790be7b9bfc3346992a2681e170a01bdc9b049e13f8764c0fcf70238d8bbb0a36c721484804f2f1c01920c286295f3a309fa7fd34cd8  biscuit-peripheral-discovery.patch.txt
+08c2c3cb4f6e9481064089fa684c09de8b29ac18059e678d60121b330b6ee14dda7d34fd1d7a422e505b0a585a0a0405199ab4708ff9e6a5a5fe9b9d709e400e  biscuit-peripheral-command-events.patch.txt
+a61d0c4cbebfd708dca10d6d47772607b85c29eeb06db46607a46586ee9bcb32315dcb3d093ecc64266f69acb7694f28af17682b54549ca25166ae782e6ce437  biscuit-lva-device-master-volume.patch.txt
+5e800dc640acaa1e370f2e2a2ade620dd25ff9935fa66089b8cc361633e654a8e18693c1ee161239425665c42364c4c2483b6af9094d8ed5d0c3541c8d612978  biscuit-lva-entity-master-volume.patch.txt
+afa8b6f7510f2e262320228b04ea6b0f28819c51ce9aa18ba1565fd1e7263ff71e6d262349a869f8d0515fcd36445d4cea2230d74a26ead467e7425371e22222  biscuit-lva-quiet-broadcast-warning.patch.txt
+5d783e0264af186c609030d097590a184a5d0674f460d7dbac6fb00824d249eb4bb9546996042ccb6b53aaa26b6e7e4216f942b5e4b5f71a8d5bf2062ebd7630  peripheral_api.py
+82a81d7b14057946e7889ddd4a381faeb8f1f41078c8ad7a17ff8417a6c7a58d1c56fc1f55c6f2606fa2497f6c38b2be294d93d52c1821f9fb0855487f9b0aad  entity.py
+4e8a8c9c8e97a0fb98e82eec33d584ae7a3fa35f9191ccb54e95af4cfccd17e4bbde306e2158448baa83b6cfa206f4c32f4a28d22a3c912331a6f0b1863f4c5b  __main__.py
+a6adf4cce03d220e31fdb69e18f6725544c22d14ddfb6f76cfd71b0e9c682707819a9f35d4c615c3333cd8f1ec6054d66ac5442642cde4943a0c2bec6158cd41  satellite.py
+b961e8a87e039d249446e448c925abb8cdf31ca80749c619f7a1cbeedeb891cc39e7d86cccb462046235af49e6a6b23a98ca96aa746c2d522e386fb7a31c7374  qualification_v1.py
+1e55f04109efe24b62d09da47139747956e2802d9c95b6dec5459d275b94ac8f452f26beef550dbcf577630c2d2d38eb0b153bbedbe82e96816c92ba42873ae7  peripheral_transport.py
+f1cb07a280c85cd73b6244cdadae8b5d4c7fc4e0062f69b13b4f26bd1512bf1d3701ef26cc06469c95ea1d2c2e20ffe35e6a615584b2367b92cd4f678cb2822b  mpv_player.py
+5f07e0943c3b459edea108b79c89355e95a6e78aa9eabea21e10d49b1186ddc00846a61ab9f651ae618b1175724e2f8fc4945b8d2916fd071f6db0c07df445c4  libmpv.py
+6c52c9df9bf47a64374af69d7adecb5d7910e4ac04298c20fdb0572462026b819a197ed004dcf6cafd3a055ab1e6ae781268f37d55045d8a591090c4a70b1fd0  biscuit-va-leds.py
+56b2e83867d1c9002392c8f2341c0ce67257aeff9619ec282abc7d7e5317b7e9f95043ab0a0b6cc789488889866b03583c9e85c0407f4559641188d713f93f22  biscuit-ring-fx.py
+ba08f5eabaa4ffcba25e7123c4def7ce3e6c574c9dffdefb31c88f54557ead9ffd8190c6fb28c60a6ea23f7bad89b626bc17af50cf3fe54d786cfe4ba6701910  biscuit_ring_config.py
+2865dc7fe8a445d15a7e8229df17a0be393cfbb42014fafd6cadd62d15b7407b64b89832d98d25dd139710e84577499c2ab2d23ce74e5c2baa5433059c465a9e  biscuit_services.py
+a366f374f71432afd6dab0fe62d4094f4c249a6b3e4c6bc70c2799872d294ad85a3ce6bf49eb6204b89277222bb796758e2baa05c9f794e0267317ad5b890ef6  biscuit_system.py
+4ae58e73084c143f71c98fee94728cadc6150aaa648c897738bdf984bf66b22db6775dadcfc858463092692d33f73de88b4fa9eb0e5c04c6876f860ba28c12ae  biscuit-voice-assistant.initd
+7ab07f402e561ce4859c4a9415721570250a8a08fa931aa29ec08c48cfe9ef830623036abc8a0cefb967cab57a5856f9b39d808790b61b03829f3569a15dc4ce  biscuit-voice-assistant-wait.sh
+d76f7aa7a6accc715af222416a1f3eb31f25ba28a9a32394f96e7f041e2fffc01861f162b063ee42dce5500f35e4ef7510717b14e266361a740c0d08ddd376fb  biscuit-va-leds.initd
+7640267e635f4c979b5b993451faa1b0559b6db217a916fe538d6507616e3aa587a2626929ae2042af12e7c3288ecc518998df2783bbbc64fd30fc09a12648bb  biscuit-pipewire.initd
+35cdf72ca7515333a88af56d06c84bb9a8cde6dff0fbf02fc69ff4dcb14a9bfb130a85a1e6509999fc2a6632cf3e398bfed876cc5f275e024b56ac4e825c1d14  biscuit-mic-pump.initd
+0d9cf798ba57fde449c7b00f82e7daa657379df1f81359298066be23b7bbef377309f77fd4cb4be1bfffcf32f4b66f98af5efe57370e3330d6c0b65f97b8d4ce  10-biscuit-sink.conf
+279865de89ae717980ef1fd626a6778b17f6760a7439d787410ab2dd35ff3fd0021c12c8daab49579b0b1608e81a3705b8370b90a55a3f8d4ef48486f7d99eed  tflite-aarch64-musl.tar.gz
+7628d33c2fdec953ba2a591bbd72f98080dcf59795296e9977dd09bbf0ba86c69ec59c97d05c0b69bd2d117a6256d40c2f62e37dca61ac04e9961adba841635f  biscuit-voice.requirements.lock
+df453cfc81d3d39cbb155269abbd425681cd569f4bd38b1a43f751d742e55fc5aa1589a8361b1bd1245df9bbc854a5c6a87173c9868b4b5dbfa7ac398c409599  biscuit-voice.lock.sha256
+2e5665d4317c8f66b0e632918e0b68328becbc023d5c9ee18dbff36c4693d5d2c3ff1b6ea8374c3ffde8f17589e4c783c24a17a0d0cd66ac96c8b97e38798011  qual-capture.py
+12d384a633778d8b021a45420507526bad4492bb56ced892d2082aa5672a03433f095026f2c3015cf94750c0a6ff1b089ce9e99e21ee063e203ba5080a0afcbd  qual-analyse.py
+"

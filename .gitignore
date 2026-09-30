@@ -1,0 +1,95 @@
+# Editor and interpreter debris
+__pycache__/
+*.py[cod]
+*.orig
+*.rej
+*~
+
+# Hand-made backups. There were 63 of these at first import: APKBUILD.bak-r51,
+# APKBUILD.before-dtb-second-*.bak and so on. They are what a repository exists
+# to replace, so they are excluded rather than committed and then deleted.
+*.bak
+*.bak-*
+*.before-*.bak
+# ...and the naming that slipped past those three: 26 kernel APKBUILD copies
+# called APKBUILD.r170-before-r171, APKBUILD.before-r219,
+# APKBUILD.r175-backup-20260810 and so on were committed, then deleted in r294,
+# along with a patch parked as 0121-*.patch.staged.
+APKBUILD.r[0-9]*
+APKBUILD.before-*
+APKBUILD.*-backup-*
+*.staged
+
+# Never commit, whatever a future .gitignore-less copy of this tree contains.
+# Nothing matching these was present at first import; they are here so that a
+# careless `git add -A` cannot introduce one later.
+key.txt
+*.pem
+*.p12
+id_rsa*
+id_ed25519*
+*_rsa
+*secret*
+*token*
+.env
+.env.*
+
+# Owner-imported stock firmware. These are proprietary Amazon files, extracted
+# by each owner from their OWN device, and must never be redistributed:
+#   coefs_FBF.cfg, coefs_FilterBank_640.cfg   Fire OS 5 chain
+#   AFE.cfg, coefs_FBFV2_*, coefs_FilterBank_*  Fire OS 6 chain
+#   vad_lite.tflite                           the stock DNN VAD
+# The importer verifies them by hash at install time; the repository carries the
+# contract, never the content.
+vad_lite.tflite
+AFE.cfg
+coefs_*.cfg
+# The speaker correction curve and its dynamics settings. speaker.fir was
+# Amazon's EQ_50.cfg with a new header, shipped until r293; from r294 the owner
+# imports EQ_50.cfg instead. mbcl.conf (ours, lowercase) is not matched.
+EQ_*.cfg
+MBCL.cfg
+speaker.fir
+# The Fire OS 5 pair were RENAMED off coefs_*.cfg and so slipped past the
+# pattern above and into the tree. Match them by the names they actually had.
+biscuit-stock-fbf.cfg
+biscuit-stock-filterbank-640.cfg
+biscuit-stock-*.cfg
+
+# Owner-imported stock ARTWORK AND AUDIO. Same rule as the configs above and
+# the same failure: the patterns there match by extension, and these arrived as
+# TARBALLS, so biscuit-earcons.tar.gz (4.3 MB of Amazon earcon recordings) and a
+# led-resources bundle full of Fire OS animations were both committed here
+# before anyone noticed. Neither is shipped any more - pmOS generates its own
+# effects and plays no earcon it did not get from the owner's own device.
+#
+# biscuit-led-resources.tar.gz is gone too: its last contents, two ordering
+# tables, were replaced by biscuit-ring-priorities.json, written from scratch.
+# It is matched here so a copy cannot come back.
+biscuit-earcons.tar.gz
+biscuit-led-resources.tar.gz
+*-earcons.tar.gz
+*.animation
+led-resources/
+earcon/
+
+# Captured audio and per-unit data.
+*.raw
+*.wav
+# Except the setup chime, which is ours: generated deterministically by
+# tools/make_setup_chime.py, and shipped so the setup page's device check
+# can sound before any earcon has been imported.
+!device/testing/device-amazon-biscuit/biscuit-setup-chime.wav
+# And 50 ms of digital silence (48 kHz stereo, all zeros), which is how "Silent"
+# is passed to the voice assistant: it takes each sound as a file path.
+!device/testing/device-amazon-biscuit/biscuit-silence.wav
+miccal*
+
+# MediaTek WLAN firmware. Owner-imported, not ours to redistribute, and the
+# device package's manifest carries only its hash. Kept out by name so a
+# careless `git add -A` cannot reintroduce it - which is how it got in.
+WIFI_RAM_CODE_8163
+WIFI_RAM_CODE
+ROMv2_lm_patch_1_0_hdr.bin
+ROMv2_lm_patch_1_1_hdr.bin
+i2s_to_spi_v34.bin

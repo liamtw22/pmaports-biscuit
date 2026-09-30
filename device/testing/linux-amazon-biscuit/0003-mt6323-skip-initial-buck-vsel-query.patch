@@ -1,0 +1,18 @@
+--- a/drivers/regulator/mt6323-regulator.c
++++ b/drivers/regulator/mt6323-regulator.c
+@@ -373,11 +373,12 @@
+ 	struct regulator_dev *rdev;
+ 	int i;
+ 	u32 reg_value;
+ 
+-	/* Query buck controller to select activated voltage register part */
+-	if (mt6323_set_buck_vosel_reg(pdev))
+-		return -EIO;
++	/*
++	 * Keep the bootloader-selected buck VSEL register layout during
++	 * initial MT6323 probe. eMMC depends on an LDO, not these bucks.
++	 */
+ 
+ 	/* Read PMIC chip revision to update constraints and voltage table */
+ 	if (regmap_read(mt6323->regmap, MT6323_CID, &reg_value) < 0) {
+ 		dev_err(&pdev->dev, "Failed to read Chip ID\n");

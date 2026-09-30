@@ -1,0 +1,60 @@
+Expose the ADC3xxx biquad and processing block selection
+
+The driver leaves the converters in PRB_R1, whose only filter is the
+first order IIR, and never writes the processing block register at all.
+The Biscuit microphone array wants the second order high pass the vendor
+uses, which lives in the first biquad and is only reachable from PRB_R2
+upwards.
+
+Add a control for the processing block, and coefficient controls for the
+first biquad of each channel. Both are plain register accesses; nothing
+here changes behaviour unless a machine actually selects a new block, so
+the reset default of PRB_R1 is preserved for every existing user.
+
+--- a/sound/soc/codecs/tlv320adc3xxx.c
++++ b/sound/soc/codecs/tlv320adc3xxx.c
+@@ -194,6 +194,15 @@
+ #define ADC3XXX_RIGHT_ADC_IIR_COEFF_D1_LSB	ADC3XXX_REG(4, 77)
+ 
+ /*
++ * First biquad of each channel. Processing blocks from PRB_R2 up run a
++ * second order section ahead of the first order IIR. Four further
++ * biquads follow at reg 24, 34, 44 and 54 (left) and 88, 98, 108 and 118
++ * (right); they are not exposed because no block selected here uses them.
++ */
++#define ADC3XXX_LEFT_ADC_BIQUAD_A_N0_MSB	ADC3XXX_REG(4, 14)
++#define ADC3XXX_RIGHT_ADC_BIQUAD_A_N0_MSB	ADC3XXX_REG(4, 78)
++
++/*
+  * Register bits.
+  */
+ 
+@@ -812,15 +821,26 @@
+ 	SOC_ENUM("Dither Control DC Offset", dither_dc_offset_enum),
+ 
+ 	/* Coefficient memory for miniDSP. */
+-	/* For the default PRB_R1 processing block, the only available
+-	 * filter is the first order IIR.
++	/*
++	 * PRB_R1, the reset default, offers only the first order IIR.
++	 * Blocks from PRB_R2 up add biquads ahead of it. Select the block
++	 * with "ADC Processing Block" before loading biquad coefficients;
++	 * coefficient memory belonging to an unselected block is inert.
+ 	 */
+ 
++	SOC_SINGLE("ADC Processing Block", ADC3XXX_PRB_SELECT, 0, 18, 0),
++
+ 	TI_COEFFICIENTS("Left ADC IIR Coefficients N0 N1 D1",
+ 			ADC3XXX_LEFT_ADC_IIR_COEFF_N0_MSB, 3),
+ 
+ 	TI_COEFFICIENTS("Right ADC IIR Coefficients N0 N1 D1",
+ 			ADC3XXX_RIGHT_ADC_IIR_COEFF_N0_MSB, 3),
++
++	TI_COEFFICIENTS("Left ADC Biquad A Coefficients N0 N1 N2 D1 D2",
++			ADC3XXX_LEFT_ADC_BIQUAD_A_N0_MSB, 5),
++
++	TI_COEFFICIENTS("Right ADC Biquad A Coefficients N0 N1 N2 D1 D2",
++			ADC3XXX_RIGHT_ADC_BIQUAD_A_N0_MSB, 5),
+ };
+ 
+ /* Left input selection, Single Ended inputs and Differential inputs */

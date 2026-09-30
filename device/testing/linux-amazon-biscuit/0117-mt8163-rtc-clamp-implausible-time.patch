@@ -1,0 +1,131 @@
+Clamp an implausible RTC reading instead of passing it up.
+
+This device's MT6323 RTC is not battery backed. After a full power loss it
+comes back reading 2069, hwclock runs in the boot runlevel, and the bad year
+becomes the system clock. Every certificate is then expired from the device's
+point of view, so anything doing TLS fails with "certificate verify failed" -
+an error that points at the CA bundle or the mirror rather than at the clock.
+apk was unaffected only because its repositories are plain HTTP.
+
+Stock does not have this problem, and not because the hardware differs. The
+vendor driver sanity-checks every read:
+
+    #define RTC_OVER_TIME_RESET  1
+    ...
+    if (unlikely(time > (unsigned long)LONG_MAX)) {
+            rtc_reset_to_deftime(tm);   /* RTC_DEFAULT_YEA 2010 */
+    }
+
+  - drivers/misc/mediatek/rtc/mtk_rtc_common.c
+
+That is why a stock Echo Dot shows 2010-01-01 on an RTC that lost its
+contents, which is observable: /dev/rtc0 on Device #3 is stamped 2010-01-01.
+
+The vendor test is deliberately NOT copied literally. "time > LONG_MAX" caught
+it only because that kernel is 32-bit, where LONG_MAX falls in 2038. On arm64
+long is 64-bit and the comparison can never be true, so this uses an explicit
+date window instead: [2010, 2060]. The lower bound doubles as the substituted
+value so a corrected reading is itself inside the window and cannot re-trigger.
+
+How the bad value gets through is visible in the driver itself:
+__mtk_rtc_read_time() does
+
+    tm->tm_year = data[RTC_OFFSET_YEAR];
+
+with no mask, while the alarm path a few functions below does
+
+    tm->tm_year = data[RTC_OFFSET_YEAR] & RTC_AL_YEA_MASK;
+
+RTC_AL_YEA_MASK is 0x7f. The year register is seven bits, so any stray upper
+bit lands straight in tm_year.
+
+Read-only, matching the vendor: the register is not rewritten, so a device
+whose RTC is merely unset is not made to look like it has been set. The
+substitute is in the past rather than the future on purpose - chrony's
+makestep steps in either direction, but a clock reading 2069 makes valid
+certificates look expired, whereas 2010 makes them look not-yet-valid and
+leaves the failure obviously a clock problem.
+
+Measured on this hardware, for the record: the RTC crystal gains about
+43 ppm (~3.7 s/day) against the 13 MHz system counter, on stock as well as
+here, so the RTC is the less accurate of the two timekeepers and matters only
+at boot.
+---
+
+diff --git a/drivers/rtc/rtc-mt6397.c b/drivers/rtc/rtc-mt6397.c
+--- a/drivers/rtc/rtc-mt6397.c
++++ b/drivers/rtc/rtc-mt6397.c
+@@ -85,10 +85,37 @@
+ 	return ret;
+ }
+ 
++/*
++ * The window a reading has to fall inside to be believed.
++ *
++ * RTC_PLAUSIBLE_MIN_YEAR is also the value substituted for a bad one, so that
++ * the substitute is itself inside the window and a second read does not keep
++ * re-triggering. 2010 is the vendor driver's own RTC_DEFAULT_YEA, which is why
++ * a stock device shows 2010-01-01 on an RTC that has lost its contents.
++ */
++#define RTC_PLAUSIBLE_MIN_YEAR	2010
++#define RTC_PLAUSIBLE_MAX_YEAR	2060
++
++static void mtk_rtc_reset_to_default(struct device *dev, struct rtc_time *tm)
++{
++	dev_warn_once(dev,
++		      "RTC read %04d-%02d-%02d is implausible; reporting %d-01-01 instead\n",
++		      tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
++		      RTC_PLAUSIBLE_MIN_YEAR);
++
++	tm->tm_year = RTC_PLAUSIBLE_MIN_YEAR - 1900;
++	tm->tm_mon = 0;
++	tm->tm_mday = 1;
++	tm->tm_wday = 5;		/* 2010-01-01 was a Friday */
++	tm->tm_hour = 0;
++	tm->tm_min = 0;
++	tm->tm_sec = 0;
++}
++
+ static int mtk_rtc_read_time(struct device *dev, struct rtc_time *tm)
+ {
+ 	struct mt6397_rtc *rtc = dev_get_drvdata(dev);
+-	int sec, ret;
++	int sec, ret, year;
+ 
+ 	do {
+ 		ret = __mtk_rtc_read_time(rtc, tm, &sec);
+@@ -99,6 +126,34 @@
+ 	/* HW register start mon/wday from one, but tm_mon/tm_wday start from zero. */
+ 	tm->tm_mon--;
+ 	tm->tm_wday--;
++
++	/*
++	 * Refuse to pass on a reading the hardware cannot really have held.
++	 *
++	 * __mtk_rtc_read_time() assigns the year register straight into
++	 * tm_year with no mask, unlike the alarm path a few functions below
++	 * which masks it with RTC_AL_YEA_MASK. The register is seven bits, so
++	 * any stray upper bit lands directly in the year: this device comes up
++	 * reading 2069 after losing power, and every certificate on earth is
++	 * then expired from its point of view. That surfaces as
++	 * "certificate verify failed" on anything doing TLS, which points at
++	 * the CA bundle rather than at the clock, and it cost a long
++	 * investigation once already.
++	 *
++	 * The vendor driver does exactly this check
++	 * (RTC_OVER_TIME_RESET in drivers/misc/mediatek/rtc/mtk_rtc_common.c)
++	 * and it is why a stock device reports 2010-01-01 rather than 2069.
++	 *
++	 * NOT a copy of the vendor test, though. Theirs is
++	 * "time > (unsigned long)LONG_MAX", which caught it only because that
++	 * kernel was 32-bit and LONG_MAX fell in 2038. On arm64 long is 64-bit
++	 * and that comparison can never be true, so the bound has to be a real
++	 * date.
++	 */
++	year = tm->tm_year + 1900;
++	if (unlikely(year < RTC_PLAUSIBLE_MIN_YEAR ||
++		     year > RTC_PLAUSIBLE_MAX_YEAR))
++		mtk_rtc_reset_to_default(dev, tm);
+ 
+ exit:
+ 	return ret;

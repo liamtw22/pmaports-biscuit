@@ -1,0 +1,152 @@
+#!/bin/sh
+# Keep the owner ACCOUNT across a flash, not just the marker that names it.
+#
+# /opt/persist/provisioned is on the persist partition and survives a flash.
+# /etc/passwd and /etc/shadow are on the rootfs and do not. So a flashed device
+# came back with the owner gone, the shipped default in its place, and the SSH
+# key that had been added through :8080 revoked along with the account it
+# belonged to. That happened twice in one evening, and both times the only way
+# back in was the web page.
+#
+# So the account is snapshotted while it exists and rebuilt when it does not:
+# same name, same uid, same password hash, same groups. The hash is copied
+# rather than the password, which is never known here.
+#
+# Usage: biscuit-persist-account save      snapshot the owner into the store
+#        biscuit-persist-account restore   rebuild the owner if it is missing
+#
+# restore exits 0 only when it ACTUALLY created the account, so a caller can
+# log that without claiming it every boot.
+set -u
+
+STORE=/opt/persist
+MARKER=$STORE/provisioned
+ADIR=$STORE/account
+# The groups an interactive owner needs on this device. wheel carries sudo;
+# the rest are what the audio, LED and network services expect.
+GROUPS_WANTED="wheel audio video netdev plugdev"
+
+owner() { cat "$MARKER" 2>/dev/null; }
+
+save() {
+	_o=$(owner)
+	[ -n "$_o" ] || return 0
+	id "$_o" >/dev/null 2>&1 || return 0
+	[ -d "$STORE" ] || return 0
+
+	mkdir -p "$ADIR" 2>/dev/null || return 0
+	chmod 700 "$ADIR" 2>/dev/null
+
+	getent passwd "$_o" > "$ADIR/passwd.new" 2>/dev/null
+	awk -F: -v u="$_o" '$1 == u' /etc/shadow > "$ADIR/shadow.new" 2>/dev/null
+	id -nG "$_o" 2>/dev/null > "$ADIR/groups.new"
+
+	# Swap in only a snapshot that has both halves. restore() trusts this
+	# data, so a truncated copy would be worse than none at all - it would
+	# rebuild an account with no usable password.
+	if [ -s "$ADIR/passwd.new" ] && [ -s "$ADIR/shadow.new" ]; then
+		mv -f "$ADIR/passwd.new" "$ADIR/passwd"
+		mv -f "$ADIR/shadow.new" "$ADIR/shadow"
+		mv -f "$ADIR/groups.new" "$ADIR/groups" 2>/dev/null
+		chmod 600 "$ADIR/passwd" "$ADIR/shadow" 2>/dev/null
+	else
+		rm -f "$ADIR/passwd.new" "$ADIR/shadow.new" "$ADIR/groups.new"
+	fi
+	return 0
+}
+
+restore() {
+	_o=$(owner)
+	[ -n "$_o" ] || return 3
+	id "$_o" >/dev/null 2>&1 && return 3	# already present; nothing to do
+	[ -s "$ADIR/passwd" ] && [ -s "$ADIR/shadow" ] || return 3
+
+	_uid=$(cut -d: -f3 "$ADIR/passwd")
+	_gid=$(cut -d: -f4 "$ADIR/passwd")
+	_gecos=$(cut -d: -f5 "$ADIR/passwd")
+	_home=$(cut -d: -f6 "$ADIR/passwd")
+	_shell=$(cut -d: -f7 "$ADIR/passwd")
+	_hash=$(cut -d: -f2 "$ADIR/shadow")
+	[ -n "$_uid" ] && [ -n "$_home" ] || return 3
+
+	addgroup -g "$_gid" "$_o" 2>/dev/null
+	adduser -D -u "$_uid" -G "$_o" -h "$_home" -s "${_shell:-/bin/ash}" \
+		-g "$_gecos" "$_o" 2>/dev/null ||
+		adduser -D -u "$_uid" -h "$_home" -s "${_shell:-/bin/ash}" \
+			"$_o" 2>/dev/null
+	id "$_o" >/dev/null 2>&1 || return 1
+
+	# Put the password hash back. awk, not sed: the hash contains $ and / and
+	# would need escaping in a sed replacement, and getting that wrong locks
+	# the owner out of their own device.
+	if [ -n "$_hash" ]; then
+		if awk -F: -v u="$_o" -v h="$_hash" 'BEGIN { OFS = ":" }
+			$1 == u { $2 = h } { print }' /etc/shadow > "$ADIR/shadow.tmp"
+		then
+			# Written through the existing file so its mode and owner
+			# survive; /etc/shadow must not become world-readable.
+			cat "$ADIR/shadow.tmp" > /etc/shadow
+		fi
+		rm -f "$ADIR/shadow.tmp"
+	fi
+
+	for _g in $(cat "$ADIR/groups" 2>/dev/null) $GROUPS_WANTED; do
+		[ "$_g" = "$_o" ] && continue
+		getent group "$_g" >/dev/null 2>&1 && addgroup "$_o" "$_g" 2>/dev/null
+	done
+
+	# The home directory comes back empty after a flash. Ownership matters
+	# because sshd's StrictModes refuses a key it does not trust.
+	mkdir -p "$_home" 2>/dev/null
+	chown "$_uid:$_gid" "$_home" 2>/dev/null
+	return 0
+}
+
+# Bind an account's ~/.ssh to the persistent copy, right now.
+#
+# biscuit-persist does this at boot. Setup creates the owner account AFTER
+# boot, so a freshly provisioned device had the owner's key sitting in the
+# store and sshd refusing it until someone rebooted - observed on hardware,
+# with the account present, the key stored, and login still denied. Setup calls
+# this so the account is usable the moment it exists.
+bind_ssh() {
+	_o=$1
+	_h=$(getent passwd "$_o" 2>/dev/null | cut -d: -f6)
+	[ -n "$_h" ] || return 1
+	_src=$STORE/ssh/users/$_o
+	_dst=$_h/.ssh
+	mkdir -p "$_src" "$_dst" 2>/dev/null || return 1
+
+	# Merge, never hide - the same rule biscuit-persist uses. A key in
+	# either place ends up in both, so this can never revoke access.
+	if [ -s "$_dst/authorized_keys" ]; then
+		touch "$_src/authorized_keys" 2>/dev/null
+		while IFS= read -r _k; do
+			case "$_k" in
+			""|"#"*) continue ;;
+			esac
+			grep -qxF "$_k" "$_src/authorized_keys" 2>/dev/null ||
+				printf '%s\n' "$_k" >> "$_src/authorized_keys"
+		done < "$_dst/authorized_keys"
+	fi
+
+	# Ownership from /etc/passwd, not from the directory: sshd's StrictModes
+	# ignores an authorized_keys the account does not own, silently.
+	_ug=$(awk -F: -v u="$_o" '$1 == u { print $3 ":" $4; exit }' /etc/passwd)
+	[ -n "$_ug" ] && chown -R "$_ug" "$_src" 2>/dev/null
+	chmod 700 "$_src" 2>/dev/null
+	[ -e "$_src/authorized_keys" ] && chmod 600 "$_src/authorized_keys"
+
+	mountinfo -q "$_dst" 2>/dev/null || mount --bind "$_src" "$_dst"
+}
+
+case "${1:-}" in
+save)    save ;;
+restore) restore ;;
+provision)
+	# Everything a newly created owner needs to be persistent and reachable.
+	save
+	bind_ssh "$(owner)"
+	;;
+*)       echo "usage: ${0##*/} save|restore|provision" >&2; exit 2 ;;
+esac

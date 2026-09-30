@@ -1,0 +1,70 @@
+The device-master-volume fix was only partly integrated into the shipped LVA
+baseline: the peripheral_api.py and __main__.py halves are present, the
+entity.py half was not. Those three call sites set both mpv players to the
+device volume percentage whenever Home Assistant sets a volume or an unmute
+runs, so the user volume was applied twice - once by biscuit-dsp, which owns
+it, and again by mpv.
+
+mpv's volume curve is cubic, so the second application is far heavier than it
+looks: measured on device, 50% is -18.06 dB and 25% is -36.12 dB. At a device
+volume of 50 the assistant's own sounds therefore came out 28 dB down instead
+of 10, and at 25 they were 56 dB down and effectively inaudible. It showed up
+first on the mute and unmute earcons because those two files are already the
+quietest in the set, at -30 and -34 dBFS RMS.
+
+--- a/linux_voice_assistant/entity.py
++++ b/linux_voice_assistant/entity.py
+@@ -178,25 +178,25 @@
+ 
+                 elif command == MediaPlayerCommand.MUTE:
+                     self._log.debug("Executing MUTE")
+                     if not self.muted:
+                         self.previous_volume = self.volume
+                         self.volume = 0
+-                        self.music_player.set_volume(0)
+-                        self.announce_player.set_volume(0)
++                        # The device codec/DSP is the one master volume. Its
++                        # VolumeChanged bridge immediately applies this zero;
++                        # keeping the local players at unity avoids a second
++                        # attenuation after unmute.
+                         self.muted = True
+                         if hasattr(self.server, "state") and getattr(self.server, "state", None) is not None:
+                             self.server.state.persist_volume(self.volume)
+                     yield self._update_state(self.state)
+ 
+                 elif command == MediaPlayerCommand.UNMUTE:
+                     self._log.debug("Executing UNMUTE")
+                     if self.muted:
+                         self.volume = self.previous_volume
+-                        self.music_player.set_volume(int(self.volume * 100))
+-                        self.announce_player.set_volume(int(self.volume * 100))
+                         self.muted = False
+                         if hasattr(self.server, "state") and getattr(self.server, "state", None) is not None:
+                             self.server.state.persist_volume(self.volume)
+                     yield self._update_state(self.state)
+ 
+             elif msg.has_volume:
+@@ -259,16 +259,19 @@
+         volume: float,
+         *,
+         persist: bool,
+         remember: bool = True,
+     ) -> None:
+         normalized = max(0.0, min(1.0, float(volume)))
+-        volume_percent = int(round(normalized * 100))
+-
+-        self.music_player.set_volume(volume_percent)
+-        self.announce_player.set_volume(volume_percent)
++
++        # ``volume`` represents biscuit-audio's physical master on this
++        # appliance. It controls the codec, DSP loudness table and ring. The
++        # mpv players must stay at unity so a 50% master is not rendered as
++        # 50% at the codec multiplied by 50% in mpv - and mpv's curve is cubic,
++        # so its 50% is -18 dB, not -6 dB. Measured: 50% -> -18.06 dB,
++        # 25% -> -36.12 dB, on top of the DSP's own taper.
+ 
+         self.volume = normalized
+ 
+         if remember:
+             self.previous_volume = normalized
+ 

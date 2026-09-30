@@ -1,0 +1,199 @@
+#!/sbin/sh
+# pmos-amazon-biscuit: replace Fire OS with postmarketOS on an amonet v2 Echo
+# Dot 2.
+#
+# Needs this Echo's backup from amazon-biscuit-backup, confirmed copied off the
+# device (the COPIED file), because this ERASES the storage that backup is on.
+# Takes this Echo's own firmware, microphone files and sounds from that backup
+# and installs them with postmarketOS, so nothing has to be pushed by hand.
+#
+# What it writes:
+#   the partition table  system_a, system_b, cache and userdata become one
+#                        userdata for postmarketOS, followed by 1 MiB system_a
+#                        and system_b stubs: amonet v2's bootloader looks
+#                        system_a up by name and hangs without it
+#   userdata             zeroed, then postmarketOS
+#   persist              the settings store (label biscuit-opt), holding this
+#                        Echo's own files
+#   boot_a, boot_b       postmarketOS's boot image, with this Echo's FPGA and
+#                        Bluetooth firmware added to its initramfs: their
+#                        drivers ask for them within a second of power-on
+# Partitions 1-8 (bootloaders, TEE, amonet's kaeru) and recovery are not touched.
+
+OUTFD=$2
+ZIP=$3
+WORK=/dev/tmp/biscuit
+LOG=/tmp/biscuit-install.log
+rm -rf $WORK
+mkdir -p $WORK
+: > $LOG
+# TWRP's unzip ignores wildcards - it extracts nothing and still succeeds -
+# so every member is named.
+ok=1
+unzip -o "$ZIP" zip.prop bin/busybox bin/biscuit-tool common/functions.sh payload/boot.img payload/SHA256SUMS -d $WORK >> $LOG 2>&1 || ok=0
+for f in zip.prop bin/busybox bin/biscuit-tool common/functions.sh payload/boot.img payload/SHA256SUMS; do [ -s $WORK/$f ] || ok=0; done
+[ $ok = 1 ] || { echo -e "ui_print (!) Could not unpack the zip\nui_print" >> /proc/self/fd/$OUTFD; exit 1; }
+chmod 755 $WORK/bin/*
+. $WORK/common/functions.sh
+fix_outfd
+
+banner
+check_device
+ui_print "Echo $SERIAL, TWRP $(getprop ro.twrp.version)"
+core=$(sed -n 's/^core=//p' $WORK/payload/SHA256SUMS)
+ui_print "Installing postmarketOS $ZIP_VERSION${core:+ (device-amazon-biscuit $core)}"
+
+# The disk image is read from this zip while userdata is rewritten, so the zip
+# must not be on it. /tmp (adb push) and adb sideload are both off the eMMC.
+zipdev=$($BB df -P "$ZIP" 2>/dev/null | tail -1 | awk '{print $1}')
+case "$(readlink -f "$zipdev" 2>/dev/null)" in
+	/dev/block/mmcblk0*) abort "This zip is on the storage it replaces. Run it from /tmp: adb push $(basename "$ZIP") /tmp/ then adb shell twrp install /tmp/$(basename "$ZIP")" ;;
+esac
+
+read_layout
+case "$KIND" in
+	v2_stock_geometry) ;;
+	v2_merged_geometry) abort "postmarketOS is already installed here. To go back to Fire OS use amazon-biscuit-stock-restore." ;;
+	*) abort "The partition table is '$KIND', not the stock amonet v2 layout. Nothing was changed." ;;
+esac
+
+# --- the backup: present, intact, this Echo's, and copied off ------------------
+mount_storage
+BACKUP=$(find_backup) || abort "No backup found. Flash amazon-biscuit-backup first."
+ui_print "Checking the backup in $BACKUP ..."
+verify_backup "$BACKUP"
+[ -f "$BACKUP/COPIED" ] || abort "Copy the backup to your computer first (adb pull /sdcard/biscuit-backup), then: adb shell touch $BACKUP/COPIED"
+for f in WIFI_RAM_CODE mediatek/ROMv2_lm_patch_1_0_hdr.bin mediatek/ROMv2_lm_patch_1_1_hdr.bin i2s_to_spi_v34.bin; do
+	[ -f "$BACKUP/assets/firmware/$f" ] || abort "The backup has no firmware/$f: postmarketOS would have no Wi-Fi or microphones."
+done
+LED=0
+backup_has_led "$BACKUP" && LED=1
+
+# --- the payload -----------------------------------------------------------------
+IMG_SHA=$(grep '^pmos.img ' $WORK/payload/SHA256SUMS | cut -d' ' -f2)
+IMG_BYTES=$(grep '^pmos.img ' $WORK/payload/SHA256SUMS | cut -d' ' -f3)
+BOOT_SHA=$(grep '^boot.img ' $WORK/payload/SHA256SUMS | cut -d' ' -f2)
+[ -n "$IMG_SHA" ] && [ -n "$IMG_BYTES" ] && [ -n "$BOOT_SHA" ] || abort "The zip's payload index is incomplete."
+[ "$(sha_of_file $WORK/payload/boot.img)" = "$BOOT_SHA" ] || abort "The zip's boot image is corrupt. Download it again."
+# TWRP's sh (mksh) does 32-bit arithmetic, and byte counts pass 2 GiB, so the
+# image is measured in MiB and the storage in sectors; awk does the division.
+IMG_MIB=$(awk -v b="$IMG_BYTES" 'BEGIN { if (b % 1048576) print "x"; else printf "%d", b / 1048576 }')
+case "$IMG_MIB" in ''|*[!0-9]*) abort "The zip's disk image is not a whole number of MiB." ;; esac
+[ "$IMG_MIB" -le $(( (LAST - 2 * STUB - MERGED_FIRST + 1) / 2048 )) ] || abort "The disk image does not fit this Echo's storage."
+
+# --- this Echo's files into RAM: installing erases the storage they are on -------
+ui_print "Copying this Echo's firmware and sounds into memory ..."
+STAGE=$WORK/stage
+mkdir -p $STAGE
+cp -r "$BACKUP/assets" $STAGE/ && cp -r "$BACKUP/earcon" $STAGE/ || abort "Could not copy the backup's files."
+# The ring's animations, when the backup has them (backup_has_led stopped
+# above if it has none and Fire OS here still does).
+dirs='assets|earcon'
+if [ $LED = 1 ]; then
+	cp -r "$BACKUP/led" $STAGE/ || abort "Could not copy the backup's files."
+	dirs='assets|earcon|led'
+fi
+rm -f $STAGE/assets/SOURCES
+( cd "$BACKUP" && grep -E " \./($dirs)/" SHA256SUMS | grep -v SOURCES ) > $WORK/stage.sums
+( cd $STAGE && sed 's# \./# ./#' $WORK/stage.sums | $BB sha256sum -c >> $LOG 2>&1 ) || abort "The copy in memory does not match the backup."
+
+# --- the boot image, built in memory before anything is written -----------------
+# biscuit-tool refuses a boot image whose kernel has no MediaTek header (it
+# would bootloop) or whose initramfs cannot take this Echo's firmware. Built
+# here, into RAM, a bad image stops the install while Fire OS is still whole.
+ui_print "Building the boot image with this Echo's firmware ..."
+F=$STAGE/assets/firmware
+run "Could not build the boot image. Nothing was changed" $BT owner-boot $WORK/payload/boot.img $WORK/boot-owner.img \
+	$F/i2s_to_spi_v34.bin=lib/firmware/i2s_to_spi_v34.bin \
+	$F/mediatek/ROMv2_lm_patch_1_0_hdr.bin=lib/firmware/mediatek/ROMv2_lm_patch_1_0_hdr.bin \
+	$F/mediatek/ROMv2_lm_patch_1_1_hdr.bin=lib/firmware/mediatek/ROMv2_lm_patch_1_1_hdr.bin
+boot_sectors=$(( ($($BB stat -c %s $WORK/boot-owner.img) + 511) / 512 ))
+for slot in boot_a boot_b; do
+	set -- $(prefix_range $slot)
+	[ -n "$2" ] || abort "No $slot in the partition table. Nothing was changed."
+	[ $boot_sectors -le $(($2 - $1 + 1)) ] || abort "The boot image is larger than $slot. Nothing was changed."
+done
+
+# --- nothing has been written yet; from here on Fire OS is being replaced --------
+ui_print " "
+ui_print "Replacing Fire OS. Do not unplug the Echo."
+unmount_all
+
+ui_print "Writing the partition table ..."
+run "Could not compute the new partition table" $BT gpt-merge $DISK $WORK/gpt-head.bin $WORK/gpt-tail.bin
+# Backup table first: while only it is new, the primary still describes a
+# consistent (stock) disk.
+write_range $WORK/gpt-tail.bin $((TOTAL - 33))
+write_range $WORK/gpt-head.bin 0
+sync
+read_layout
+[ "$KIND" = v2_merged_geometry ] || abort "The partition table reads back as '$KIND'."
+$BB blockdev --rereadpt $DISK >> $LOG 2>&1
+
+# Zero all of it first. The image is written whole, but whatever lies past it
+# must not still hold the old system_a's ext4 superblocks: TWRP runs e2fsck -y
+# on userdata at every start and would "repair" postmarketOS with them.
+ui_print "Clearing the new userdata (about 3 minutes) ..."
+span=$((LAST + 1 - MERGED_FIRST))
+mib=$((span / 2048))
+$BB dd if=/dev/zero of=$DISK bs=1048576 seek=$((MERGED_FIRST / 2048)) count=$mib conv=notrunc,fsync 2>>$LOG ||
+	abort "Could not clear userdata."
+rest=$((span - mib * 2048))
+[ $rest = 0 ] || $BB dd if=/dev/zero of=$DISK bs=512 seek=$((MERGED_FIRST + mib * 2048)) count=$rest conv=notrunc,fsync 2>>$LOG ||
+	abort "Could not clear the end of the disk."
+
+ui_print "Writing postmarketOS ($IMG_MIB MiB) ..."
+unzip -p "$ZIP" payload/pmos.img.xz | $BB unxz -c | $BB dd of=$DISK bs=1048576 seek=$((MERGED_FIRST / 2048)) conv=notrunc,fsync 2>>$LOG ||
+	abort "Could not write postmarketOS."
+sync
+ui_print "Checking what was written ..."
+got=$($BB dd if=$DISK bs=1048576 skip=$((MERGED_FIRST / 2048)) count=$IMG_MIB 2>/dev/null | $BB sha256sum | cut -d' ' -f1)
+[ "$got" = "$IMG_SHA" ] || abort "postmarketOS did not read back correctly. Run $ZIP_NAME-$ZIP_VERSION again."
+
+# --- the settings store, with this Echo's own files ------------------------------
+ui_print "Making the settings store ..."
+PERSIST=$(by_name persist) || abort "No persist partition."
+set -- $(prefix_range persist)
+[ "$(readlink -f $PERSIST)" = "$(readlink -f /dev/block/mmcblk0p9)" ] || abort "persist is not partition 9."
+run "Could not format the settings store" $MKE2FS -F -q -t ext4 -L biscuit-opt $PERSIST
+mkdir -p $WORK/opt
+run "Could not mount the settings store" mount -t ext4 $PERSIST $WORK/opt
+mkdir -p $WORK/opt/persist/biscuit/assets $WORK/opt/persist/earcon
+cp -r $STAGE/assets/* $WORK/opt/persist/biscuit/assets/ && cp $STAGE/earcon/* $WORK/opt/persist/earcon/ ||
+	{ umount $WORK/opt; abort "The settings store is too small for this Echo's files."; }
+if [ -d $STAGE/led ] && [ -n "$(ls $STAGE/led)" ]; then
+	# Not worth failing an install over: the page can import them later from
+	# the backup's led folder.
+	# The volume ramp is left out, as the page's import leaves it out: this
+	# Echo draws its own under those names.
+	mkdir -p $WORK/opt/persist/biscuit/led
+	for f in $STAGE/led/*.animation; do
+		[ -f "$f" ] && led_wanted "$f" || continue
+		cp "$f" $WORK/opt/persist/biscuit/led/ 2>>$LOG || {
+			rm -rf $WORK/opt/persist/biscuit/led
+			ui_print "  (the ring animations did not fit; import them later from the"
+			ui_print "   backup's led folder: Settings > Storage > Files from stock)"
+			break
+		}
+	done
+fi
+chmod -R u=rwX,go=rX $WORK/opt/persist
+sync
+n=$(find $WORK/opt/persist -type f | wc -l)
+umount $WORK/opt
+ui_print "  $n file(s) stored"
+
+# --- the boot image, with this Echo's firmware -------------------------------------
+ui_print "Writing the boot image to both slots ..."
+for slot in boot_a boot_b; do
+	set -- $(prefix_range $slot)
+	write_range $WORK/boot-owner.img $1
+done
+
+sync
+ui_print " "
+ui_print "postmarketOS is installed."
+ui_print "Reboot with: adb reboot"
+ui_print "It sets itself up on the first boot, then opens a Wi-Fi network"
+ui_print "named biscuit-XXXX. Join it from a phone to finish setup."
+exit 0

@@ -1,0 +1,31 @@
+# Vendor firmware that must be in the initramfs, not merely on the root
+# filesystem.
+#
+# These three are requested by BUILT-IN drivers during device_initcall:
+#
+#   dough-fpga spi0.0   i2s_to_spi_v34.bin        t=0.61 s
+#   mt8163-stp-bt       ROMv2_lm_patch_1_1_hdr    t=0.93 s
+#   mt8163-stp-bt       ROMv2_lm_patch_1_0_hdr    t=1.00 s
+#
+# The root filesystem is not mounted until t=7.4 s, so a file on disk is six
+# seconds too late and the driver fails permanently - dough_probe() returns
+# request_firmware()'s -ENOENT, which is not a deferred probe. The kernel unpacks
+# the initramfs in populate_rootfs() at rootfs_initcall, BEFORE device_initcall,
+# so a copy in the cpio is there in time.
+#
+# biscuit-import-assets writes real files here rather than symlinks into
+# /opt/persist for exactly this reason: the initramfs has no /opt.
+#
+# WIFI_RAM_CODE is deliberately NOT listed. wlan_mt6625l is a loadable module
+# whose carrier comes up around t=35 s, so it reads from the real root filesystem
+# and does not need 373 KB of initramfs.
+#
+# !optional because none of the three ships: each owner imports them from their
+# own Echo, so a freshly built image has none. Without the marker mkinitfs fails
+# on the first missing file and `pmbootstrap install` cannot produce a clean
+# image at all. The installer puts the owner's copies in the first boot image,
+# and once biscuit-import-assets has activated them into /lib/firmware every
+# later mkinitfs picks them up here.
+/lib/firmware/i2s_to_spi_v34.bin!optional
+/lib/firmware/mediatek/ROMv2_lm_patch_1_0_hdr.bin!optional
+/lib/firmware/mediatek/ROMv2_lm_patch_1_1_hdr.bin!optional

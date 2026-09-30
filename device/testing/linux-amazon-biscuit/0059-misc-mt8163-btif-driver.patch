@@ -1,0 +1,304 @@
+--- /dev/null
++++ b/drivers/misc/mt8163-btif.c
+@@ -0,0 +1,275 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * MediaTek MT8163 BTIF DMA transport.
++ *
++ * BTIF is the AP-to-CONSYS transport, not a 16550 UART.  Its control block
++ * happens to have UART-like status registers, but stock moves every WMT/STP
++ * byte through the dedicated AP-DMA virtual FIFOs.  An 8250 driver can make
++ * the block look idle, yet it never programs those engines and corrupts the
++ * bootstrap protocol.  This driver establishes the DMA transport only; the
++ * WMT/STP client owns firmware loading and protocol traffic above it.
++ */
++
++#include <linux/bits.h>
++#include <linux/clk.h>
++#include <linux/dma-mapping.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/platform_device.h>
++
++#define BTIF_FAKELCR			0x0c
++#define BTIF_IER			0x04
++#define BTIF_TRI_LVL			0x60
++#define BTIF_DMA_EN			0x4c
++#define BTIF_HANDSHAKE			0x6c
++
++#define BTIF_DMA_EN_RX			BIT(0)
++#define BTIF_DMA_EN_TX			BIT(1)
++#define BTIF_DMA_EN_AUTORST		BIT(2)
++#define BTIF_HANDSHAKE_ENABLE		BIT(0)
++#define BTIF_TRI_LVL_TX(x)		((x) & 0xf)
++#define BTIF_TRI_LVL_RX(x)		(((x) & 0x7) << 4)
++#define BTIF_TX_FIFO_THRESHOLD		8
++#define BTIF_RX_FIFO_THRESHOLD		1
++
++#define DMA_INT_FLAG			0x00
++#define DMA_INT_EN			0x04
++#define DMA_EN				0x08
++#define DMA_RST			0x0c
++#define DMA_VFF_ADDR			0x1c
++#define DMA_VFF_LEN			0x24
++#define DMA_VFF_THRE			0x28
++#define DMA_VFF_WPT			0x2c
++#define DMA_VFF_RPT			0x30
++#define DMA_VFF_VALID			0x3c
++#define DMA_VFF_LEFT			0x40
++
++#define DMA_WARM_RESET			BIT(0)
++#define DMA_ENABLE			BIT(0)
++#define DMA_TX_INT_DONE		BIT(0)
++#define DMA_RX_INT_THRESHOLD		BIT(0)
++#define DMA_RX_INT_DONE		BIT(1)
++#define DMA_VFIFO_SIZE			SZ_8K
++
++struct mt8163_btif_dma {
++	void __iomem *base;
++	void *fifo;
++	dma_addr_t dma_addr;
++	int irq;
++	u32 int_enable;
++	u32 mode_bit;
++	const char *name;
++};
++
++struct mt8163_btif {
++	struct device *dev;
++	void __iomem *base;
++	struct clk *btif_clk;
++	struct clk *apdma_clk;
++	struct mt8163_btif_dma tx;
++	struct mt8163_btif_dma rx;
++};
++
++static int mt8163_btif_dma_reset(struct mt8163_btif_dma *dma)
++{
++	u32 value;
++
++	writel(DMA_WARM_RESET, dma->base + DMA_RST);
++	return readl_poll_timeout(dma->base + DMA_EN, value,
++				  !(value & DMA_ENABLE), 10, 1000);
++}
++
++static int mt8163_btif_dma_setup(struct mt8163_btif *btif,
++				 struct mt8163_btif_dma *dma)
++{
++	int ret;
++	u32 value;
++
++	ret = mt8163_btif_dma_reset(dma);
++	if (ret)
++		return dev_err_probe(btif->dev, ret, "%s DMA reset timed out\n",
++				     dma->name);
++
++	if (upper_32_bits(dma->dma_addr))
++		return dev_err_probe(btif->dev, -ERANGE,
++				     "%s DMA address is above 32 bits\n", dma->name);
++
++	writel(lower_32_bits(dma->dma_addr), dma->base + DMA_VFF_ADDR);
++	writel(DMA_VFIFO_SIZE, dma->base + DMA_VFF_LEN);
++	writel(0, dma->base + DMA_VFF_WPT);
++	writel(0, dma->base + DMA_VFF_RPT);
++	writel(dma == &btif->tx ? DMA_VFIFO_SIZE - 7 :
++		DMA_VFIFO_SIZE * 3 / 4, dma->base + DMA_VFF_THRE);
++	writel(dma->int_enable, dma->base + DMA_INT_EN);
++	writel(DMA_ENABLE, dma->base + DMA_EN);
++
++	value = readl(btif->base + BTIF_DMA_EN);
++	writel(value | dma->mode_bit, btif->base + BTIF_DMA_EN);
++
++	dev_info(btif->dev, "BTIF %s DMA setup succeeded (vfifo=%u, irq=%d)\n",
++		 dma->name, DMA_VFIFO_SIZE, dma->irq);
++	return 0;
++}
++
++static irqreturn_t mt8163_btif_dma_irq(int irq, void *data)
++{
++	struct mt8163_btif_dma *dma = data;
++	u32 status;
++
++	status = readl(dma->base + DMA_INT_FLAG);
++	if (!status)
++		return IRQ_NONE;
++
++	/* MT8163 APDMA DMA_INT_FLAG is write-one-to-clear. */
++	writel(status, dma->base + DMA_INT_FLAG);
++
++	/*
++	 * STP owns the virtual-FIFO producer and consumer pointers.  Before it
++	 * binds, acknowledge only: moving raw bytes here would recreate the PIO
++	 * bootstrap this transport replaces.
++	 */
++	return IRQ_HANDLED;
++}
++
++static ssize_t dma_state_show(struct device *dev,
++			      struct device_attribute *attr, char *buf)
++{
++	struct mt8163_btif *btif = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf,
++		"tx en=0x%08x valid=%u left=%u\n"
++		"rx en=0x%08x valid=%u left=%u\n"
++		"btif dma_en=0x%08x handshake=0x%08x\n",
++		readl(btif->tx.base + DMA_EN),
++		readl(btif->tx.base + DMA_VFF_VALID),
++		readl(btif->tx.base + DMA_VFF_LEFT),
++		readl(btif->rx.base + DMA_EN),
++		readl(btif->rx.base + DMA_VFF_VALID),
++		readl(btif->rx.base + DMA_VFF_LEFT),
++		readl(btif->base + BTIF_DMA_EN),
++		readl(btif->base + BTIF_HANDSHAKE));
++}
++static DEVICE_ATTR_RO(dma_state);
++
++static struct attribute *mt8163_btif_attrs[] = {
++	&dev_attr_dma_state.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(mt8163_btif);
++
++static int mt8163_btif_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mt8163_btif *btif;
++	u32 value;
++	int ret;
++
++	btif = devm_kzalloc(dev, sizeof(*btif), GFP_KERNEL);
++	if (!btif)
++		return -ENOMEM;
++
++	btif->dev = dev;
++	platform_set_drvdata(pdev, btif);
++
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return dev_err_probe(dev, ret, "32-bit DMA is unavailable\n");
++
++	btif->base = devm_platform_ioremap_resource_byname(pdev, "btif");
++	if (IS_ERR(btif->base))
++		return PTR_ERR(btif->base);
++
++	btif->tx.base = devm_platform_ioremap_resource_byname(pdev, "tx-dma");
++	if (IS_ERR(btif->tx.base))
++		return PTR_ERR(btif->tx.base);
++
++	btif->rx.base = devm_platform_ioremap_resource_byname(pdev, "rx-dma");
++	if (IS_ERR(btif->rx.base))
++		return PTR_ERR(btif->rx.base);
++
++	btif->btif_clk = devm_clk_get_enabled(dev, "btifc");
++	if (IS_ERR(btif->btif_clk))
++		return dev_err_probe(dev, PTR_ERR(btif->btif_clk),
++				     "failed to enable BTIF clock\n");
++
++	btif->apdma_clk = devm_clk_get_enabled(dev, "apdmac");
++	if (IS_ERR(btif->apdma_clk))
++		return dev_err_probe(dev, PTR_ERR(btif->apdma_clk),
++				     "failed to enable APDMA clock\n");
++
++	btif->tx.name = "TX";
++	btif->tx.irq = platform_get_irq_byname(pdev, "tx-dma");
++	btif->tx.int_enable = DMA_TX_INT_DONE;
++	btif->tx.mode_bit = BTIF_DMA_EN_TX;
++
++	btif->rx.name = "RX";
++	btif->rx.irq = platform_get_irq_byname(pdev, "rx-dma");
++	btif->rx.int_enable = DMA_RX_INT_THRESHOLD | DMA_RX_INT_DONE;
++	btif->rx.mode_bit = BTIF_DMA_EN_RX;
++
++	if (btif->tx.irq < 0 || btif->rx.irq < 0)
++		return dev_err_probe(dev, -EINVAL, "missing BTIF DMA interrupt\n");
++
++	btif->tx.fifo = dmam_alloc_coherent(dev, DMA_VFIFO_SIZE,
++					   &btif->tx.dma_addr, GFP_KERNEL);
++	if (!btif->tx.fifo)
++		return -ENOMEM;
++
++	btif->rx.fifo = dmam_alloc_coherent(dev, DMA_VFIFO_SIZE,
++					   &btif->rx.dma_addr, GFP_KERNEL);
++	if (!btif->rx.fifo)
++		return -ENOMEM;
++
++	ret = devm_request_irq(dev, btif->tx.irq, mt8163_btif_dma_irq,
++			       IRQF_NO_THREAD, "mt8163-btif-tx", &btif->tx);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to request TX DMA IRQ\n");
++
++	ret = devm_request_irq(dev, btif->rx.irq, mt8163_btif_dma_irq,
++			       IRQF_NO_THREAD, "mt8163-btif-rx", &btif->rx);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to request RX DMA IRQ\n");
++
++	/* Vendor controller setup before the DMA engines are enabled. */
++	writel(0, btif->base + BTIF_FAKELCR);
++	value = readl(btif->base + BTIF_HANDSHAKE);
++	writel(value | BTIF_HANDSHAKE_ENABLE, btif->base + BTIF_HANDSHAKE);
++	writel(BTIF_TRI_LVL_TX(BTIF_TX_FIFO_THRESHOLD) |
++		BTIF_TRI_LVL_RX(BTIF_RX_FIFO_THRESHOLD),
++		btif->base + BTIF_TRI_LVL);
++	writel(BTIF_DMA_EN_AUTORST, btif->base + BTIF_DMA_EN);
++	writel(0, btif->base + BTIF_IER);
++
++	ret = mt8163_btif_dma_setup(btif, &btif->tx);
++	if (ret)
++		return ret;
++
++	ret = mt8163_btif_dma_setup(btif, &btif->rx);
++	if (ret)
++		return ret;
++
++	dev_info(dev, "BTIF DMA transport ready; waiting for STP/WMT client\n");
++	return 0;
++}
++
++static const struct of_device_id mt8163_btif_of_match[] = {
++	{ .compatible = "mediatek,mt8163-btif" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt8163_btif_of_match);
++
++static struct platform_driver mt8163_btif_driver = {
++	.probe = mt8163_btif_probe,
++	.driver = {
++		.name = "mt8163-btif",
++		.of_match_table = mt8163_btif_of_match,
++		.dev_groups = mt8163_btif_groups,
++	},
++};
++module_platform_driver(mt8163_btif_driver);
++
++MODULE_DESCRIPTION("MediaTek MT8163 BTIF DMA transport core");
++MODULE_LICENSE("GPL");
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -693 +693,16 @@
++config MT8163_BTIF
++	tristate "MediaTek MT8163 BTIF DMA transport"
++	depends on ARCH_MEDIATEK || COMPILE_TEST
++	depends on COMMON_CLK && DMA_CMA
++	help
++	  BTIF is the DMA transport between the application processor and the
++	  MT8163 connectivity processor.  Its control registers superficially
++	  resemble a 16550 UART, but stock firmware moves every byte through two
++	  APDMA virtual FIFOs.  This driver sets up those engines and must be used
++	  by the MT8163 STP/WMT stack, not by serial8250 or btmtkuart.
++
++	  It intentionally has no userspace data interface.  The WMT/STP client
++	  owns the protocol and firmware state machine above this transport.
++
++	  If unsure, say N.
+ endmenu
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -77,3 +77,4 @@
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
+ obj-$(CONFIG_DOUGH_FPGA)	+= dough-fpga.o
+ obj-$(CONFIG_MT8163_CONSYS)	+= mt8163-consys.o
++obj-$(CONFIG_MT8163_BTIF)	+= mt8163-btif.o

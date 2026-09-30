@@ -1,0 +1,681 @@
+#!/usr/bin/env python3
+"""Put a new kernel and initramfs where this Echo's bootloader looks for them.
+
+    biscuit-boot-update status        JSON: is boot_a what /boot/boot.img builds?
+    biscuit-boot-update build OUT     write the image boot_a should hold
+    biscuit-boot-update apply         build, check, write boot_a then boot_b
+    biscuit-boot-update rollback      put back what the last apply replaced
+
+WHY THIS EXISTS
+
+The bootloader (LK, under amonet) reads the kernel and initramfs from the
+boot_a and boot_b partitions. An apk upgrade regenerates /boot/boot.img inside
+the root filesystem, and nothing ever copied it to those partitions: a kernel
+fix could be installed and would never run. The install zip writes both slots
+once; this is that step, done again on the device, when the owner asks.
+
+THE IMAGE IS THE INSTALLER'S, BYTE FOR BYTE
+
+`build` is a port of biscuit-tool's owner-boot (biscuit-installer/zip), and
+must stay one: the install zip and this tool have to agree on what a good image
+is. It appends this Echo's own Bluetooth and FPGA firmware to the initramfs -
+the drivers ask for it before the root filesystem exists - unless the
+initramfs already carries it, which it does when mkinitfs ran on the device
+with the firmware imported. It also makes sure bootopt asks for a 64-bit
+kernel, and recomputes the header's id.
+
+WHAT MAKES WRITING IT SAFE ENOUGH
+
+ONLY THE PARTITIONS THAT HOLD A KERNEL NOW
+
+Partition names do not say which partition boots. On an Echo installed by the
+zip (amonet v2) boot_a and boot_b hold the kernel. On an Echo flashed by hand
+in the older layout, the kernel is on boot_a_x, and the partition NAMED boot_a
+holds the bootloader - writing a kernel there would leave a device that does
+not start at all. So a slot is only written if it holds a kernel image now
+(an Android header with 2048-byte pages and the MediaTek KERNEL header), and
+on the older layout, recognised by boot_a_x, nothing is written.
+
+A bad image here means a device that does not boot until it is reinstalled
+from TWRP, so nothing is written until the image has been checked: an Android
+header, the MediaTek kernel header LK requires, a 64-bit bootopt, root and boot
+UUIDs that match the filesystems this system is running from, an initramfs
+that inflates and holds an init and the firmware, and a size that fits the
+slot. boot_a is written and read back first; boot_b only if that matched. A
+read-back that does not match restores the previous image at once.
+"""
+import hashlib
+import io
+import json
+import os
+import re
+import signal
+import struct
+import sys
+import time
+import zlib
+
+BOOT_IMG = "/boot/boot.img"
+SLOTS = ("/dev/disk/by-partlabel/boot_a", "/dev/disk/by-partlabel/boot_b")
+LEGACY_SLOT = "/dev/disk/by-partlabel/boot_a_x"
+BOOT_SLOT = 16 << 20
+PAGE = 2048
+MTK_MAGIC = 0x58881688
+FIRMWARE_STORE = "/opt/persist/biscuit/assets/firmware"
+FIRMWARE = (
+    ("i2s_to_spi_v34.bin", "lib/firmware/i2s_to_spi_v34.bin"),
+    ("mediatek/ROMv2_lm_patch_1_0_hdr.bin", "lib/firmware/mediatek/ROMv2_lm_patch_1_0_hdr.bin"),
+    ("mediatek/ROMv2_lm_patch_1_1_hdr.bin", "lib/firmware/mediatek/ROMv2_lm_patch_1_1_hdr.bin"),
+)
+STATE_DIR = "/var/lib/biscuit"
+PREVIOUS = os.path.join(STATE_DIR, "boot-previous.img")
+RECORD = os.path.join(STATE_DIR, "boot-installed.json")
+
+
+class Refused(Exception):
+    pass
+
+
+class Unsupported(Refused):
+    """This Echo's layout is not one this tool writes to."""
+
+
+class Damaged(Exception):
+    """A slot may hold a partial image and could not be put back as it was."""
+
+
+# Exit codes: 3 = refused, nothing written; 4 = a slot may be damaged;
+# 5 = every slot was written, but the record of it could not be saved.
+EXIT_REFUSED = 3
+EXIT_DAMAGED = 4
+EXIT_UNRECORDED = 5
+HELD = {signal.SIGTERM, signal.SIGINT, signal.SIGHUP}
+
+
+def le32(b, off):
+    return struct.unpack_from("<I", b, off)[0]
+
+
+def pad(n, to=PAGE):
+    return (n + to - 1) // to * to
+
+
+def parse_boot(data):
+    if len(data) < PAGE or data[:8] != b"ANDROID!":
+        raise Refused("not an Android boot image")
+    ksize, rsize, ssize, page = le32(data, 8), le32(data, 16), le32(data, 24), le32(data, 36)
+    if page != PAGE:
+        raise Refused("page size %d, not %d" % (page, PAGE))
+    koff = PAGE
+    roff = koff + pad(ksize)
+    soff = roff + pad(rsize)
+    if soff + ssize > len(data):
+        raise Refused("the boot image is truncated")
+    return {"ksize": ksize, "rsize": rsize, "ssize": ssize, "koff": koff, "roff": roff, "soff": soff}
+
+
+def image_length(head):
+    """How much of a partition is the image, from its header alone: the
+    header plus the padded sections."""
+    if len(head) < PAGE or head[:8] != b"ANDROID!" or le32(head, 36) != PAGE:
+        raise Refused("not an Android boot image")
+    ksize, rsize, ssize = le32(head, 8), le32(head, 16), le32(head, 24)
+    n = PAGE + pad(ksize) + pad(rsize) + (pad(ssize) if ssize else 0)
+    if n > BOOT_SLOT:
+        raise Refused("the header claims more than a slot holds")
+    return n
+
+
+def holds_kernel(head):
+    """True when a partition's first bytes are a kernel boot image: an Android
+    header with 2048-byte pages, then the MediaTek KERNEL header. The
+    bootloader's partition fails both."""
+    if len(head) < PAGE + 16 or head[:8] != b"ANDROID!" or le32(head, 36) != PAGE:
+        return False
+    return le32(head, PAGE) == MTK_MAGIC and head[PAGE + 8:PAGE + 14] == b"KERNEL"
+
+
+def boot_slots():
+    """The partitions to write, each checked by what it holds now."""
+    if os.path.exists(LEGACY_SLOT):
+        raise Unsupported("this Echo was installed by hand in the older layout, where the "
+                          "partition named boot_a holds the bootloader; its boot image is "
+                          "written by hand (boot_a_x)")
+    out = []
+    for slot in SLOTS:
+        if not os.path.exists(slot):
+            continue
+        with open(slot, "rb") as f:
+            head = f.read(PAGE + 64)
+        if not holds_kernel(head):
+            raise Refused("%s does not hold a kernel image now, so it is not overwritten"
+                          % os.path.basename(slot))
+        out.append(slot)
+    if not out:
+        raise Unsupported("no boot_a or boot_b partition")
+    return out
+
+
+def slot_size(slot):
+    fd = os.open(slot, os.O_RDONLY)
+    try:
+        return os.lseek(fd, 0, os.SEEK_END)
+    finally:
+        os.close(fd)
+
+
+def gunzip_first(data, limit=32 << 20):
+    try:
+        d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        out = d.decompress(data, limit)
+    except zlib.error as err:
+        raise Refused("the initramfs does not inflate (%s)" % err)
+    if not d.eof:
+        raise Refused("the initramfs does not inflate")
+    return out
+
+
+def parse_newc(c):
+    entries, pos = [], 0
+    while pos + 110 <= len(c):
+        if c[pos:pos + 6] != b"070701":
+            raise Refused("the initramfs is not a newc archive")
+        try:
+            mode = int(c[pos + 14:pos + 22], 16)
+            size = int(c[pos + 54:pos + 62], 16)
+            nlen = int(c[pos + 94:pos + 102], 16)
+        except ValueError:
+            raise Refused("the initramfs has a damaged header")
+        if pos + 110 + nlen > len(c):
+            raise Refused("the initramfs is truncated")
+        name = c[pos + 110:pos + 110 + nlen - 1].decode("utf-8", "replace") if nlen else ""
+        data = pos + 110 + nlen
+        data += (4 - data % 4) % 4
+        if name.startswith("TRAILER!!!"):
+            break
+        entries.append({"name": name, "mode": mode, "data": c[data:data + size]})
+        pos = data + size
+        pos += (4 - pos % 4) % 4
+    return entries
+
+
+def resolve(index, path):
+    """Follow the archive's own symlinks, as biscuit-tool's resolve() does, so
+    a file meant for lib/firmware lands where lib points (usr/lib)."""
+    todo, done = path, ""
+    for _ in range(40):
+        if not todo:
+            return done
+        part, _, rest = todo.partition("/")
+        cand = (done + "/" + part) if done else part
+        x = index.get(cand)
+        if x is not None and (x["mode"] & 0o170000) == 0o120000:
+            target = x["data"].decode("utf-8", "replace")
+            if target.startswith("/"):
+                done = ""
+                todo = target[1:] + ("/" + rest if rest else "")
+            else:
+                todo = target + ("/" + rest if rest else "")
+            continue
+        done, todo = cand, rest
+    raise Refused("symlink loop resolving %s" % path)
+
+
+class Newc:
+    def __init__(self):
+        self.buf = io.BytesIO()
+        self.ino = 1000
+
+    def pad4(self):
+        self.buf.write(b"\0" * ((4 - self.buf.tell() % 4) % 4))
+
+    def entry(self, name, mode, data=b""):
+        hdr = "070701" + "".join("%08X" % v for v in (
+            self.ino, mode, 0, 0, 1, 0, len(data), 0, 0, 0, 0, len(name) + 1, 0))
+        self.ino += 1
+        self.buf.write(hdr.encode("ascii"))
+        self.buf.write(name.encode("utf-8") + b"\0")
+        self.pad4()
+        if data:
+            self.buf.write(data)
+        self.pad4()
+
+
+def build(source=BOOT_IMG, firmware_store=FIRMWARE_STORE, files=FIRMWARE):
+    """The image boot_a should hold, from a boot.img. A port of owner-boot."""
+    with open(source, "rb") as f:
+        data = f.read()
+    b = parse_boot(data)
+    if le32(data, b["koff"]) != MTK_MAGIC:
+        raise Refused("the kernel has no MediaTek header; the image would bootloop")
+    ramdisk_in = data[b["roff"]:b["roff"] + b["rsize"]]
+    base = parse_newc(gunzip_first(ramdisk_in))
+    index = {e["name"]: e for e in base}
+
+    dirs, wanted = [], []
+    for src, dest in files:
+        target = resolve(index, dest)
+        with open(os.path.join(firmware_store, src), "rb") as f:
+            blob = f.read()
+        have = index.get(target)
+        if have is not None:
+            # mkinitfs on the device already put it there, from the same
+            # imported file. A DIFFERENT file there is a problem to stop on.
+            if have["data"] != blob:
+                raise Refused("the initramfs has a different %s" % target)
+            continue
+        parts = target.split("/")
+        for i in range(1, len(parts)):
+            d = "/".join(parts[:i])
+            x = index.get(d)
+            if x is not None:
+                if (x["mode"] & 0o170000) != 0o040000:
+                    raise Refused("%s in the initramfs is not a directory" % d)
+                continue
+            if d not in dirs:
+                dirs.append(d)
+        wanted.append((target, blob))
+
+    if wanted:
+        # The appended archive never holds an entry of a different type from
+        # the first archive's: the kernel's unpacker deletes the old entry
+        # first, and a plain `lib` once replaced pmOS's lib -> usr/lib.
+        cp = Newc()
+        for d in dirs:
+            cp.entry(d, 0o40755)
+        for target, blob in wanted:
+            cp.entry(target, 0o100644, blob)
+        cp.entry("TRAILER!!!", 0)
+        rpad = (4 - b["rsize"] % 4) % 4
+        ramdisk = ramdisk_in + b"\0" * rpad + cp.buf.getvalue()
+    else:
+        ramdisk = ramdisk_in
+
+    header = bytearray(data[:PAGE])
+    struct.pack_into("<I", header, 16, len(ramdisk))
+    cmd = header[64:64 + 512]
+    at = cmd.find(b"bootopt=")
+    if at < 0 or at + 0x12 + 2 > 512:
+        raise Refused("the boot image command line has no bootopt")
+    field = bytes(cmd[at + 0x12:at + 0x14])
+    if field == b"32":
+        header[64 + at + 0x12:64 + at + 0x14] = b"64"
+    elif field != b"64":
+        raise Refused("unrecognised bootopt in the boot image")
+
+    kernel = data[b["koff"]:b["koff"] + b["ksize"]]
+    second = data[b["soff"]:b["soff"] + b["ssize"]]
+    s = hashlib.sha1()
+    for part in (kernel, ramdisk, second):
+        s.update(part)
+        s.update(struct.pack("<I", len(part)))
+    header[576:608] = s.digest() + b"\0" * 12
+
+    out = bytearray(bytes(header))
+    out += kernel + b"\0" * (pad(len(kernel)) - len(kernel))
+    out += ramdisk + b"\0" * (pad(len(ramdisk)) - len(ramdisk))
+    if second:
+        out += second + b"\0" * (pad(len(second)) - len(second))
+    if len(out) > BOOT_SLOT:
+        raise Refused("the boot image would be %d bytes; a slot holds %d" % (len(out), BOOT_SLOT))
+    return bytes(out), len(wanted)
+
+
+def _uuid_of(mountpoint):
+    """The filesystem UUID of what is mounted at mountpoint, from sysfs and
+    /dev/disk/by-uuid, without blkid."""
+    dev = None
+    with open("/proc/self/mountinfo") as f:
+        for line in f:
+            p = line.split()
+            if p[4] == mountpoint:
+                dev = os.path.realpath(p[p.index("-") + 2])
+    if not dev:
+        return None
+    for u in os.listdir("/dev/disk/by-uuid"):
+        if os.path.realpath(os.path.join("/dev/disk/by-uuid", u)) == dev:
+            return u
+    return None
+
+
+def check(image):
+    """Everything that has to be true before an image is written to a slot."""
+    b = parse_boot(image)
+    if not id_ok(image):
+        raise Refused("the image's checksum does not match its contents")
+    if le32(image, b["koff"]) != MTK_MAGIC:
+        raise Refused("no MediaTek kernel header")
+    cmd = image[64:64 + 512].split(b"\0")[0].decode("utf-8", "replace")
+    opt = re.search(r"bootopt=(\S+)", cmd)
+    fields = opt.group(1).split(",") if opt else []
+    if len(fields) < 3 or fields[2][:2] != "64":
+        raise Refused("bootopt does not ask for a 64-bit kernel")
+    for key, mnt in (("pmos_root_uuid", "/"), ("pmos_boot_uuid", "/boot")):
+        m = re.search(key + r"=(\S+)", cmd)
+        live = _uuid_of(mnt)
+        if not m or not live or m.group(1) != live:
+            raise Refused("%s is %s, but %s is %s" % (key, m.group(1) if m else "missing", mnt, live))
+    entries = parse_newc(gunzip_first(image[b["roff"]:b["roff"] + b["rsize"]]))
+    # Every newc member, including an appended one after the first.
+    names = {e["name"] for e in entries}
+    tail = image[b["roff"]:b["roff"] + b["rsize"]]
+    d = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        d.decompress(tail)
+    except zlib.error as err:
+        raise Refused("the initramfs does not inflate (%s)" % err)
+    rest = d.unused_data.lstrip(b"\0")
+    if rest:
+        names |= {e["name"] for e in parse_newc(rest)}
+    index = {e["name"]: e for e in entries}
+    if "init" not in names:
+        raise Refused("the initramfs has no init")
+    for _src, dest in FIRMWARE:
+        if resolve(index, dest) not in names:
+            raise Refused("the initramfs lacks %s" % dest)
+    return cmd
+
+
+def current(slot=None):
+    slot = slot or boot_slots()[0]
+    with open(slot, "rb") as f:
+        head = f.read(PAGE)
+        try:
+            n = image_length(head)
+        except Refused:
+            return None
+        f.seek(0)
+        return f.read(n)
+
+
+def id_ok(image):
+    """True when the header's id - SHA-1 over kernel, ramdisk and second
+    stage, each followed by its length - matches the contents. A slot whose
+    write was torn part way keeps its old header over new data, and still
+    parses: this is what tells it apart."""
+    try:
+        b = parse_boot(image)
+    except Refused:
+        return False
+    h = hashlib.sha1()
+    for off, size in ((b["koff"], b["ksize"]), (b["roff"], b["rsize"]), (b["soff"], b["ssize"])):
+        h.update(image[off:off + size])
+        h.update(struct.pack("<I", size))
+    return h.digest() == image[576:596]
+
+
+def sections(image):
+    b = parse_boot(image)
+    return (hashlib.sha256(image[b["koff"]:b["koff"] + b["ksize"]]).hexdigest(),
+            hashlib.sha256(image[b["roff"]:b["roff"] + b["rsize"]]).hexdigest())
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def boot_id():
+    """This boot's identity. An image written since the Echo started has
+    never been booted; the clock cannot say so, it may read 2010."""
+    try:
+        with open("/proc/sys/kernel/random/boot_id") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def read_record():
+    try:
+        with open(RECORD) as f:
+            rec = json.load(f)
+        return rec if isinstance(rec, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def write_file(path, data):
+    """Replace a file so that a power cut leaves the old or the new one."""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    fd = os.open(os.path.dirname(path), os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def rollback_info(want_kernel=None):
+    """Whether the image kept before the last install can be put back, and
+    whether its kernel is not the installed kernel package's. An older
+    kernel would then run with the newer package's modules - the Wi-Fi driver
+    among them - which the page warns about."""
+    info = {"available": os.path.exists(PREVIOUS), "kernel_differs": None}
+    if not want_kernel:
+        # Without a build to compare with, what the last install recorded.
+        rec = read_record()
+        if rec.get("kernel") and rec.get("previous_kernel"):
+            info["kernel_differs"] = rec["kernel"] != rec["previous_kernel"]
+    if info["available"] and want_kernel:
+        try:
+            with open(PREVIOUS, "rb") as f:
+                info["kernel_differs"] = sections(f.read())[0] != want_kernel
+        except (OSError, Refused):
+            pass
+    return info
+
+
+def status():
+    rec = read_record()
+    base = {"last_apply": rec or None}
+    try:
+        slots = boot_slots()
+        want, appended = build()
+        wk, wr = sections(want)
+        olds = [current(s) for s in slots]
+    except Unsupported as err:
+        return dict(base, ok=False, unsupported=True, error=str(err))
+    except Exception as err:                      # noqa: BLE001 - reported, never raised
+        return dict(base, ok=False, error=str(err) or type(err).__name__,
+                    damaged=bool(rec.get("damaged")), rollback=rollback_info())
+    have = olds[0]
+    if have is None:
+        return dict(base, ok=False, error="boot_a does not hold a boot image",
+                    damaged=bool(rec.get("damaged")), rollback=rollback_info())
+    hk, hr = sections(have)
+    rolled = rec.get("rolled_back") or {}
+    return dict(base, ok=True, available=sha(want), installed=sha(have),
+                kernel_differs=wk != hk, initramfs_differs=wr != hr,
+                differs=any(o != want for o in olds),
+                slots_agree=all(o == have for o in olds),
+                damaged=bool(rec.get("damaged")),
+                # A Put back stands only while /boot still builds the image it
+                # put back from: a newer kernel since is a new image to install.
+                rolled_back=(bool(rolled) and rolled.get("sha256") == sha(have)
+                             and rec.get("sha256") == sha(want)),
+                size=len(want),
+                built=time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(BOOT_IMG))),
+                rollback=rollback_info(wk))
+
+
+def write_slot(slot, image):
+    if len(image) > slot_size(slot):
+        raise Refused("the image is larger than %s" % os.path.basename(slot))
+    with open(slot, "r+b") as f:
+        f.write(image)
+        f.flush()
+        os.fsync(f.fileno())
+    with open(slot, "rb") as f:
+        return f.read(len(image)) == image
+
+
+def write_all(slots, image, olds):
+    """Write image to every slot. If any write fails, every slot touched so
+    far - the failing one included - gets its own previous contents back.
+
+    The caller holds termination signals off around this and the record
+    that follows it."""
+    touched = []
+    for slot in slots:
+        touched.append(slot)
+        try:
+            ok, why = write_slot(slot, image), "it did not read back as written"
+        except (OSError, Refused) as err:
+            ok, why = False, str(err)
+        if ok:
+            print("wrote %s: %d bytes" % (os.path.basename(slot), len(image)))
+            continue
+        lost = []
+        for t in touched:
+            try:
+                if olds.get(t) is None or not write_slot(t, olds[t]):
+                    lost.append(os.path.basename(t))
+            except (OSError, Refused):
+                lost.append(os.path.basename(t))
+        if lost:
+            raise Damaged("%s: %s, and %s could not be put back as it was"
+                          % (os.path.basename(slot), why, " and ".join(lost)))
+        raise Refused("%s: %s; every slot was put back as it was"
+                      % (os.path.basename(slot), why))
+
+
+def record_damage(image, err, attempt=None):
+    """Remember, across a restart, that a slot may hold a partial image: the
+    page then refuses a restart, offers the install again, and no later
+    install takes the damaged slot for the image to put back. `attempt` is
+    this install's own time and kernels, so the page does not describe an
+    earlier install. The package job also keeps a marker in /run, for when
+    the root filesystem cannot take even this."""
+    rec = read_record()
+    if attempt:
+        rec.update(attempt)
+        # An install was attempted since: an earlier Put back no longer
+        # describes the slots, and must not hide the row that undoes this.
+        rec.pop("rolled_back", None)
+    rec["damaged"] = {"sha256": sha(image), "when": int(time.time()), "error": str(err)[:200]}
+    try:
+        write_file(RECORD, json.dumps(rec).encode())
+    except OSError as werr:
+        print("biscuit-boot-update: could not record the damage either: %s" % werr, file=sys.stderr)
+
+
+def finish(image, rec, checked=False):
+    """Write the record of what the slots now hold. Every slot is already
+    written (or, `checked`, was read and found to hold it), so a failure here
+    is reported as exactly that, not as a failed install."""
+    rec.pop("damaged", None)
+    try:
+        write_file(RECORD, json.dumps(rec).encode())
+        os.sync()
+    except OSError as err:
+        print("biscuit-boot-update: %s every slot, but could not record it: %s"
+              % ("checked" if checked else "wrote", err), file=sys.stderr)
+        return EXIT_UNRECORDED
+    return 0
+
+
+def apply():
+    slots = boot_slots()
+    image, appended = build()
+    cmd = check(image)
+    olds = {s: current(s) for s in slots}
+    rec = read_record()
+    if all(o == image for o in olds.values()):
+        print("boot_a already holds this image")
+        # Every slot reads back as this image, which is all finish() needs to
+        # know: a damage record from an earlier attempt is over.
+        if rec.get("damaged"):
+            return finish(image, rec, checked=True)
+        return 0
+    have = olds[slots[0]]
+    os.makedirs(STATE_DIR, exist_ok=True)
+    # Keep, as the image to put back, the last one this Echo actually started
+    # from. Not an image this tool wrote since the current boot (it has never
+    # run), not a slot a failed install may have torn (its checksum no longer
+    # matches), and nothing while a damaged install is on record.
+    unbooted = have is not None and rec.get("sha256") == sha(have) and rec.get("boot_id") == boot_id()
+    if have is not None and not unbooted and not rec.get("damaged") and id_ok(have):
+        write_file(PREVIOUS, have)
+    elif have is not None and not unbooted:
+        print("kept the saved previous image: boot_a's current one does not check out")
+    try:
+        with open(PREVIOUS, "rb") as f:
+            previous_kernel = sections(f.read())[0]
+    except (OSError, Refused):
+        previous_kernel = None
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, HELD)
+    try:
+        attempt = {"sha256": sha(image), "when": int(time.time()), "boot_id": boot_id(),
+                   "appended": appended, "cmdline": cmd,
+                   "kernel": sections(image)[0], "previous_kernel": previous_kernel}
+        try:
+            write_all(slots, image, olds)
+        except Damaged as err:
+            record_damage(image, err, attempt)
+            raise
+        return finish(image, attempt)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+
+
+def rollback():
+    slots = boot_slots()
+    with open(PREVIOUS, "rb") as f:
+        image = f.read()
+    check(image)
+    olds = {s: current(s) for s in slots}
+    if all(o == image for o in olds.values()):
+        print("boot_a already holds the previous image")
+        rec = read_record()
+        if rec.get("damaged"):
+            return finish(image, rec, checked=True)
+        return 0
+    held = signal.pthread_sigmask(signal.SIG_BLOCK, HELD)
+    try:
+        try:
+            write_all(slots, image, olds)
+        except Damaged as err:
+            record_damage(image, err)
+            raise
+        rec = read_record()
+        rec["rolled_back"] = {"sha256": sha(image), "when": int(time.time())}
+        return finish(image, rec)
+    finally:
+        signal.pthread_sigmask(signal.SIG_SETMASK, held)
+
+
+def main(argv):
+    cmd = argv[1] if len(argv) > 1 else ""
+    try:
+        if cmd == "status":
+            print(json.dumps(status()))
+            return 0
+        if cmd == "build" and len(argv) > 2:
+            src = argv[3] if len(argv) > 3 else BOOT_IMG
+            image, n = build(src)
+            with open(argv[2], "wb") as f:
+                f.write(image)
+            print("wrote %s: %d bytes, %d file(s) appended to the initramfs" % (argv[2], len(image), n))
+            return 0
+        if cmd == "apply":
+            return apply()
+        if cmd == "rollback":
+            return rollback()
+    except Damaged as err:
+        print("biscuit-boot-update: DAMAGED: %s" % err, file=sys.stderr)
+        return EXIT_DAMAGED
+    except Refused as err:
+        print("biscuit-boot-update: %s" % err, file=sys.stderr)
+        return EXIT_REFUSED
+    except Exception as err:                      # noqa: BLE001 - nothing was written
+        print("biscuit-boot-update: %s" % (str(err) or type(err).__name__), file=sys.stderr)
+        return 1
+    print(__doc__.split("\n\n")[1], file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

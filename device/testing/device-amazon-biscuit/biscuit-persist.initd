@@ -1,0 +1,691 @@
+#!/sbin/openrc-run
+
+name="biscuit-persist"
+description="Mount the persistent store and restore Wi-Fi, Bluetooth and the device name"
+
+# WHY THIS IS A SERVICE AND NOT AN /etc/fstab ENTRY:
+#
+#   /etc/fstab lives on the rootfs, and flashing an update REPLACES the rootfs.
+#   Putting the mounts there means they survive a reboot and vanish on exactly
+#   the occasion they exist for. That was tried, and it cost a user their Wi-Fi
+#   and device name on the first flash after it was set up - the data was still
+#   on the partition, but nothing was left to mount it.
+#
+#   Shipping it as a service in the device package means every image carries it.
+#
+# THE SPLIT THIS EXISTS TO CREATE:
+#
+#   update / reflash -> keep the network and pairings. The flash writes boot_a
+#                       and userdata only, so partition 14 is untouched.
+#   factory reset    -> forget them. biscuit-factory-reset erases the store and
+#                       the setup service raises the onboarding AP because no
+#                       wpa_supplicant.conf exists.
+#
+# Mounted BY LABEL, not UUID: a re-mkfs of the store changes the UUID, and an
+# fstab-style UUID reference would then silently fail to mount.
+
+STORE=/opt
+LABEL=biscuit-opt
+
+# THE PACKAGE FEED. Both halves of it live on the ROOTFS - the trusted key in
+# /etc/apk/keys and the repository line in /etc/apk/repositories - so a flash
+# takes them with it and the device silently stops seeing updates, with no
+# error anywhere to say why. The key is public, so the package carries its own
+# copy and start() puts both back on every boot.
+#
+# Restored HERE and not from .post-install, because install scripts do not run
+# on upgrade at all - only on a first install - so a device that already had
+# the package would never have got them.
+#
+# THE FEED IS ON BY DEFAULT, AND THE OWNER CAN TURN IT OFF FOR GOOD. Because
+# the line is put back on every boot, deleting it from /etc/apk/repositories
+# lasted only until the next one. The owner's choice therefore lives on the
+# persist partition, where it also survives a flash:
+#
+#     /opt/persist/update-feed   "off"  the feed line is kept out of
+#                                       /etc/apk/repositories (an active one is
+#                                       removed once); nothing from the feed is
+#                                       offered or installed any more
+#                                "on"   a request to turn it back on: a
+#                                       commented-out line is uncommented, a
+#                                       missing one added, and the file is then
+#                                       removed, which is the default
+#                                no file: the default, the line is added when
+#                                       missing
+#
+# Case and blanks in the file do not matter; any other word is ignored with a
+# warning and the feed stays on.
+#
+# Commenting the line out ("#https://...") is also honoured, as it always was,
+# and is recorded as "off" the first time it is seen, so it outlives a flash
+# too. Deleting the line outright cannot be told apart from a flash that took
+# it, so that alone still brings it back. The signing key stays either way: it
+# only lets apk verify packages that claim to come from the feed.
+#
+# THE WAY BACK. Once "off" has been applied, an ACTIVE feed line appearing in
+# the file again - the owner uncommenting it, or adding it back - means the
+# owner turned the feed back on: the flag is removed and the line kept. That
+# needs to know that "off" was already applied to THIS root filesystem, which
+# is what FEED_OFF_MARK records. It is on the rootfs, so a flash removes it:
+# on a freshly flashed rootfs an active line is removed as before rather than
+# read as the owner's choice. (The image itself carries no feed line - it is
+# built with pmbootstrap's default mirrors and only this service adds it - so
+# that is belt and braces.) A settings reset writes "on" (apply_reset).
+FEED_URL=https://liamtw22.github.io/biscuit-apk/edge
+FEED_KEY_SRC=/usr/share/biscuit/biscuit-apk.rsa.pub
+FEED_KEY_DST=/etc/apk/keys/biscuit-apk.rsa.pub
+FEED_FLAG=$STORE/persist/update-feed
+# Overridable only so a test harness can point them at copies.
+: "${APK_REPOSITORIES:=/etc/apk/repositories}"
+: "${FEED_OFF_MARK:=/var/lib/biscuit/update-feed-off}"
+
+depend() {
+	need localmount
+	# Everything that reads this state must come after us. `local` matters
+	# because /etc/local.d/wifi.start lives there and starts wpa_supplicant.
+	# `sshd` matters because it generates host keys in its own start_pre if it
+	# does not find any, and a generated key is a NEW identity.
+	before local net bluetooth sshd
+}
+
+# Bind one directory from the store over its normal path, creating both sides
+# on first boot so a fresh store works without special-casing.
+bind_dir() {
+	src="$STORE/persist/$1"
+	dst="$2"
+	mkdir -p "$src" "$dst" 2>/dev/null
+	mountinfo -q "$dst" && return 0
+	mount --bind "$src" "$dst"
+}
+
+# SSH SURVIVES A FLASH FROM HERE ON.
+#
+# A flash replaces the rootfs, which took two things with it. sshd found no host
+# keys and generated fresh ones, so the device came back with a NEW IDENTITY and
+# every client refused to connect with REMOTE HOST IDENTIFICATION HAS CHANGED.
+# And ~/.ssh/authorized_keys was gone, so the only way back in was a password -
+# which OpenSSH cannot supply non-interactively, making recovery a manual job on
+# every single update.
+#
+# Both now live in the store, by the same split as everything else here: an
+# update keeps them, a factory reset forgets them and the device lands in setup.
+
+# The host identity. Copied rather than bound: /etc/ssh also holds
+# sshd_config, which belongs to the package and must NOT come from the store -
+# binding the directory would freeze a config the package can no longer update.
+persist_ssh_host_keys() {
+	src="$STORE/persist/ssh/host"
+	mkdir -p "$src"
+	chmod 700 "$src"
+
+	# First boot ever: neither side has keys, and sshd would generate them in
+	# its own start_pre - after us, so we would not capture them until the NEXT
+	# boot, leaving exactly one flash window where the identity still changes.
+	# Generating them here closes that window.
+	if ! ls "$src"/ssh_host_*_key >/dev/null 2>&1 &&
+	   ! ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1; then
+		ssh-keygen -A >/dev/null 2>&1 || true
+	fi
+
+	if ls "$src"/ssh_host_*_key >/dev/null 2>&1; then
+		cp -p "$src"/ssh_host_* /etc/ssh/ 2>/dev/null || true
+	elif ls /etc/ssh/ssh_host_*_key >/dev/null 2>&1; then
+		cp -p /etc/ssh/ssh_host_* "$src"/ 2>/dev/null || true
+	fi
+
+	# sshd refuses to start on a private key it considers world-readable.
+	for _k in /etc/ssh/ssh_host_*_key; do
+		[ -e "$_k" ] && chmod 600 "$_k"
+	done
+	for _k in /etc/ssh/ssh_host_*_key.pub; do
+		[ -e "$_k" ] && chmod 644 "$_k"
+	done
+}
+
+# Authorised keys, per user. BOUND rather than copied, so a key added by the
+# settings page or by ssh-copy-id lands in the store immediately - a copy would
+# need a matching write-back and would lose anything added between the last
+# sync and an unclean shutdown.
+#
+# Ownership is reapplied on every boot rather than once at creation, because
+# setup replaces the shipped account: the store directory can easily outlive
+# the uid that made it, and sshd's StrictModes silently ignores an
+# authorized_keys whose directory the user does not own.
+persist_ssh_authorized_keys() {
+	for _home in /home/*; do
+		[ -d "$_home" ] || continue
+		_user=${_home##*/}
+		src="$STORE/persist/ssh/users/$_user"
+		dst="$_home/.ssh"
+		mkdir -p "$src"
+
+		# MERGE what the live directory has into the store - never replace it,
+		# and never hide it.
+		#
+		# The old rule adopted the live file only when the store had none at
+		# all. That looks safe and is not: a flash installs a fresh image whose
+		# authorized_keys the store has never seen, the store already has an
+		# entry for that username from before, so nothing is adopted and the
+		# bind mount below hides the key the image just installed. The device
+		# then refuses the only key that could reach it. Observed twice in one
+		# evening, on the account the flash had just recreated.
+		#
+		# Merging cannot lock anyone out: a key present in either place ends up
+		# in both. Removing a key stays a deliberate act through the :8080 SSH
+		# page, which rewrites the store copy.
+		if [ -s "$dst/authorized_keys" ]; then
+			touch "$src/authorized_keys" 2>/dev/null
+			while IFS= read -r _key; do
+				case "$_key" in
+				""|"#"*) continue ;;
+				esac
+				grep -qxF "$_key" "$src/authorized_keys" 2>/dev/null ||
+					printf '%s\n' "$_key" >> "$src/authorized_keys"
+			done < "$dst/authorized_keys"
+		fi
+
+		# From /etc/passwd, not from the home directory's own ownership: on
+		# this image /home/user is group root, and propagating that would give
+		# the store a group the account is not even in. Mode 700 makes it
+		# harmless either way, but "owned by the user" is what StrictModes is
+		# actually asking about.
+		_ug=$(awk -F: -v u="$_user" '$1 == u { print $3 ":" $4; exit }' /etc/passwd)
+		[ -n "$_ug" ] && chown -R "$_ug" "$src" 2>/dev/null
+		chmod 700 "$src"
+		[ -e "$src/authorized_keys" ] && chmod 600 "$src/authorized_keys"
+
+		mkdir -p "$dst"
+		mountinfo -q "$dst" || mount --bind "$src" "$dst"
+	done
+}
+
+# Carry out a reset requested from the settings page.
+#
+# The request is a one-word file - settings, network or all - and the list of
+# what each erases is /usr/share/biscuit/reset.conf, which the page also shows
+# before anyone confirms. The request is removed first, so a reset that fails
+# part-way cannot repeat at every boot.
+RESET_REQUEST=reset-request
+RESET_LIST=/usr/share/biscuit/reset.conf
+
+apply_reset() {
+	[ -f "$STORE/persist/$RESET_REQUEST" ] || return 0
+	_scope=$(tr -dc 'a-z' < "$STORE/persist/$RESET_REQUEST")
+	rm -f "$STORE/persist/$RESET_REQUEST"
+	sync
+	case "$_scope" in
+	settings) _take="settings" ;;
+	network)  _take="network" ;;
+	all)      _take="settings network all" ;;
+	*) ewarn "ignoring unknown reset '$_scope'"; return 0 ;;
+	esac
+	[ -r "$RESET_LIST" ] || { ewarn "no $RESET_LIST; reset not done"; return 0; }
+	einfo "reset: $_scope"
+
+	# Erasing everything takes the owner account too: the rootfs copy as well
+	# as the saved one, or the old password would still work and setup, seeing
+	# an account, would not ask for a new one. The shipped default stays as
+	# setup left it, locked.
+	if [ "$_scope" = all ]; then
+		_owner=$(cat "$STORE/persist/provisioned" 2>/dev/null)
+		case "$_owner" in
+		""|root|user) ;;
+		*)
+			if id "$_owner" >/dev/null 2>&1; then
+				deluser --remove-home "$_owner" >/dev/null 2>&1 ||
+					ewarn "reset: could not remove the account $_owner"
+			fi
+			;;
+		esac
+		# A new identity: sshd makes fresh host keys when it finds none, and
+		# the saved copies go with the ssh line in the list.
+		rm -f /etc/ssh/ssh_host_*
+		echo amazon-biscuit > /etc/hostname
+	fi
+
+	while read -r _s _p _rest; do
+		case "$_s" in ""|"#"*) continue ;; esac
+		case " $_take " in *" $_s "*) ;; *) continue ;; esac
+		case "$_p" in
+		/*) _path=$_p ;;
+		*..*) continue ;;
+		*) _path=$STORE/persist/$_p ;;
+		esac
+		if [ -d "$_path" ] && [ ! -L "$_path" ]; then
+			# Emptied, not removed: some are bind targets.
+			find "$_path" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null
+		else
+			rm -f "$_path"
+		fi
+	done < "$RESET_LIST"
+	# A settings reset turns the update feed back on, however it was turned
+	# off: removing the flag alone would leave a commented-out line, which
+	# apply_feed_choice would record as "off" all over again. "on" is carried
+	# out later in this same boot and then removed.
+	case " $_take " in
+	*" settings "*) printf 'on\n' > "$FEED_FLAG" 2>/dev/null ||
+		ewarn "reset: could not turn the update feed back on" ;;
+	esac
+	sync
+	# For the setup page, which says which reset brought the device there.
+	echo "$_scope" > /run/biscuit-reset-done 2>/dev/null
+	einfo "reset: $_scope done"
+}
+
+# The feed's line in /etc/apk/repositories, as the owner wants it. Matched as
+# a whole line with awk - surrounding blanks and an "@tag " prefix aside - not
+# as a pattern, so the dots in the hostname match only dots, and "#<url>"
+# (commented out) is told apart from "<url>" (active).
+# 0 active, 1 commented out only, 2 absent.
+feed_line_state() {
+	awk -v u="$FEED_URL" '
+		{ l = $0; sub(/^[ \t]+/, "", l); sub(/[ \t\r]+$/, "", l)
+		  sub(/^@[^ \t]+[ \t]+/, "", l) }
+		l == u || l == u "/" { a = 1; next }
+		l ~ /^#/ { sub(/^#[ \t]*/, "", l); sub(/^@[^ \t]+[ \t]+/, "", l)
+			   if (l == u || l == u "/") c = 1 }
+		END { exit a ? 0 : (c ? 1 : 2) }' "$APK_REPOSITORIES" 2>/dev/null
+}
+
+# /etc/apk/repositories with one change, on stdout:
+#   drop       every active feed line removed
+#   uncomment  the first commented-out feed line made active again, its
+#              "@tag" prefix and everything else about it kept
+#   append     the feed line added at the end
+# Every other line is passed through as it is. awk ends every line it prints
+# with a newline, so a file whose last line had none is not glued onto the
+# appended URL (which would break both repositories).
+_feed_awk() {
+	awk -v u="$FEED_URL" -v mode="$1" '
+		function bare(s) {
+			sub(/^[ \t]+/, "", s); sub(/[ \t\r]+$/, "", s)
+			sub(/^@[^ \t]+[ \t]+/, "", s); return s
+		}
+		{ l = bare($0) }
+		mode == "drop" && (l == u || l == u "/") { next }
+		mode == "uncomment" && !done && l ~ /^#/ {
+			c = l; sub(/^#[ \t]*/, "", c); c = bare(c)
+			if (c == u || c == u "/") {
+				s = $0; sub(/^[ \t]*#[ \t]*/, "", s)
+				print s; done = 1; next
+			}
+		}
+		{ print }
+		END { if (mode == "append") print u }' "$APK_REPOSITORIES"
+}
+
+# Replace /etc/apk/repositories with _feed_awk's version of it. 0 when done.
+#
+# Written to a file beside it and renamed over it, so a power cut leaves the
+# old file or the new one, never a truncated one. busybox awk exits 0 even when
+# its output could not be written - a full disk - so the copy is compared with
+# a second run before it replaces anything: a short copy would otherwise have
+# replaced the file and taken every repository with it. The copy is given the
+# original's mode and owner first.
+_feed_rewrite() {
+	_tmp=$APK_REPOSITORIES.biscuit-tmp
+	rm -f "$_tmp"
+	if _feed_awk "$1" > "$_tmp" 2>/dev/null &&
+	   _feed_awk "$1" 2>/dev/null | cmp -s - "$_tmp"; then
+		_m=$(stat -c %a "$APK_REPOSITORIES" 2>/dev/null) &&
+			chmod "$_m" "$_tmp" 2>/dev/null
+		_o=$(stat -c %u:%g "$APK_REPOSITORIES" 2>/dev/null) &&
+			chown "$_o" "$_tmp" 2>/dev/null
+		if mv -f "$_tmp" "$APK_REPOSITORIES" 2>/dev/null; then
+			sync
+			return 0
+		fi
+	fi
+	rm -f "$_tmp"
+	ewarn "could not rewrite $APK_REPOSITORIES (disk full?); left it unchanged"
+	return 1
+}
+
+# "off" has been applied to this rootfs. See FEED_OFF_MARK above.
+_feed_mark_off() {
+	[ -f "$FEED_OFF_MARK" ] && return 0
+	mkdir -p "${FEED_OFF_MARK%/*}" 2>/dev/null
+	: > "$FEED_OFF_MARK" 2>/dev/null ||
+		ewarn "could not write $FEED_OFF_MARK; uncommenting the feed line will not turn it back on"
+}
+
+apply_feed_choice() {
+	[ -f "$APK_REPOSITORIES" ] || return 0
+	# Case and blanks do not matter: "OFF" is off.
+	_want=$( { tr 'A-Z' 'a-z' < "$FEED_FLAG" | tr -dc 'a-z'; } 2>/dev/null)
+	case "$_want" in
+	""|on|off) ;;
+	*)
+		ewarn "$FEED_FLAG says '$_want', which is neither on nor off; the update feed stays on"
+		_want=""
+		;;
+	esac
+	feed_line_state
+	_line=$?
+	case "$_want" in
+	on)
+		# The owner's (or a settings reset's) request to turn it back on.
+		# Carried out, then removed: from here on the default applies, so
+		# commenting the line out again is an opt-out again.
+		case "$_line" in
+		0) ;;
+		1) _feed_rewrite uncomment || return 0 ;;
+		*) _feed_rewrite append || return 0 ;;
+		esac
+		rm -f "$FEED_FLAG" "$FEED_OFF_MARK"
+		einfo "the update feed is on ($FEED_FLAG asked for it)"
+		;;
+	off)
+		if [ "$_line" != 0 ]; then
+			_feed_mark_off
+		elif [ -f "$FEED_OFF_MARK" ]; then
+			# "off" was applied to this rootfs and the line is active again:
+			# the owner uncommented or re-added it to turn the feed back on.
+			rm -f "$FEED_FLAG" "$FEED_OFF_MARK"
+			einfo "the update feed line is active again; the feed is back on"
+		elif _feed_rewrite drop; then
+			# Drop the active line only; everything else, a commented-out
+			# copy included, stays exactly as it was.
+			_feed_mark_off
+			einfo "the update feed is off ($FEED_FLAG); removed its repository"
+		fi
+		;;
+	*)
+		case "$_line" in
+		0)
+			rm -f "$FEED_OFF_MARK"
+			;;
+		1)
+			# Commented out by hand: the owner's opt-out, which a flash
+			# would otherwise undo. Record it where a flash cannot reach.
+			if printf 'off\n' > "$FEED_FLAG" 2>/dev/null; then
+				_feed_mark_off
+				einfo "the update feed was commented out; recorded as off in $FEED_FLAG"
+			fi
+			;;
+		*)
+			_feed_rewrite append &&
+				rm -f "$FEED_OFF_MARK" &&
+				einfo "restored the package feed repository"
+			;;
+		esac
+		;;
+	esac
+	return 0
+}
+
+start() {
+	ebegin "Mounting the persistent store"
+
+	if ! mountinfo -q "$STORE"; then
+		mkdir -p "$STORE"
+		# nofail in spirit: a device whose store is missing or corrupt must
+		# still boot. It comes up unconfigured and lands in setup, which is
+		# the same outcome as a factory reset - recoverable, not bricked.
+		if ! mount -L "$LABEL" "$STORE" 2>/dev/null; then
+			ewarn "no partition labelled $LABEL; settings will not persist"
+			eend 0
+			return 0
+		fi
+	fi
+
+	# A reset chosen on the settings page. Done here, at boot, before anything
+	# has read the store or bound it into place: a reset carried out while the
+	# device was running would race every service that saves its settings, and
+	# this service's own stop() writes the device name back on the way down.
+	apply_reset
+
+	bind_dir wpa_supplicant /etc/wpa_supplicant
+	bind_dir bluetooth /var/lib/bluetooth
+	# OWNER-IMPORTED STOCK ASSETS. The Fire OS 6 microphone chain reads its
+	# coefficients and DNN VAD from /usr/share/biscuit/fireos6, which is on the
+	# ROOTFS - so a flash wipes them and the device comes back holding a profile
+	# setting it cannot honour: run_fireos6 refuses, mic-stream falls back to the
+	# pmos chain, and mic.env still says fireos6. That has already happened once.
+	#
+	# These are Amazon files that each owner extracts from their own device, so
+	# they are never packaged; the store is the only place they can live. An
+	# EMPTY bind is fine and is what an owner who has imported nothing gets: the
+	# size gate in biscuit-mic-stream then refuses the profile and says so.
+	bind_dir fireos6 /usr/share/biscuit/fireos6
+
+	# Put the owner's imported files in place NOW, in the boot runlevel. The
+	# Wi-Fi firmware is one of them, and wlan_mt6625l reads it from the root
+	# filesystem when Wi-Fi starts. On a fresh install nothing else has done this
+	# yet, and a device with no Wi-Fi firmware cannot raise its setup hotspot,
+	# which is the only way a new owner can reach it. biscuit-mic-hub also runs
+	# this, but from the default runlevel, with no ordering against Wi-Fi.
+	# Safe with nothing imported: it then does nothing.
+	if [ -x /usr/bin/biscuit-import-assets ]; then
+		/usr/bin/biscuit-import-assets activate >/dev/null 2>&1 ||
+			ewarn "could not activate the imported assets"
+	fi
+
+	# /boot READ-ONLY. It is journal-less ext2, postmarketOS never fsck's it,
+	# `Maximum mount count` is -1 so nothing ever forces a check, and initramfs
+	# stage 1 cannot boot without it. A power cut while it is mounted rw is
+	# therefore the one corruption on this device that only a reflash recovers
+	# from - and nothing on a running device needs to write there except
+	# boot-deploy, which reopens it through its own hook.
+	#
+	# DONE HERE RATHER THAN IN /etc/fstab, and not by choice: pmbootstrap
+	# regenerates fstab on every image build, so an `ro` written there is
+	# discarded by the next flash. That is why this fix was made once before
+	# and lost. Same reasoning as the mounts above - a service ships in the
+	# package, an fstab line does not survive.
+	if mountinfo -q /boot 2>/dev/null &&
+	   ! grep -q " /boot .*[(, ]ro[,) ]" /proc/mounts 2>/dev/null; then
+		if mount -o remount,ro /boot 2>/dev/null; then
+			einfo "/boot remounted read-only"
+		else
+			ewarn "could not remount /boot read-only"
+		fi
+	fi
+
+	# Hands-free calling. bluealsa is told which profiles to offer through
+	# /etc/conf.d/bluealsa, which belongs to bluez-alsa-openrc and ships
+	# A2DP-only - so it is on the rootfs, replaced by every flash, and cannot
+	# simply be shipped in our package without conflicting with its owner.
+	#
+	# HFP works from kernel pkgrel 233, which enabled CONFIG_BT_RFCOMM. Without
+	# RFCOMM, BlueZ could not open the server socket, published no SDP record,
+	# and no phone would offer to route calls here - a2dp hid it completely for
+	# months because it runs over L2CAP and never touches RFCOMM.
+	#
+	# hfp-hf is the right role: the phone is the Audio Gateway, this device is
+	# the hands-free unit a call gets routed TO.
+	# LC3-SWB has to be excluded, not merely deprioritised. Call audio never
+	# crosses HCI on this SoC: the BT firmware leaves frames in a shared SRAM
+	# bank that the MediaTek BTCVSD block reads, and that block handles CVSD
+	# and mSBC only. Left to themselves, a modern phone and bluez-alsa pick
+	# LC3-SWB at 32 kHz - the best of the three, and unusable here. Measured
+	# on a real call: hw:0,3 never became readable at all, in either
+	# direction, while bluez-alsa reported the transport running.
+	#
+	# "-c -NAME" disables one codec and leaves the rest alone. An allow-list
+	# would have silently taken aptX, LDAC and Opus away from A2DP, which
+	# works today and has nothing to do with this.
+	# The r158 duplex bridge handles mSBC as well as CVSD. Preserve the
+	# working negotiation after reboot; only unsupported LC3-SWB is excluded.
+	_ba_want='BLUEALSA_CONF="-p a2dp-source -p a2dp-sink -p hfp-hf -c -LC3-SWB"'
+	if [ -f /etc/conf.d/bluealsa ] &&
+	   ! grep -qxF "$_ba_want" /etc/conf.d/bluealsa 2>/dev/null; then
+		sed -i "s|^BLUEALSA_CONF=.*|$_ba_want|" \
+			/etc/conf.d/bluealsa 2>/dev/null &&
+			einfo "set bluealsa profiles and codecs for hands-free calling"
+	fi
+
+	# Our /etc/sudoers.d/10-biscuit-wheel rule only does anything if
+	# /etc/sudoers actually reads that directory. Alpine's sudo ships the
+	# directive, but /etc/sudoers belongs to the sudo package and is replaced
+	# by every flash - and if it ever lands without it, the rule is a silent
+	# no-op and the device becomes unadministrable over SSH with nothing
+	# anywhere to say why. Cheap to check, so check it.
+	#
+	# Validated before it is kept: a malformed /etc/sudoers makes sudo refuse
+	# every command, which is the one outcome worse than needing a password.
+	if [ -f /etc/sudoers ] && [ -d /etc/sudoers.d ] &&
+	   ! grep -qE '^[@#]includedir[[:space:]]+/etc/sudoers\.d' /etc/sudoers; then
+		cp -p /etc/sudoers /etc/sudoers.biscuit-bak
+		printf '%s\n' '@includedir /etc/sudoers.d' >> /etc/sudoers
+		if visudo -cf /etc/sudoers >/dev/null 2>&1; then
+			rm -f /etc/sudoers.biscuit-bak
+			einfo "enabled /etc/sudoers.d"
+		else
+			mv -f /etc/sudoers.biscuit-bak /etc/sudoers
+			ewarn "refusing to enable /etc/sudoers.d: visudo rejected it"
+		fi
+	fi
+
+	# The owner account itself. This must run BEFORE the authorized_keys work
+	# below, because that binds each account's ~/.ssh and there is no home to
+	# bind onto until the account exists again.
+	#
+	# A flash replaces /etc/passwd and /etc/shadow while leaving the persist
+	# partition alone, so the device came back owned by nobody, with the
+	# shipped default account in place of the real one and its SSH key gone.
+	if [ -x /usr/bin/biscuit-persist-account ]; then
+		if /usr/bin/biscuit-persist-account restore; then
+			einfo "rebuilt the owner account after a flash"
+		fi
+		/usr/bin/biscuit-persist-account save
+	fi
+
+	persist_ssh_host_keys
+	persist_ssh_authorized_keys
+
+	# The regulatory region chosen during setup. wpa_supplicant reapplies this
+	# itself from country= in its config, but only once it starts - this makes
+	# the domain right from boot, which matters for anything that looks at the
+	# channel list before then, and keeps the setting true even if the
+	# supplicant config is ever rebuilt without it.
+	#
+	# Silently does nothing without /lib/firmware/regulatory.db in the
+	# INITRAMFS: the kernel asks for it about five seconds before the rootfs is
+	# mounted, never retries, and falls back to a world domain that refuses
+	# every `iw reg set`. See 51-biscuit-regdb.files.
+	if [ -s "$STORE/persist/region" ]; then
+		_region=$(cat "$STORE/persist/region" 2>/dev/null)
+		case "$_region" in
+		[A-Z][A-Z]) iw reg set "$_region" 2>/dev/null &&
+			einfo "regulatory region $_region" ;;
+		esac
+	fi
+
+	# The device name is a single file, so it is copied rather than bound.
+	# The store is authoritative when it has one.
+	if [ -s "$STORE/persist/etc/hostname" ]; then
+		cp "$STORE/persist/etc/hostname" /etc/hostname
+		hostname -F /etc/hostname 2>/dev/null || true
+	elif [ -s /etc/hostname ]; then
+		# First boot after a factory reset, or the very first boot with a
+		# store: adopt whatever the image came with so the next flash keeps it.
+		mkdir -p "$STORE/persist/etc"
+		cp /etc/hostname "$STORE/persist/etc/hostname"
+	fi
+	# Avahi and BlueZ publish the name too, from their own config files on the
+	# rootfs. Derive both from the name just restored, before either starts, so
+	# a reflash or a rename made through one path cannot leave <name>.local, a
+	# phone's Bluetooth list and Home Assistant showing three different names.
+	_name=$(cat /etc/hostname 2>/dev/null)
+	case "$_name" in
+	""|*[!A-Za-z0-9-]*) ;;
+	*)
+		if [ -f /etc/avahi/avahi-daemon.conf ] &&
+		   ! grep -qx "host-name=$_name" /etc/avahi/avahi-daemon.conf; then
+			sed -i "s/^#\?host-name=.*/host-name=$_name/" /etc/avahi/avahi-daemon.conf
+		fi
+		if [ -f /etc/bluetooth/main.conf ] &&
+		   ! grep -qx "Name = $_name" /etc/bluetooth/main.conf; then
+			sed -i "s/^#\?Name = .*/Name = $_name/" /etc/bluetooth/main.conf
+		fi
+		# Until r287 biscuit-btaudio and every pairing window forced the alias
+		# "Echo-Dot-PMOS", which BlueZ saved and which outranks main.conf's
+		# Name - so the device name never reached a phone. That alias was
+		# ours, not the owner's; one they set on the settings page is anything
+		# else and is kept. Done here, on the file, because bluetoothd is not
+		# running yet: from biscuit-btaudio the adapter was not registered in
+		# time for bluetoothctl to report its alias, and the check saw nothing.
+		for _s in /var/lib/bluetooth/*/settings; do
+			[ -f "$_s" ] && grep -qx "Alias=Echo-Dot-PMOS" "$_s" &&
+				sed -i "/^Alias=Echo-Dot-PMOS$/d" "$_s"
+		done
+		;;
+	esac
+
+	# The time zone chosen on the settings page. /etc/localtime is on the
+	# rootfs, which a flash replaces; with none chosen - or after a reset - it
+	# is UTC, as the image ships.
+	_tz=$(cat "$STORE/persist/timezone" 2>/dev/null)
+	case "$_tz" in
+	""|*..*|/*) _tz=Etc/UTC ;;
+	esac
+	[ -f "/usr/share/zoneinfo/$_tz" ] || _tz=Etc/UTC
+	if [ "$(readlink /etc/localtime 2>/dev/null)" != "/usr/share/zoneinfo/$_tz" ]; then
+		ln -sf "/usr/share/zoneinfo/$_tz" /etc/localtime
+	fi
+	echo "$_tz" > /etc/timezone
+	# What the services starting now will use, so the settings page can say
+	# when a later change has not reached them yet.
+	echo "$_tz" > /run/biscuit-timezone-at-boot
+
+	# Stop pam_openrc autostarting a per-user OpenRC session on every login.
+	#
+	# On a headless appliance that session has nothing to run, but a second
+	# concurrent login collides with the first session's supervisor and OpenRC
+	# leaves a marker in /run/openrc/failed that outlives it. `rc-status` then
+	# reports `user.user [failed]` for ever - the sort of standing false alarm
+	# that hides a real one. rc.conf documents this switch as disabling the
+	# module "without the need of removing it from the pam configuration files".
+	#
+	# WHY HERE AND NOT IN THE POST-INSTALL, WHICH ALSO SETS IT:
+	#
+	#   The post-install cannot be relied on for this, twice over. It only runs
+	#   on a fresh *install*, so `pmbootstrap install` into an existing rootfs
+	#   upgrades the package and never runs it; and package ordering decides
+	#   whether the files it edits exist yet - the same trap that made the whole
+	#   script exit early until r132. Doing it here is order-independent and
+	#   self-healing, which is the pattern biscuit-btaudio.sh uses for
+	#   main.conf and wifi.start uses for wpa_supplicant.conf.
+	#
+	#   Setting it at boot takes effect from this boot on: the collision needs
+	#   two logins, which cannot happen before we run.
+	#
+	# The substitution matches an optional leading '#' in one expression. The
+	# `0,/re/s||repl|` form looks tidier but its empty regex is a GNU sed
+	# extension: busybox sed accepts it, changes nothing and exits 0.
+	if [ -f /etc/rc.conf ] &&
+	   ! grep -qE '^[[:space:]]*rc_autostart_user[[:space:]]*=[[:space:]]*"?NO"?' /etc/rc.conf; then
+		if grep -qE '^[[:space:]]*#?[[:space:]]*rc_autostart_user[[:space:]]*=' /etc/rc.conf; then
+			sed -i 's|^[[:space:]]*#\?[[:space:]]*rc_autostart_user[[:space:]]*=.*|rc_autostart_user="NO"|' /etc/rc.conf
+		else
+			printf '
+rc_autostart_user="NO"
+' >> /etc/rc.conf
+		fi
+		einfo "disabled pam_openrc user sessions in /etc/rc.conf"
+	fi
+
+	# Put the feed back if a flash took it, unless the owner turned it off (see
+	# FEED_FLAG above). The key is only copied when absent.
+	if [ -f "$FEED_KEY_SRC" ] && [ ! -f "$FEED_KEY_DST" ]; then
+		mkdir -p /etc/apk/keys 2>/dev/null
+		cp "$FEED_KEY_SRC" "$FEED_KEY_DST" &&
+			einfo "restored the package feed signing key"
+	fi
+	apply_feed_choice
+
+	eend 0
+}
+
+stop() {
+	# Capture a name chosen during this session - the setup flow writes
+	# /etc/hostname, which is on the rootfs and about to be thrown away.
+	if [ -s /etc/hostname ] && mountinfo -q "$STORE"; then
+		mkdir -p "$STORE/persist/etc"
+		cp /etc/hostname "$STORE/persist/etc/hostname" 2>/dev/null || true
+	fi
+	# The binds are deliberately left up: unmounting them here would race
+	# services that are still shutting down and still reading this state.
+	return 0
+}

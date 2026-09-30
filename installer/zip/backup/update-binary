@@ -1,0 +1,168 @@
+#!/sbin/sh
+# amazon-biscuit-backup: save everything of this Echo's that postmarketOS
+# needs or that cannot be recovered from anywhere else, BEFORE Fire OS is
+# replaced.
+#
+# Writes /sdcard/biscuit-backup/<serial>/ on the Echo:
+#   raw/      both GPTs, the eMMC boot areas (boot1 holds this unit's factory
+#             calibration and identity) and partitions 1-12
+#   assets/   this Echo's own firmware, microphone files and speaker
+#             correction curve, found by content in its Fire OS system
+#             partition and its stock kernel
+#   earcon/   its own sounds
+#   led/      its own light ring animations (always there, if empty)
+#   info.txt  serial, format (BACKUP_FORMAT in functions.sh), made_by,
+#             led_count and more
+#   SHA256SUMS
+#
+# Copy it to your computer afterwards (adb pull /sdcard/biscuit-backup) and
+# confirm with: adb shell touch /sdcard/biscuit-backup/<serial>/COPIED
+# The install zip refuses to run until that file exists, because installing
+# erases the storage this backup is on.
+
+OUTFD=$2
+ZIP=$3
+WORK=/dev/tmp/biscuit
+LOG=/tmp/biscuit-backup.log
+rm -rf $WORK
+mkdir -p $WORK
+: > $LOG
+# TWRP's unzip ignores wildcards - it extracts nothing and still succeeds -
+# so every member is named.
+ok=1
+unzip -o "$ZIP" zip.prop bin/busybox bin/biscuit-tool common/functions.sh assets.list -d $WORK >> $LOG 2>&1 || ok=0
+for f in zip.prop bin/busybox bin/biscuit-tool common/functions.sh assets.list; do [ -s $WORK/$f ] || ok=0; done
+[ $ok = 1 ] || { echo -e "ui_print (!) Could not unpack the zip\nui_print" >> /proc/self/fd/$OUTFD; exit 1; }
+chmod 755 $WORK/bin/*
+. $WORK/common/functions.sh
+fix_outfd
+
+banner
+check_device
+ui_print "Echo $SERIAL, TWRP $(getprop ro.twrp.version)"
+
+read_layout
+[ "$KIND" = v2_stock_geometry ] ||
+	abort "The partition table is '$KIND'. A backup is taken on the stock amonet v2 layout, before installing."
+
+mount_storage || abort "TWRP's storage (/sdcard) is not mounted. Try: adb shell twrp mount data"
+# -P: one line per filesystem; busybox otherwise wraps a long by-name device.
+free=$($BB df -Pk /sdcard | tail -1 | awk '{print $4}')
+[ "$free" -gt 200000 ] || abort "Less than 200 MB free on /sdcard."
+
+DEST=$BACKUP_ROOT_SDCARD/$SERIAL
+PART=$DEST.partial
+rm -rf "$PART"
+mkdir -p "$PART/raw" "$PART/assets" "$PART/earcon" "$PART/led"
+
+# --- the partition tables, the boot areas, partitions 1-12 --------------------
+ui_print "Saving the partition tables and boot areas ..."
+read_range "$PART/raw/gpt-head.bin" 0 34
+read_range "$PART/raw/gpt-tail.bin" $((TOTAL - 33)) 33
+for area in mmcblk0boot0 mmcblk0boot1; do
+	$BB dd if=/dev/block/$area of="$PART/raw/$area.img" bs=4096 2>>$LOG || abort "Could not read $area."
+	[ "$(sha_of_file "$PART/raw/$area.img")" = "$($BB dd if=/dev/block/$area bs=4096 2>/dev/null | $BB sha256sum | cut -d' ' -f1)" ] ||
+		abort "$area did not read the same twice."
+done
+ui_print "Saving partitions 1-12 ..."
+for p in $PREFIX; do
+	name=${p%%:*}
+	set -- $(prefix_range $name)
+	read_range "$PART/raw/$name.img" $1 $(($2 - $1 + 1))
+	[ "$(sha_of_file "$PART/raw/$name.img")" = "$(sha_of_range $1 $(($2 - $1 + 1)))" ] ||
+		abort "$name did not read back the same."
+done
+
+# --- this Echo's own firmware and sounds --------------------------------------
+# assets.list is the package manifest's accepted files: profile|name|bytes|sha256.
+# A file is taken only if its content matches, whatever it is called.
+ui_print "Collecting this Echo's firmware and sounds ..."
+sizes=$(cut -d'|' -f3 $WORK/assets.list | sort -u)
+take() {   # FILE ORIGIN
+	sz=$($BB stat -c %s "$1")
+	echo "$sizes" | grep -qx "$sz" || return 0
+	h=$(sha_of_file "$1")
+	line=$(grep "|$sz|$h\$" $WORK/assets.list | head -1)
+	[ -n "$line" ] || return 0
+	# Quoted: TWRP's sh is mksh, where a bare | in a pattern is alternation.
+	profile=${line%%"|"*}
+	rest=${line#*"|"}
+	name=${rest%%"|"*}
+	[ -f "$PART/assets/$profile/$name" ] && return 0
+	mkdir -p "$(dirname "$PART/assets/$profile/$name")"
+	cp "$1" "$PART/assets/$profile/$name" || abort "Could not copy $name."
+	echo "$profile/$name <- $2" >> "$PART/assets/SOURCES"
+}
+for slot in system_a system_b; do
+	dev=$(by_name $slot) || continue
+	mnt=$WORK/$slot
+	mkdir -p $mnt
+	mount -t ext4 -o ro "$dev" $mnt >> $LOG 2>&1 || { ui_print "  ($slot is not readable, skipped)"; continue; }
+	for rel in system/vendor/firmware system/vendor/etc/audio-algorithms system/etc/firmware \
+	           system/etc/audio-algorithms vendor/firmware vendor/etc/audio-algorithms \
+	           etc/firmware etc/audio-algorithms; do
+		[ -d "$mnt/$rel" ] || continue
+		$BB find "$mnt/$rel" -type f | while read -r f; do take "$f" "$slot:/${f#$mnt/}"; done
+	done
+	for rel in system/local/share/earcon/base local/share/earcon/base; do
+		if [ -d "$mnt/$rel" ] && [ -z "$(ls "$PART/earcon")" ]; then
+			cp "$mnt/$rel"/* "$PART/earcon/" 2>>$LOG && echo "earcon <- $slot:/$rel" >> "$PART/assets/SOURCES"
+		fi
+	done
+	# The light ring's animations: plain text, a few hundred small files. The
+	# settings page offers the Fire OS ones for any activity once imported.
+	for rel in system/etc/led-resources etc/led-resources; do
+		if [ -d "$mnt/$rel" ] && [ -z "$(ls "$PART/led")" ]; then
+			cp "$mnt/$rel"/*.animation "$PART/led/" 2>>$LOG && echo "led <- $slot:/$rel" >> "$PART/assets/SOURCES"
+		fi
+	done
+	umount $mnt
+done
+# The FPGA bitstream is not a file on Fire OS: the stock kernel carries it.
+for slot in boot_a boot_b; do
+	if $BT carve-fpga "$PART/raw/$slot.img" $WORK/fpga.bin >> $LOG 2>&1; then
+		take $WORK/fpga.bin "$slot: carved from the stock kernel"
+	fi
+done
+
+firmware_ok=1
+for f in WIFI_RAM_CODE mediatek/ROMv2_lm_patch_1_0_hdr.bin mediatek/ROMv2_lm_patch_1_1_hdr.bin i2s_to_spi_v34.bin; do
+	[ -f "$PART/assets/firmware/$f" ] || { firmware_ok=0; ui_print "  missing firmware: $f"; }
+done
+for profile in firmware fireos6 fireos5 speaker; do
+	[ -d "$PART/assets/$profile" ] && ui_print "  $profile: $(find "$PART/assets/$profile" -type f | wc -l) file(s)"
+done
+ui_print "  earcons: $(ls "$PART/earcon" | wc -l) file(s)"
+leds=$(ls "$PART/led" | wc -l | tr -d ' ')
+ui_print "  ring animations: $leds file(s)"
+
+# --- index, check, and put in place --------------------------------------------
+{
+	echo "serial=$SERIAL"
+	echo "format=$BACKUP_FORMAT"
+	echo "made_by=$ZIP_NAME $ZIP_VERSION"
+	# Makes an empty led/ explicit: the backup found none.
+	echo "led_count=$leds"
+	echo "date=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+	echo "twrp=$(getprop ro.twrp.version)"
+	echo "layout=$KIND"
+	echo "total_sectors=$TOTAL"
+	echo "firmware_complete=$firmware_ok"
+} > "$PART/info.txt"
+( cd "$PART" && $BB find . -type f ! -name SHA256SUMS | sort | xargs $BB sha256sum > SHA256SUMS ) ||
+	abort "Could not index the backup."
+( cd "$PART" && $BB sha256sum -c SHA256SUMS >> $LOG 2>&1 ) || abort "The backup did not verify."
+rm -rf "$DEST.old"
+[ -d "$DEST" ] && mv "$DEST" "$DEST.old"
+mv "$PART" "$DEST" || abort "Could not finish the backup folder."
+rm -rf "$DEST.old"
+sync
+
+ui_print " "
+ui_print "Backup complete: /sdcard/biscuit-backup/$SERIAL"
+[ $firmware_ok = 1 ] || ui_print "(!) The firmware set is incomplete: postmarketOS would have no Wi-Fi. Do not install."
+ui_print "Now copy it to your computer:"
+ui_print "  adb pull /sdcard/biscuit-backup"
+ui_print "then confirm you have it:"
+ui_print "  adb shell touch /sdcard/biscuit-backup/$SERIAL/COPIED"
+exit 0

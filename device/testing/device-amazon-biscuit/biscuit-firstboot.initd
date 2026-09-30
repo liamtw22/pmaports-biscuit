@@ -1,0 +1,276 @@
+#!/sbin/openrc-run
+
+description="Keep the shipped default account off SSH, and retire it once the device has been set up"
+
+# THE SHIPPED IMAGE USES POSTMARKETOS'S DOCUMENTED DEFAULTS
+#
+#     username  user
+#     password  147147
+#
+# That is what postmarketos.org/install publishes for every ready-to-run image,
+# so it is what people will expect, and it gives a device whose Wi-Fi setup
+# fails a way back in instead of only a reflash.
+#
+# It is also a password every reader of that page knows. On a phone that is
+# tolerable - you unlock the screen and change it. This device is headless,
+# always on, and sits on a home network with a microphone, so the default must
+# not survive setup.
+#
+# So: the default account is EXPECTED before setup and REMOVED after it. The
+# first-boot wizard collects a real username and password, biscuit-setup.sh
+# creates that account and writes /opt/persist/provisioned, and this is the
+# backstop that makes sure the default is gone even if that cleanup did not run
+# - after an interrupted setup, or on a device provisioned before this existed.
+#
+# GUARDS, because this removes accounts:
+#   - does nothing at all until the device is provisioned
+#   - never touches the account named in the marker. Setup no longer accepts
+#     the name "user", but a device set up by an older release may have an
+#     owner of that name, and it keeps the account and its password
+#   - never touches root, system accounts, or anything outside 1000..64999
+#   - refuses to run if /opt is not mounted, because "no marker" and "the disk
+#     holding the marker is missing" are indistinguishable from here
+
+PROVISIONED=/opt/persist/provisioned
+DEFAULT_USER=user
+DEFAULT_PASSWORD=147147
+LOG=/var/log/biscuit-firstboot.log
+
+# PASSWORD SSH FOR THE DEFAULT ACCOUNT, ONLY OVER THE USB CABLE.
+#
+# Until setup replaces it, the default account's password is the one printed on
+# postmarketos.org, the account is in wheel, and wheel has passwordless sudo
+# (biscuit-wheel-nopasswd). So while that password is live, sshd is told to
+# refuse PASSWORD logins for it on every address except the USB network, which
+# needs the cable and therefore someone holding the device:
+#
+#     local 172.16.42.1, client in 172.16.42.0/24
+#
+# postmarketOS's standard USB-networking addresses (the device is .1 and the
+# computer gets .2 from udhcpd-usb.conf). Key logins are untouched, so a key
+# added over USB keeps working on any network. The setup network is closed to
+# every login separately and unconditionally by
+# /etc/ssh/sshd_config.d/40-biscuit.conf.
+#
+# WHY USB STAYS OPEN: it is the recovery path for a device whose Wi-Fi setup
+# fails - the reason the default account is shipped at all - and it is off
+# unless someone turns it on (biscuit-usbmode, "Connected devices, USB").
+#
+# "Live" is decided from the account's actual password hash, not from whether
+# setup has run. That way an owner who picked the name "user" during setup,
+# with a password of their own, gets ordinary SSH, while one who typed the
+# published password back in stays covered - that is the most exposed state,
+# not the least. An account that is locked or has no password at all cannot
+# log in with a password anyway, so it needs no rule.
+#
+# The rule lives in /run, which is empty at every boot, so it can never
+# outlive the state it describes. "sshpolicy" is asked for again whenever the
+# password can have changed - by biscuit-setup.sh the moment setup has created,
+# reset or retired the account, by the settings page after a password change,
+# and by the package's post-upgrade - so the change reaches sshd at once rather
+# than at the next boot. (A password changed with passwd(1) in a shell is seen
+# at the next boot, or by running "rc-service biscuit-firstboot sshpolicy".)
+#
+# THE SETTINGS PAGE HOLDS THE SAME LINE. It refuses to sign "user" in, or to
+# honour a session for it, off the USB network while this function says the
+# password is live or this rule exists - it carries a Python copy of
+# default_password_live() and reads this file. A change to either side of the
+# check must be made to both (biscuit-settings.py shipped_password_live).
+SSHD_POLICY_DIR=/run/biscuit-sshd
+SSHD_POLICY=$SSHD_POLICY_DIR/default-account.conf
+# Overridable only so a test harness can point them at copies.
+: "${BISCUIT_PASSWD:=/etc/passwd}"
+: "${BISCUIT_SHADOW:=/etc/shadow}"
+
+extra_commands="sshpolicy"
+description_sshpolicy="Re-evaluate the SSH rule for the shipped default account"
+
+depend() {
+	need localmount
+	# biscuit-persist is what MOUNTS /opt, and the marker this service reads
+	# lives there. Without this the two race, /opt is not a mountpoint yet, and
+	# the guard below refuses on every single boot - so the default account was
+	# never actually retired on a provisioned device. Found by reading the log
+	# after a reflash: "REFUSING: /opt is not a mountpoint".
+	need biscuit-persist
+	before biscuit-setup
+	# The SSH policy below is written for sshd to read when it starts.
+	before sshd
+}
+
+_log() {
+	echo "$(date '+%H:%M:%S') $*" >> "$LOG"
+}
+
+start() {
+	retire_default_account
+	apply_ssh_policy
+	return 0
+}
+
+retire_default_account() {
+	ebegin "Checking the shipped default account"
+
+	if ! mountpoint -q /opt 2>/dev/null; then
+		_log "REFUSING: /opt is not a mountpoint; the marker cannot be trusted"
+		eend 0 "persist not mounted; leaving accounts alone"
+		return 0
+	fi
+
+	if [ ! -f "$PROVISIONED" ]; then
+		# Not set up yet. The default account is how someone gets in if the
+		# captive portal does not work for them, so it stays.
+		eend 0 "not set up yet; the default account is expected"
+		return 0
+	fi
+
+	owner=$(cat "$PROVISIONED" 2>/dev/null)
+
+	# THE MARKER AND THE ACCOUNT IT NAMES ARE ON OPPOSITE SIDES OF A FLASH.
+	#
+	# The marker is on the persist partition and survives; the account is in
+	# /etc/passwd on the rootfs and does not. So after a reflash the marker can
+	# name an owner who no longer exists - verified on hardware, where it still
+	# said "user" while only the shipped default was present.
+	#
+	# Retiring the default account in that state would leave the device with NO
+	# account at all. This guard is what makes the ordering fix above safe: it
+	# was the /opt race, not any deliberate check, that had been preventing that
+	# outcome. The default therefore stays, and stays usable, until an owner
+	# account genuinely exists again.
+	if [ -n "$owner" ] && ! id "$owner" >/dev/null 2>&1; then
+		_log "STALE MARKER: provisioned as '$owner' but no such account exists"
+		_log "keeping $DEFAULT_USER - removing it would leave no way in"
+		eend 0 "owner account missing; keeping the default account"
+		return 0
+	fi
+
+	if [ "$owner" = "$DEFAULT_USER" ]; then
+		_log "the owner chose the name '$DEFAULT_USER'; keeping it"
+		eend 0 "default name is the owner's account; kept"
+		return 0
+	fi
+
+	if ! id "$DEFAULT_USER" >/dev/null 2>&1; then
+		eend 0 "default account already retired"
+		return 0
+	fi
+
+	uid=$(id -u "$DEFAULT_USER" 2>/dev/null)
+	if [ -z "$uid" ] || [ "$uid" -lt 1000 ] || [ "$uid" -ge 65000 ]; then
+		_log "refusing to remove $DEFAULT_USER: uid $uid is out of range"
+		eend 0 "default account uid out of range; left alone"
+		return 0
+	fi
+
+	_log "device provisioned as '$owner'; removing the shipped default account"
+	deluser --remove-home "$DEFAULT_USER" >/dev/null 2>&1 \
+		|| deluser "$DEFAULT_USER" >/dev/null 2>&1
+	if id "$DEFAULT_USER" >/dev/null 2>&1; then
+		_log "FAILED to remove $DEFAULT_USER; locking it instead"
+		passwd -l "$DEFAULT_USER" >/dev/null 2>&1 || true
+		eend 0 "could not remove the default account; locked it"
+	else
+		_log "removed $DEFAULT_USER"
+		eend 0 "shipped default account retired"
+	fi
+	return 0
+}
+
+# 0 when DEFAULT_USER can still sign in with DEFAULT_PASSWORD, or when that
+# cannot be ruled out for the shipped account; 1 when it cannot sign in with it.
+default_password_live() {
+	awk -F: -v u="$DEFAULT_USER" '$1 == u { f = 1 } END { exit !f }' \
+		"$BISCUIT_PASSWD" 2>/dev/null || return 1
+
+	_m=""
+	_hash=""
+	if [ -r "$BISCUIT_SHADOW" ]; then
+		_hash=$(awk -F: -v u="$DEFAULT_USER" '$1 == u { print $2; exit }' \
+			"$BISCUIT_SHADOW" 2>/dev/null)
+		# Locked, or no password at all (which sshd refuses anyway,
+		# PermitEmptyPasswords being off): no password login to guard.
+		case "$_hash" in
+		""|"!"*|"*"*) return 1 ;;
+		esac
+		_salt=$(printf '%s' "$_hash" | cut -d'$' -f3)
+		case "$(printf '%s' "$_hash" | cut -d'$' -f2)" in
+		6) _m=sha512 ;;
+		5) _m=sha256 ;;
+		1) _m=md5 ;;
+		esac
+		# An explicit rounds= field is not something cryptpw can reproduce.
+		case "$_salt" in ""|rounds=*) _m="" ;; esac
+	fi
+
+	if [ -n "$_m" ]; then
+		# The same check the settings page makes (cryptpw over stdin, so the
+		# password is never in argv).
+		_try=$(printf '%s' "$DEFAULT_PASSWORD" |
+			cryptpw -P 0 -m "$_m" -S "$_salt" 2>/dev/null)
+		if [ -n "$_try" ]; then
+			[ "$_try" = "$_hash" ]
+			return
+		fi
+	fi
+
+	# The hash could not be checked. An account setup made for the owner under
+	# the name "user" holds a password the owner typed; anything else is the
+	# shipped account, so assume it still has the shipped password.
+	[ "$(cat "$PROVISIONED" 2>/dev/null)" != "$DEFAULT_USER" ]
+}
+
+ssh_policy_text() {
+	printf '%s\n' \
+		"# Written by biscuit-firstboot at $(date '+%Y-%m-%d %H:%M:%S'): the account" \
+		"# '$DEFAULT_USER' still has the published default password, so password" \
+		"# logins for it are refused except over the USB network. Removed as soon" \
+		"# as setup replaces the account; /run is empty again at every boot."
+	printf 'Match User %s LocalAddress !172.16.42.1,*\n' "$DEFAULT_USER"
+	printf '\tPasswordAuthentication no\n\tKbdInteractiveAuthentication no\n'
+	printf 'Match User %s Address !172.16.42.0/24,*\n' "$DEFAULT_USER"
+	printf '\tPasswordAuthentication no\n\tKbdInteractiveAuthentication no\n'
+}
+
+apply_ssh_policy() {
+	ebegin "Setting the SSH rule for the shipped default account"
+	_had=no
+	[ -f "$SSHD_POLICY" ] && _had=yes
+
+	if default_password_live; then
+		mkdir -p "$SSHD_POLICY_DIR" 2>/dev/null
+		chmod 755 "$SSHD_POLICY_DIR" 2>/dev/null
+		if [ "$_had" = no ]; then
+			if ssh_policy_text > "$SSHD_POLICY.tmp" 2>/dev/null &&
+			   mv -f "$SSHD_POLICY.tmp" "$SSHD_POLICY"; then
+				chmod 644 "$SSHD_POLICY"
+				_log "default password is live: password SSH for $DEFAULT_USER over USB only"
+			else
+				rm -f "$SSHD_POLICY.tmp"
+				_log "FAILED to write $SSHD_POLICY; password SSH for $DEFAULT_USER is NOT restricted"
+				eend 0 "could not write the SSH rule"
+				return 0
+			fi
+		fi
+		_state="password SSH for $DEFAULT_USER over USB only"
+	else
+		rm -f "$SSHD_POLICY"
+		[ "$_had" = yes ] && _log "default password no longer live: SSH rule for $DEFAULT_USER removed"
+		_state="no rule needed"
+	fi
+
+	# sshd reads its configuration when it starts and on reload. At boot this
+	# runs first and it is not running yet; from setup it is, and the change
+	# has to reach it now.
+	_has=no
+	[ -f "$SSHD_POLICY" ] && _has=yes
+	if [ "$_has" != "$_had" ]; then
+		rc-service --ifstarted sshd reload >/dev/null 2>&1 || true
+	fi
+	eend 0 "$_state"
+	return 0
+}
+
+sshpolicy() {
+	apply_ssh_policy
+}

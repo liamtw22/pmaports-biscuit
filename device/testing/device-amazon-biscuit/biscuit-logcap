@@ -1,0 +1,39 @@
+#!/bin/sh
+# biscuit-logcap FILE [MAX_BYTES]
+#
+# Append stdin to FILE. When FILE passes MAX_BYTES (default 2 MiB), move it to
+# FILE.1 and start a new FILE, so a log never holds more than about twice the
+# cap. It is used as an OpenRC --stdout-logger/--stderr-logger for daemons whose
+# output was going straight to a file with nothing to rotate it.
+#
+# Several loggers may share one FILE, one for each stream of each daemon. Each
+# reopens the path for every line, so a rotation by any one of them is followed
+# by all; each re-reads the real size every 64 lines, so their counts agree.
+# Lines are rare (a burst at start-up, then a few a minute at most), so a
+# reopen per line costs nothing.
+f=${1:?usage: biscuit-logcap FILE [MAX_BYTES]}
+umask 027
+exec awk -v f="$f" -v max="${2:-2097152}" '
+function realsize(   cmd, s) {
+	s = 0
+	cmd = "stat -c %s \"" f "\" 2>/dev/null"
+	if ((cmd | getline s) <= 0)
+		s = 0
+	close(cmd)
+	return s + 0
+}
+BEGIN { n = realsize() }
+{
+	print >> f
+	close(f)
+	n += length($0) + 1
+	if (++lines % 64 == 0)
+		n = realsize()
+	# Confirm against the real size before rotating. A count gone stale
+	# because another logger just rotated would otherwise rotate the new,
+	# nearly empty file over the full generation in FILE.1.
+	if (n > max && (n = realsize()) > max) {
+		system("mv -f \"" f "\" \"" f ".1\" 2>/dev/null")
+		n = 0
+	}
+}'

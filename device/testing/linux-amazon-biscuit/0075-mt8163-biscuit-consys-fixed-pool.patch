@@ -1,0 +1,38 @@
+Fix the CONSYS shared-DRAM reservation to the stock Biscuit address
+
+The original mainline port allocates a two-megabyte `consys-pool` dynamically
+below 512 MiB.  On Device #1 that produced `0x5f400000` and consequently
+programmed CONSYS_EMI_MAPPING as `0x11f4`.  The successful instrumented
+FireOS kernel on the otherwise-identical Device #3 instead reserves
+`0x5f600000..0x5f7fffff` and programs `0x11f6`.
+
+That physical window is part of the firmware ABI: the connectivity processor
+uses it for WMT/STP shared state and coredump buffers.  A valid chip ID and a
+working TX DMA ring do not prove that a different window is usable.  Make the
+reservation exact so the generic driver computes the stock mapping and its
+existing region-13 MPU setup from the correct base.
+
+This intentionally does not change the rail sequence, reset release timing,
+BTIF DMA setup, or the native STP/WMT implementation.  It supersedes the
+unverified CONNMCU clock experiment that previously occupied patch number
+0075.
+
+diff --git a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -723,3 +723,15 @@
+ &consys {
+	mediatek,emi = <&emi>;
+ };
++
++/*
++ * FireOS on Biscuit reserves this exact 2 MiB ABI window.  Do not let the
++ * early allocator choose a different aligned location: CONSYS firmware sees
++ * the address encoded in infracfg's CONSYS_EMI_MAPPING register.
++ */
++&consys_mem {
++	reg = <0x0 0x5f600000 0x0 0x00200000>;
++	/delete-property/ size;
++	/delete-property/ alignment;
++	/delete-property/ alloc-ranges;
++};

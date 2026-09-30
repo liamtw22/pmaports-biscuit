@@ -1,0 +1,80 @@
+--- a/sound/soc/mediatek/mt8163/mt8163-dai-i2s.c
++++ b/sound/soc/mediatek/mt8163/mt8163-dai-i2s.c
+@@ -537,6 +537,57 @@
+ };
+ 
+ /* dai ops */
++/*
++ * The MT8163 "I2S DAC out" path (AFE_I2S_CON1) does not take its data straight
++ * from the interconnect: it is fed through the ADDA downlink SRC. The vendor
++ * driver always brings that block up alongside the serialiser
++ * (SetI2SDacOut() + SetI2SDacEnable()); without it the serialiser clocks out
++ * zeros, which is why BCK/LRCK look perfect while DIN stays silent.
++ */
++static int mt8163_dl_src_rate_idx(unsigned int rate)
++{
++	switch (rate) {
++	case 8000:  return 0;
++	case 11025: return 1;
++	case 12000: return 2;
++	case 16000: return 3;
++	case 22050: return 4;
++	case 24000: return 5;
++	case 32000: return 6;
++	case 44100: return 7;
++	case 48000: return 8;
++	default:    return -EINVAL;
++	}
++}
++
++static int mt8163_enable_dl_src(struct mtk_base_afe *afe, unsigned int rate)
++{
++	int idx = mt8163_dl_src_rate_idx(rate);
++	unsigned int con0;
++	int ret;
++
++	if (idx < 0)
++		return idx;
++
++	/* vendor CleanPreDistortion() */
++	regmap_write(afe->regmap, AFE_ADDA_PREDIS_CON0, 0);
++	regmap_write(afe->regmap, AFE_ADDA_PREDIS_CON1, 0);
++
++	/* vendor SetDLSrc2(): rate | mode | 0.3dB voice-mode degrade */
++	con0 = ((unsigned int)idx << 28) | (0x03 << 24) | (0x03 << 11) | BIT(1);
++	if (idx == 0 || idx == 3)
++		con0 |= BIT(5);
++	regmap_write(afe->regmap, AFE_ADDA_DL_SRC2_CON1, 0xf74f0000);
++	regmap_write(afe->regmap, AFE_ADDA_DL_SRC2_CON0, con0);
++
++	/* vendor SetI2SDacEnable(): turn the SRC and the ADDA path on */
++	ret = regmap_update_bits(afe->regmap, AFE_ADDA_DL_SRC2_CON0, 0x1, 0x1);
++	if (ret)
++		return ret;
++
++	return regmap_update_bits(afe->regmap, AFE_ADDA_UL_DL_CON0, 0x1, 0x1);
++}
++
+ static int mtk_i2s_master_config(struct mtk_base_afe *afe,
+ 				 int i2s_id, struct snd_pcm_hw_params *params)
+ {
+@@ -574,6 +625,19 @@
+ 	if (i2s_priv->low_jitter_en)
+ 		val |= BIT(AFE_I2S_M_I2S_HD_EN_SHIFT);
+ 
++	if (i2s_id == MT8163_AFE_DAI_I2S1) {
++		/* I2S out sample-rate field, as the vendor programs it */
++		ret = regmap_update_bits(afe->regmap, AFE_DAC_CON1,
++					 I2S_MODE_MASK << I2S_MODE_SHIFT,
++					 rate_val << I2S_MODE_SHIFT);
++		if (ret)
++			return ret;
++
++		ret = mt8163_enable_dl_src(afe, rate);
++		if (ret)
++			return ret;
++	}
++
+ 	ret = regmap_update_bits(afe->regmap, i2s_priv->con_reg, mask, val);
+ 	if (ret)
+ 		return ret;

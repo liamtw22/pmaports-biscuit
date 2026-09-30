@@ -1,0 +1,13 @@
+--- a/drivers/soc/mediatek/mtk-pmic-wrap.c
++++ b/drivers/soc/mediatek/mtk-pmic-wrap.c
+@@ -2462,9 +2462,9 @@
+ 	.spi_w = PWRAP_MAN_CMD_SPI_WRITE,
+ 	.wdt_src = PWRAP_WDT_SRC_MASK_ALL,
+ 	.caps = PWRAP_CAP_RESET | PWRAP_CAP_DCM,
+ 	.init_reg_clock = pwrap_mt2701_init_reg_clock,
+-	.init_soc_specific = pwrap_mt2701_init_soc_specific,
++	.init_soc_specific = NULL,
+ };
+ 
+ static const struct pmic_wrapper_type pwrap_mt8173 = {
+ 	.regs = mt8173_regs,

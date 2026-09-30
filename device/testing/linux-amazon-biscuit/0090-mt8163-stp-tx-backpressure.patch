@@ -1,0 +1,163 @@
+From e12736a6ed49835b38e9b0fa5da954e63ee7f485 Mon Sep 17 00:00:00 2001
+From: Claude <claude@localhost>
+Date: Mon, 10 Aug 2026 22:38:52 -0400
+Subject: [PATCH] bluetooth: retry STP transmits instead of dropping HCI
+ packets
+
+A2DP playback dropped the link after a while, and switching the UCM output
+device tore the transport down. The kernel logged the reason:
+
+	Bluetooth: hci0: STP transmit failed: -11
+
+-11 is -EAGAIN. mt8163_stp_send_full() returns it whenever tx_pending is
+still set, because the full-STP engine permits exactly one outstanding data
+frame. That was sufficient for the serialized WMT bootstrap and firmware
+patch download, but A2DP produces continuous ACL traffic, so the window is
+frequently busy - and mt8163_stp_tx_work() responded by logging the error
+and calling kfree_skb(). Every busy window silently discarded an HCI packet,
+which breaks the AVDTP stream and eventually collapses the link.
+
+Section 11.6 of the porting notes predicted this at r170: "an -EAGAIN must
+not ultimately cause queued HCI traffic to be dropped."
+
+Wait for the peer ACK that clears tx_pending and try again, mirroring the
+idiom mt8163_stp_btif_write() already uses one layer down, with a bounded
+budget so a genuinely wedged window cannot block the transmit worker
+forever. Count and rate-limit the remaining genuine failures rather than
+logging every one. A seven-frame vendor-style transmit window remains the
+better answer for sustained throughput; this is the minimal correct fix.
+
+Also read stock's VCN33 efuse selector and log it. Stock reads this between
+the MCU-clock restore and RF calibration and feeds it to
+wmt_set_pmic_voltage(); PMOS hardcodes 3.3 V. Reporting the value shows
+whether this unit wants a different rail at all. Nothing is applied: that
+needs a new setter in the CONSYS driver and does not belong in a revision
+whose job is A2DP stability. The read is deliberately non-fatal.
+
+No firmware, patch address, fragmentation, STP framing, BTIF, CONSYS power,
+EMI or boot packaging behaviour changed.
+---
+ drivers/bluetooth/hci_mt8163_stp.c | 77 +++++++++++++++++++++++++++++-
+ 1 file changed, 75 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index 0b16392..03fc812 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -45,6 +45,7 @@
+ #define MT8163_STP_WMT_TIMEOUT		msecs_to_jiffies(1500)
+ #define MT8163_STP_FULL_RETRIES		3
+ #define MT8163_STP_WMT_EVT_TRACES	16
++#define MT8163_STP_TX_RETRIES		200
+ #define MT8163_WMT_PATCH_HEADER_LEN	28
+ #define MT8163_WMT_PATCH_FRAGMENT	1000
+ 
+@@ -168,6 +169,21 @@ static const u8 wmt_antenna_select_evt[] =
+ 	{ 0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01 };
+ static const u8 wmt_bt_on_cmd[] = { 0x01, 0x06, 0x02, 0x00, 0x00, 0x01 };
+ static const u8 wmt_bt_on_evt[] = { 0x02, 0x06, 0x01, 0x00, 0x00 };
++/*
++ * Stock reads an efuse to pick the VCN33 rail voltage and then calls
++ * wmt_set_pmic_voltage(). PMOS hardcodes 3.3 V. Read the value and log it so it
++ * is known whether this unit actually wants something else; the event's low two
++ * bits select VOL_3300, VOL_3400, VOL_3500 or VOL_3600. Nothing is applied here
++ * - changing the rail needs a new setter in the CONSYS driver and does not
++ * belong in a revision whose job is A2DP stability.
++ */
++static const u8 wmt_get_efuse_vcn33_cmd[] =
++	{ 0x01, 0x12, 0x02, 0x00, 0x04, 0x00 };
++static const u8 wmt_get_efuse_vcn33_evt[] =
++	{ 0x02, 0x12, 0x02, 0x00, 0x04, 0x00 };
++/* The selector byte is device-supplied, so only the event header is compared. */
++static const u8 wmt_get_efuse_vcn33_evt_mask[] =
++	{ 0xff, 0xff, 0x00, 0x00, 0x00, 0x00 };
+ 
+ enum mt8163_stp_rx_state {
+ 	MT8163_STP_RX_SYNC,
+@@ -1131,6 +1147,31 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 				     "WMT patch MCU-clock programming disable failed\n");
+ 	dev_warn(stp->dev, "WMT patch-download MCU clock restored to 26 MHz\n");
+ 
++	/*
++	 * Stock reads the VCN33 efuse here, between the MCU-clock restore and
++	 * the RF calibration, and feeds the result to wmt_set_pmic_voltage().
++	 * Report the value only; the rail stays at the 3.3 V the CONSYS driver
++	 * already applies. Deliberately non-fatal, so an unexpected reply cannot
++	 * cost the controller.
++	 */
++	ret = mt8163_stp_wmt_xfer_mask(stp, wmt_get_efuse_vcn33_cmd,
++				       sizeof(wmt_get_efuse_vcn33_cmd),
++				       wmt_get_efuse_vcn33_evt,
++				       wmt_get_efuse_vcn33_evt_mask,
++				       sizeof(wmt_get_efuse_vcn33_evt));
++	if (ret) {
++		dev_warn(stp->dev, "WMT VCN33 efuse read failed (%d)\n", ret);
++	} else {
++		static const char * const vcn33_mv[] = {
++			"3300", "3400", "3500", "3600",
++		};
++		u8 sel = stp->wmt_rx[5] & 0x03;
++
++		dev_warn(stp->dev,
++			 "WMT VCN33 efuse selector %u (%s mV); rail left at 3300 mV\n",
++			 sel, vcn33_mv[sel]);
++	}
++
+ 	/*
+ 	 * Stock step 7 raises the PALDO, runs the RF calibration script, then
+ 	 * drops it again before the per-function Bluetooth enable. On MT8163
+@@ -1195,6 +1236,35 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 	return 0;
+ }
+ 
++/*
++ * The full-STP engine permits exactly one outstanding data frame, so
++ * mt8163_stp_send_full() returns -EAGAIN whenever tx_pending is still set. That
++ * is routine under A2DP's continuous ACL traffic and must not cost the packet:
++ * dropping it breaks the AVDTP stream and the link collapses shortly after.
++ *
++ * Wait for the peer ACK that clears tx_pending and try again, mirroring the
++ * idiom mt8163_stp_btif_write() already uses one layer down. A bounded budget
++ * keeps a genuinely wedged window from blocking the transmit worker forever.
++ *
++ * A seven-frame vendor-style transmit window would be the better answer for
++ * sustained throughput; this is the minimal correct fix.
++ */
++static int mt8163_stp_send_retry(struct mt8163_stp *stp, u8 type,
++				 const u8 *buf, size_t len)
++{
++	unsigned int tries = MT8163_STP_TX_RETRIES;
++	int ret;
++
++	do {
++		ret = mt8163_stp_send(stp, type, buf, len);
++		if (ret != -EAGAIN)
++			return ret;
++		usleep_range(500, 1000);
++	} while (--tries);
++
++	return -ETIMEDOUT;
++}
++
+ static void mt8163_stp_tx_work(struct work_struct *work)
+ {
+ 	struct mt8163_stp *stp = container_of(work, struct mt8163_stp, tx_work);
+@@ -1210,10 +1280,13 @@ static void mt8163_stp_tx_work(struct work_struct *work)
+ 			goto free;
+ 		buf[0] = type;
+ 		memcpy(buf + 1, skb->data, skb->len);
+-		ret = mt8163_stp_send(stp, MT8163_STP_TASK_BT, buf, skb->len + 1);
++		ret = mt8163_stp_send_retry(stp, MT8163_STP_TASK_BT, buf,
++					    skb->len + 1);
+ 		kfree(buf);
+ 		if (ret) {
+-			bt_dev_err(stp->hdev, "STP transmit failed: %d", ret);
++			stp->hdev->stat.err_tx++;
++			bt_dev_err_ratelimited(stp->hdev,
++					       "STP transmit failed: %d", ret);
+ 			goto free;
+ 		}
+ 
+-- 
+2.55.0.windows.3
+

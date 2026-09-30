@@ -1,0 +1,158 @@
+--- a/drivers/misc/mt8163-consys.c
++++ b/drivers/misc/mt8163-consys.c
+@@ -33,12 +33,17 @@
+ #include <linux/delay.h>
+ #include <linux/io.h>
+ #include <linux/kstrtox.h>
++#include <linux/mfd/syscon.h>
+ #include <linux/mod_devicetable.h>
+ #include <linux/module.h>
++#include <linux/of.h>
++#include <linux/of_reserved_mem.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/regmap.h>
+ #include <linux/regulator/consumer.h>
+ #include <linux/reset.h>
++#include <linux/sizes.h>
+ 
+ /* Registers within the CONN_MCU_CONFIG window at 0x18070000. */
+ #define CONSYS_CHIP_ID			0x008
+@@ -60,6 +65,17 @@
+  */
+ static const u32 consys_known_ids[] = { 0x8163, 0x0321, 0x0335, 0x0337 };
+ 
++/*
++ * The processor cannot reach system memory on its own. This register in
++ * infracfg windows a slice of DRAM into its address space, and it is written
++ * in megabytes as an offset from the start of DRAM, which is why the reserved
++ * region has to be megabyte aligned: a region that is not would leave the
++ * processor pointed somewhere other than where the memory actually is.
++ */
++#define INFRACFG_CONSYS_EMI_MAPPING	0x320
++#define CONSYS_EMI_MAPPING_ENABLE	BIT(12)
++#define MT8163_DRAM_BASE		0x40000000UL
++
+ /* The block needs a moment after the domain comes up before it will answer. */
+ #define CONSYS_SETTLE_US		10
+ #define CONSYS_ID_RETRIES		20
+@@ -76,7 +92,11 @@
+ 	struct device *dev;
+ 	void __iomem *mcu;
+ 	struct reset_control *cpu_reset;
++	struct regmap *infracfg;
+ 	struct regulator_bulk_data supplies[ARRAY_SIZE(consys_supply_names)];
++	phys_addr_t emi_base;
++	phys_addr_t emi_size;
++	u32 emi_mapping;
+ 	u32 chip_id;
+ 	bool powered;
+ };
+@@ -90,6 +110,65 @@
+ 			return true;
+ 
+ 	return false;
++}
++
++/*
++ * Point the processor at the slice of DRAM it has been given. Nothing here is
++ * needed to identify the block, but firmware download has nowhere to land
++ * without it, so a missing region is reported rather than treated as fatal.
++ */
++static int mt8163_consys_map_emi(struct mt8163_consys *priv)
++{
++	struct device *dev = priv->dev;
++	struct reserved_mem *rmem;
++	struct device_node *np;
++	u32 val, cur;
++	int ret;
++
++	np = of_parse_phandle(dev->of_node, "memory-region", 0);
++	if (!np) {
++		dev_info(dev, "no memory-region, firmware download will not be possible\n");
++		return 0;
++	}
++
++	rmem = of_reserved_mem_lookup(np);
++	of_node_put(np);
++	if (!rmem) {
++		dev_err(dev, "memory-region does not name a reserved region\n");
++		return -EINVAL;
++	}
++
++	if (!IS_ALIGNED(rmem->base, SZ_1M) || rmem->size < SZ_1M) {
++		dev_err(dev, "reserved region %pa size %pa must be at least 1 MiB and 1 MiB aligned\n",
++			&rmem->base, &rmem->size);
++		return -EINVAL;
++	}
++
++	if (rmem->base < MT8163_DRAM_BASE) {
++		dev_err(dev, "reserved region %pa is below the start of DRAM\n",
++			&rmem->base);
++		return -EINVAL;
++	}
++
++	val = ((rmem->base - MT8163_DRAM_BASE) >> 20) | CONSYS_EMI_MAPPING_ENABLE;
++
++	ret = regmap_read(priv->infracfg, INFRACFG_CONSYS_EMI_MAPPING, &cur);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to read the EMI mapping register\n");
++
++	/* The vendor sets bits here rather than replacing the register. */
++	ret = regmap_write(priv->infracfg, INFRACFG_CONSYS_EMI_MAPPING, cur | val);
++	if (ret)
++		return dev_err_probe(dev, ret, "failed to write the EMI mapping register\n");
++
++	priv->emi_base = rmem->base;
++	priv->emi_size = rmem->size;
++	priv->emi_mapping = cur | val;
++
++	dev_info(dev, "EMI window %pa size %pa, mapping register 0x%08x\n",
++		 &priv->emi_base, &priv->emi_size, priv->emi_mapping);
++
++	return 0;
+ }
+ 
+ /*
+@@ -254,10 +333,24 @@
+ }
+ static DEVICE_ATTR_RW(powered);
+ 
++static ssize_t emi_show(struct device *dev,
++			struct device_attribute *attr, char *buf)
++{
++	struct mt8163_consys *priv = dev_get_drvdata(dev);
++
++	if (!priv->emi_size)
++		return sysfs_emit(buf, "unmapped\n");
++
++	return sysfs_emit(buf, "base    %pa\nsize    %pa\nmapping 0x%08x\n",
++			  &priv->emi_base, &priv->emi_size, priv->emi_mapping);
++}
++static DEVICE_ATTR_RO(emi);
++
+ static struct attribute *mt8163_consys_attrs[] = {
+ 	&dev_attr_chip_id.attr,
+ 	&dev_attr_registers.attr,
+ 	&dev_attr_powered.attr,
++	&dev_attr_emi.attr,
+ 	NULL,
+ };
+ ATTRIBUTE_GROUPS(mt8163_consys);
+@@ -292,6 +385,16 @@
+ 	if (IS_ERR(priv->cpu_reset))
+ 		return dev_err_probe(dev, PTR_ERR(priv->cpu_reset),
+ 				     "failed to get CPU reset\n");
++
++	priv->infracfg = syscon_regmap_lookup_by_phandle(dev->of_node,
++							 "mediatek,infracfg");
++	if (IS_ERR(priv->infracfg))
++		return dev_err_probe(dev, PTR_ERR(priv->infracfg),
++				     "failed to get infracfg\n");
++
++	ret = mt8163_consys_map_emi(priv);
++	if (ret)
++		return ret;
+ 
+ 	pm_runtime_enable(dev);
+ 

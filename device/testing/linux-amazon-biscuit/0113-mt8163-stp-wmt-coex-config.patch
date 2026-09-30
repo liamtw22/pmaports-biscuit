@@ -1,0 +1,42 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -168,6 +168,18 @@
+ };
+ static const u8 wmt_antenna_select_evt[] =
+ 	{ 0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01 };
++/*
++ * Stock's coexistence configuration (wmt_stp_init_coex). Byte 5 is
++ * coex_wmt_ant_mode from WMT_SOC.cfg, which stock sets to 1 - the antenna
++ * topology the firmware should assume for BT/Wi-Fi arbitration. Only this
++ * one coex command applies to this chip; the other four are behind
++ * CFG_SUBSYS_COEX_NEED, which is 0 for MT6628.
++ */
++static const u8 wmt_coex_cfg_cmd[] =
++	{ 0x01, 0x10, 0x02, 0x00, 0x01, 0x01 };
++static const u8 wmt_coex_cfg_evt[] =
++	{ 0x02, 0x10, 0x01, 0x00, 0x00 };
++
+ /* Stock chip-bootstrap step 15, init_table_5_1 "configure FM comm". */
+ static const u8 wmt_fm_strap_cmd[] =
+ 	{ 0x01, 0x05, 0x02, 0x00, 0x02, 0x02 };
+@@ -1324,6 +1336,19 @@
+ 	dev_warn(stp->dev, "WMT RF calibration completed\n");
+ 
+ 	mt8163_consys_bt_paldo_set(stp->consys_dev, false);
++
++	/*
++	 * Stock runs wmt_stp_init_coex() at exactly this point - after the
++	 * BT/WIFI/EFUSE PALDOs are dropped and before the per-function enables.
++	 * Non-fatal: a rejection must not cost us Bluetooth or Wi-Fi.
++	 */
++	ret = mt8163_stp_wmt_xfer(stp, wmt_coex_cfg_cmd, sizeof(wmt_coex_cfg_cmd),
++				  wmt_coex_cfg_evt, sizeof(wmt_coex_cfg_evt));
++	if (ret)
++		dev_warn(stp->dev,
++			 "WMT coexistence config rejected (%d); continuing\n", ret);
++	else
++		dev_warn(stp->dev, "WMT coexistence config applied (ant_mode=1)\n");
+ 	stp->bt_paldo_enabled = false;
+ 
+ 	/*

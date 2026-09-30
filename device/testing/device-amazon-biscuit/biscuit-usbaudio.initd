@@ -1,0 +1,19 @@
+#!/sbin/openrc-run
+description="Bridge the USB Audio Class gadget to this device's audio"
+
+# Supervised rather than run once: the gadget card comes and goes as the USB
+# mode changes and as the host suspends, and a one-shot that exits when the
+# card disappears would never come back. Same reasoning as the other audio
+# services here - a subsystem that dies quietly while the rest keeps working
+# is the failure mode that costs the most time to find.
+supervisor=supervise-daemon
+command=/usr/bin/biscuit-usbaudio
+command_background=true
+pidfile=/run/biscuit-usbaudio.pid
+respawn_delay=5
+respawn_max=0
+
+depend() {
+	need dev
+	after usb-rndis biscuit-audio biscuit-pipewire
+}

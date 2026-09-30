@@ -1,0 +1,141 @@
+From 3d3e73fe9648957df62727e0d2e6855492e3752b Mon Sep 17 00:00:00 2001
+From: Claude <claude@localhost>
+Date: Mon, 10 Aug 2026 17:11:44 -0400
+Subject: [PATCH] bluetooth: unmask LE advertising reports the controller never
+ asked for
+
+The controller under-reports itself. Read Local Supported Commands returns
+137 entries whose highest octets are 24 and 29: octets 25 to 28, every LE
+command octet, are entirely zero. Its LE commands nevertheless work - LE Set
+Scan Parameters, LE Set Scan Enable, LE Set Advertising Parameters, LE Set
+Advertise Enable and the LE reads all complete with Success, and an
+externally visible ADV_IND was confirmed from a phone.
+
+hci_le_set_event_mask_sync() gates the advertising-report bit on that claim:
+
+	if (hdev->commands[26] & 0x08)
+		events[0] |= 0x02;	/* LE Advertising Report */
+
+so the host sent a mask of 0x0000000000000010, LE Long Term Key Request
+alone - the single bit implied by le_features[0] = LE Encryption - and asked
+the controller never to report what it heard. Scanning ran correctly and
+returned nothing, which had been misread as a dead receive path for several
+revisions. Unmasking these events by hand from userspace turned a silent
+fifteen-second scan into 1337 advertising reports with neighbours resolved
+by name.
+
+Correct the recorded command support and re-send the mask from post_init,
+which runs straight after hci_init_sync() with req_lock held. This is the
+same defect class as HCI_QUIRK_BROKEN_LOCAL_EXT_FEATURES_PAGE_2 already
+applied here: the controller misdeclares its capabilities and the core
+believes it.
+
+Also drop the loop variable left behind in mt8163_stp_deliver_payload() when
+the byte-wise WMT matcher was replaced, which was warning as unused. Do not
+include hci_sync.h directly: hci_core.h already pulls it in and it carries no
+include guard of its own.
+
+No firmware, patch address, fragmentation, STP, BTIF, CONSYS power, EMI or
+boot packaging behaviour changed.
+---
+ drivers/bluetooth/hci_mt8163_stp.c | 61 +++++++++++++++++++++++++++---
+ 1 file changed, 56 insertions(+), 5 deletions(-)
+
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index aeca3e2..0b16392 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -29,6 +29,7 @@
+ #include <linux/mt8163-consys.h>
+ 
+ #include <net/bluetooth/bluetooth.h>
++/* hci_core.h pulls in hci_sync.h, which has no include guard of its own. */
+ #include <net/bluetooth/hci_core.h>
+ 
+ #define MT8163_STP_TASK_BT		0
+@@ -542,13 +543,10 @@ static void mt8163_stp_process_ack(struct mt8163_stp *stp, u8 ack)
+ 
+ static void mt8163_stp_deliver_payload(struct mt8163_stp *stp)
+ {
+-	size_t i;
+-
+-	if (stp->payload_type == MT8163_STP_TASK_WMT) {
++	if (stp->payload_type == MT8163_STP_TASK_WMT)
+ 		mt8163_stp_wmt_frame(stp, stp->payload, stp->payload_need);
+-	} else if (stp->payload_type == MT8163_STP_TASK_BT) {
++	else if (stp->payload_type == MT8163_STP_TASK_BT)
+ 		mt8163_stp_hci_rx(stp, stp->payload, stp->payload_need);
+-	}
+ }
+ 
+ static bool mt8163_stp_is_fw_message(u8 type)
+@@ -1236,6 +1234,58 @@ free:
+ 	}
+ }
+ 
++/*
++ * The controller under-reports itself. Read Local Supported Commands comes back
++ * with 137 entries whose highest octets are 24 and 29: octets 25 to 28, every LE
++ * command octet, are entirely zero. The LE commands nevertheless work - LE Set
++ * Scan Parameters, LE Set Scan Enable, LE Set Advertising Parameters, LE Set
++ * Advertise Enable and the LE reads all complete with Success.
++ *
++ * hci_le_set_event_mask_sync() gates the advertising-report bit on exactly that
++ * claim:
++ *
++ *	if (hdev->commands[26] & 0x08)
++ *		events[0] |= 0x02;	// LE Advertising Report
++ *
++ * so the host sent a mask of 0x10, LE Long Term Key Request alone, and asked the
++ * controller never to report what it heard. Scanning ran perfectly and returned
++ * nothing. Unmasking these events by hand from userspace turned a silent
++ * fifteen-second scan into 1337 advertising reports with neighbours resolved by
++ * name, which is what identified this.
++ *
++ * post_init runs straight after hci_init_sync() with req_lock held, so correct
++ * the recorded command support and re-send the mask there.
++ */
++static int mt8163_stp_hci_post_init(struct hci_dev *hdev)
++{
++	struct hci_cp_le_set_event_mask cp = {};
++	int ret;
++
++	/* LE Set Scan Enable, LE Create Connection. */
++	hdev->commands[26] |= 0x08 | 0x10;
++	/* LE Connection Update, LE Read Remote Features. */
++	hdev->commands[27] |= 0x04 | 0x20;
++
++	/*
++	 * Connection Complete, Advertising Report, Connection Update Complete,
++	 * Read Remote Features Complete and Long Term Key Request: the set the
++	 * core would have chosen had the controller declared its LE commands.
++	 */
++	cp.mask[0] = 0x1f;
++
++	ret = __hci_cmd_sync_status(hdev, HCI_OP_LE_SET_EVENT_MASK,
++				    sizeof(cp), &cp, HCI_CMD_TIMEOUT);
++	if (ret) {
++		bt_dev_err(hdev, "LE event mask correction failed: %d", ret);
++		return ret;
++	}
++
++	bt_dev_info(hdev,
++		    "LE event mask corrected to 0x%02x; advertising reports enabled",
++		    cp.mask[0]);
++	return 0;
++}
++
+ static int mt8163_stp_hci_open(struct hci_dev *hdev)
+ {
+ 	return 0;
+@@ -1280,6 +1330,7 @@ static int mt8163_stp_hci_register(struct mt8163_stp *stp)
+ 	hdev->close = mt8163_stp_hci_close;
+ 	hdev->flush = mt8163_stp_hci_flush;
+ 	hdev->send = mt8163_stp_hci_send_frame;
++	hdev->post_init = mt8163_stp_hci_post_init;
+ 	SET_HCIDEV_DEV(hdev, stp->dev);
+ 	hci_set_drvdata(hdev, stp);
+ 
+-- 
+2.55.0.windows.3
+

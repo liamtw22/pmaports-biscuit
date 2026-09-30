@@ -1,0 +1,62 @@
+#!/sbin/openrc-run
+# Light ring content: plays stock's animations under stock's priority model.
+#
+# Pairs with biscuit-als, which decides brightness. This is the only thing that
+# writes the ring LEDs; biscuit-als never touches them.
+
+# The animation to show while booting, as a --play argument for the daemon.
+#
+# This used to be a start_post() that echoed into /run/biscuit-ring/control.
+# It never worked on a real boot: the daemon creates that FIFO itself, and on a
+# cold boot /run is fresh tmpfs, so start_post wrote to a path that did not
+# exist yet and the redirect failed instantly. Measured on the device: service
+# pidfile at 21:07:33, FIFO at 21:07:47. It appeared to work only when tested
+# with `rc-service biscuit-ring restart`, where the previous run's FIFO is
+# still there.
+#
+# --play is the daemon's own flag, so there is no FIFO, no race and no window
+# where the animation can be missed - it renders as soon as the ring is up.
+boot_anim() {
+	# Already booted: a restart on a running device must not put the comet
+	# back. The marker is on tmpfs, so it is absent again next boot.
+	[ -f /run/biscuit-ring/boot-done ] && return 0
+
+	if [ -r /opt/persist/led-anim.env ]; then
+		. /opt/persist/led-anim.env
+	fi
+	anim=${LED_booting:-act_booting}
+	# Written by biscuit-settings from a validated list, but it lands on a
+	# command line, so refuse anything that is not a plain animation name.
+	case $anim in
+		*[!A-Za-z0-9_-]*|"") anim=act_booting ;;
+	esac
+	printf -- "--play %s" "$anim"
+}
+
+name="biscuit-ring"
+description="Light ring animations (stock resources and priority layers)"
+
+command="/usr/bin/python3"
+command_args="/usr/bin/biscuit-ring.py $(boot_anim)"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/biscuit-ring.log"
+error_log="/var/log/biscuit-ring.log"
+
+depend() {
+	need localmount
+	# biscuit-persist provides /opt/persist, where led-anim.env lives.
+	after modules biscuit-als biscuit-persist
+}
+
+start_pre() {
+	if [ ! -r /usr/bin/biscuit-ring.py ]; then
+		eerror "biscuit-ring.py is not installed"
+		return 1
+	fi
+	if [ ! -d /usr/share/biscuit-ring/led-resources ]; then
+		eerror "no animations under /usr/share/biscuit-ring/led-resources"
+		return 1
+	fi
+	return 0
+}

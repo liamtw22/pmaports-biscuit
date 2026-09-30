@@ -1,0 +1,25 @@
+# Members of wheel may use sudo without re-entering a password.
+#
+# This device is administered over SSH by the single account the setup wizard
+# creates, and that account's key is the only credential the :8080 SSH page can
+# display or revoke. A sudo password on top of it is not a second factor - it
+# is a second secret guarding the same authority, one the device has no way to
+# show, rotate or revoke, and one that has to be typed by hand on a headless
+# appliance nobody has a console for.
+#
+# The trade is deliberate and worth stating plainly: whoever holds that
+# account's SSH key holds root. That is the property we want, because revoking
+# the key from the SSH page now revokes root along with it - there is exactly
+# one thing to take away, instead of a second root credential living outside
+# everything that manages this device.
+#
+# It does move the weakest link. With this rule in place, SSH password
+# authentication is the shortest path to root, so turn it off from the SSH page
+# once a key is installed; that toggle is guarded against locking you out.
+#
+# The shipped default account (user / 147147, postmarketOS's published
+# default) is in wheel too, until setup replaces it. Its password is public, so
+# while it is live sshd refuses it everywhere except over the USB cable
+# (biscuit-firstboot), and refuses every login from the open setup network
+# (/etc/ssh/sshd_config.d/40-biscuit.conf).
+%wheel ALL=(ALL) NOPASSWD: ALL

@@ -1,0 +1,42 @@
+#!/sbin/openrc-run
+
+description="Bluetooth speaker: pairing agent, auto-trust, and the A2DP playback bridge"
+
+command="/usr/bin/biscuit-btaudio.sh"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/biscuit-btaudio.log"
+error_log="/var/log/biscuit-btaudio.log"
+
+depend() {
+	need localmount dbus
+	after bluetooth bluealsa
+}
+
+start_pre() {
+	if [ ! -x /usr/bin/biscuit-btaudio.sh ]; then
+		eerror "biscuit-btaudio.sh is not installed"
+		return 1
+	fi
+	if ! command -v bluetoothctl >/dev/null 2>&1; then
+		eerror "bluetoothctl is not installed"
+		return 1
+	fi
+	if ! command -v bluealsa-aplay >/dev/null 2>&1; then
+		eerror "bluealsa-aplay is not installed"
+		return 1
+	fi
+	return 0
+}
+
+stop_post() {
+	# The script leaves a bluetoothctl session holding the pairing agent and a
+	# bluealsa-aplay it started; neither is a child of the supervised pid.
+	pkill -f "biscuit-btaudio.sh" 2>/dev/null
+	pkill -f "bluetoothctl" 2>/dev/null
+	if [ -f /run/bluealsa-aplay.pid ]; then
+		start-stop-daemon --stop --quiet --pidfile /run/bluealsa-aplay.pid 2>/dev/null
+		rm -f /run/bluealsa-aplay.pid
+	fi
+	return 0
+}

@@ -1,0 +1,58 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index 60d1d64..709cb9c 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -92,6 +92,23 @@ static const u8 wmt_patch_address_cmd[] = {
+ };
+ static const u8 wmt_patch_address_evt[] =
+ 	{ 0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01 };
++static const u8 wmt_power_dlm_cmd1[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x60, 0x00, 0x10, 0x80, 0x00, 0x00, 0x00, 0x00,
++	0x00, 0x0f, 0x00, 0x00,
++};
++static const u8 wmt_power_dlm_cmd2[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x60, 0x00, 0x10, 0x80, 0x00, 0x00, 0x00, 0x00,
++	0xf0, 0x00, 0x00, 0x00,
++};
++static const u8 wmt_power_dlm_cmd3[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x60, 0x00, 0x10, 0x80, 0x00, 0x00, 0x00, 0x00,
++	0x08, 0x00, 0x00, 0x00,
++};
++static const u8 wmt_power_dlm_evt[] =
++	{ 0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01 };
+ static const u8 wmt_set_mcu_clk_enable_cmd[] = {
+ 	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
+ 	0x34, 0x03, 0x00, 0x80, 0x00, 0x00, 0x01, 0x00,
+@@ -858,6 +875,29 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 	if (ret)
+ 		return dev_err_probe(stp->dev, ret, "framed WMT STP query failed\n");
+ 
++	/* Stock powers the MT8163 DLM patch destination before download. */
++	ret = mt8163_stp_wmt_xfer(stp, wmt_power_dlm_cmd1,
++				  sizeof(wmt_power_dlm_cmd1), wmt_power_dlm_evt,
++				  sizeof(wmt_power_dlm_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret,
++				     "WMT DLM power command 1/3 failed\n");
++	dev_warn(stp->dev, "WMT DLM power command 1/3 acknowledged\n");
++	ret = mt8163_stp_wmt_xfer(stp, wmt_power_dlm_cmd2,
++				  sizeof(wmt_power_dlm_cmd2), wmt_power_dlm_evt,
++				  sizeof(wmt_power_dlm_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret,
++				     "WMT DLM power command 2/3 failed\n");
++	dev_warn(stp->dev, "WMT DLM power command 2/3 acknowledged\n");
++	ret = mt8163_stp_wmt_xfer(stp, wmt_power_dlm_cmd3,
++				  sizeof(wmt_power_dlm_cmd3), wmt_power_dlm_evt,
++				  sizeof(wmt_power_dlm_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret,
++				     "WMT DLM power command 3/3 failed\n");
++	dev_warn(stp->dev, "WMT DLM power command 3/3 acknowledged\n");
++
+ 	/* Stock raises the MT8163 connectivity MCU clock for patch download. */
+ 	ret = mt8163_stp_wmt_xfer(stp, wmt_set_mcu_clk_enable_cmd,
+ 				  sizeof(wmt_set_mcu_clk_enable_cmd),

@@ -1,0 +1,85 @@
+From: Biscuit PMOS maintainers <maintainers@example.invalid>
+Subject: [PATCH] misc: mt8163-consys: clear stock shared EMI area
+
+The stock MT8163 connectivity implementation maps the 343 KiB region at
+the upper half of the first MiB of the CONSYS window and clears it before
+the radio processor is released.  Mirror that host-side initialization.
+
+The reserved memory is already established by the device tree and guarded
+by the existing size and alignment checks.  This does not alter the DMA
+rings or the WMT transport; it makes the contents of the stock shared area
+deterministic for the next RX bring-up test.
+
+---
+ drivers/misc/mt8163-consys.c | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+diff --git a/drivers/misc/mt8163-consys.c b/drivers/misc/mt8163-consys.c
+index 7d91558..ac55140 100644
+--- a/drivers/misc/mt8163-consys.c
++++ b/drivers/misc/mt8163-consys.c
+@@ -81,6 +81,15 @@ static const u32 consys_known_ids[] = { 0x8163, 0x0321, 0x0335, 0x0337 };
+ #define CONSYS_EMI_MAPPING_ENABLE	BIT(12)
+ #define MT8163_DRAM_BASE		0x40000000UL
+ 
++/*
++ * The vendor maps and clears this slice before the connectivity processor is
++ * brought out of reset.  It is documented there as coredump space, but it is
++ * part of the processor's shared first-megabyte window and therefore needs
++ * deterministic contents while bring-up is being compared with stock.
++ */
++#define CONSYS_EMI_SHARED_OFFSET	SZ_512K
++#define CONSYS_EMI_SHARED_SIZE		(343 * SZ_1K)
++
+ /*
+  * The vendor also fences the upper half of the first megabyte of that window
+  * as EMI MPU region 13, so the processor's shared memory and its coredumps are
+@@ -268,6 +277,34 @@ static int mt8163_consys_map_emi(struct mt8163_consys *priv)
+ 	return 0;
+ }
+ 
++/* Match the stock host-side initialization of the shared CONSYS window. */
++static int mt8163_consys_clear_shared_emi(struct mt8163_consys *priv)
++{
++	void __iomem *shared;
++	phys_addr_t phys;
++
++	if (!priv->emi_base)
++		return 0;
++
++	if (priv->emi_size < CONSYS_EMI_SHARED_OFFSET + CONSYS_EMI_SHARED_SIZE)
++		return dev_err_probe(priv->dev, -EINVAL,
++				     "EMI window is too small for the shared CONSYS area\n");
++
++	phys = priv->emi_base + CONSYS_EMI_SHARED_OFFSET;
++	shared = devm_ioremap(priv->dev, phys, CONSYS_EMI_SHARED_SIZE);
++	if (!shared)
++		return dev_err_probe(priv->dev, -ENOMEM,
++				     "failed to map the shared CONSYS EMI area\n");
++
++	memset_io(shared, 0, CONSYS_EMI_SHARED_SIZE);
++	wmb();
++
++	dev_info(priv->dev, "cleared shared CONSYS EMI area %pa (%u KiB)\n",
++		 &phys, CONSYS_EMI_SHARED_SIZE / SZ_1K);
++
++	return 0;
++}
++
+ /*
+  * Fence the shared-memory half of the window as the vendor's region 13.
+  * Readback is not decoration: this is an experiment, and a write that the
+@@ -695,6 +732,10 @@ static int mt8163_consys_probe(struct platform_device *pdev)
+ 		if (ret)
+ 			return ret;
+ 	}
+ 
++	ret = mt8163_consys_clear_shared_emi(priv);
++	if (ret)
++		return ret;
++
+ 	pm_runtime_enable(dev);
+ 
+ 	ret = mt8163_consys_power_up(priv);
+-- 
+2.50.1

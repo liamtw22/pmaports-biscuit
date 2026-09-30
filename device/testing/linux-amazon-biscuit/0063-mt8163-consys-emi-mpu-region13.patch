@@ -1,0 +1,183 @@
+Fence the connectivity processor's shared memory
+
+The window the processor reads its firmware through is also where it writes
+its coredumps, and the vendor does not leave that half of it open. It
+programs EMI MPU region 13 across the upper half of the first megabyte,
+forbidding every domain that has no business there. This kernel has never
+done it: all three registers read zero on the running device.
+
+Only region 13 is reproduced. The two permission registers are shared with
+region 12, which owns their lower halves, so each is a read-modify-write.
+The vendor clears permissions before moving the address and restores them
+after, and that order is kept, because a live region must never point
+somewhere new while it still carries its old rights.
+
+It is behind a parameter and off by default, and it reads the registers back
+and says what it found: a write the hardware quietly ignored would otherwise
+look exactly like one that worked.
+
+diff --git a/drivers/misc/mt8163-consys.c b/drivers/misc/mt8163-consys.c
+index e95ef03..9aafb1e 100644
+--- a/drivers/misc/mt8163-consys.c
++++ b/drivers/misc/mt8163-consys.c
+@@ -44,6 +44,7 @@
+ #include <linux/regulator/consumer.h>
+ #include <linux/reset.h>
+ #include <linux/sizes.h>
++#include <linux/spinlock.h>
+ 
+ /* Registers within the CONN_MCU_CONFIG window at 0x18070000. */
+ #define CONSYS_CHIP_ID			0x008
+@@ -76,6 +77,33 @@ static const u32 consys_known_ids[] = { 0x8163, 0x0321, 0x0335, 0x0337 };
+ #define CONSYS_EMI_MAPPING_ENABLE	BIT(12)
+ #define MT8163_DRAM_BASE		0x40000000UL
+ 
++/*
++ * The vendor also fences the upper half of the first megabyte of that window
++ * as EMI MPU region 13, so the processor's shared memory and its coredumps are
++ * unreachable from the domains that have no business in them. This kernel has
++ * never programmed it: all three registers read zero on the running device.
++ *
++ * Only region 13 is reproduced, and only as the vendor writes it. The two
++ * permission registers are shared with region 12, which owns their lower
++ * halves, so each is a read-modify-write rather than a store. The vendor
++ * clears the permissions before moving the address and restores them after,
++ * and that order is kept: a live region must never point somewhere new while
++ * it still carries its old rights.
++ */
++#define EMI_MPUF2			0x288
++#define EMI_MPUK2			0x2b0
++#define EMI_MPUK2_2ND			0x2b4
++#define EMI_MPU_PHYS_OFFSET		0x40000000UL
++#define EMI_MPU_GRANULE_SHIFT		16
++/* SET_ACCESS_PERMISSON(FORBIDDEN x5, NO_PROTECTION, FORBIDDEN, NO_PROTECTION) */
++#define CONSYS_MPU_AX_PM		0x0a28
++#define CONSYS_MPU_AX_PM2		0x0b6d
++
++static bool set_emi_mpu;
++module_param(set_emi_mpu, bool, 0444);
++MODULE_PARM_DESC(set_emi_mpu,
++		 "Program EMI MPU region 13 over the processor's shared memory, as the vendor does. Experimental.");
++
+ /* The block needs a moment after the domain comes up before it will answer. */
+ #define CONSYS_SETTLE_US		10
+ #define CONSYS_ID_RETRIES		20
+@@ -93,6 +121,8 @@ struct mt8163_consys {
+ 	void __iomem *mcu;
+ 	struct reset_control *cpu_reset;
+ 	struct regmap *infracfg;
++	struct regmap *emi;
++	spinlock_t mpu_lock;
+ 	struct regulator_bulk_data supplies[ARRAY_SIZE(consys_supply_names)];
+ 	phys_addr_t emi_base;
+ 	phys_addr_t emi_size;
+@@ -171,6 +201,67 @@ static int mt8163_consys_map_emi(struct mt8163_consys *priv)
+ 	return 0;
+ }
+ 
++/*
++ * Fence the shared-memory half of the window as the vendor's region 13.
++ * Readback is not decoration: this is an experiment, and a write that the
++ * hardware quietly ignored would look exactly like one that worked.
++ */
++static int mt8163_consys_set_mpu(struct mt8163_consys *priv)
++{
++	struct device *dev = priv->dev;
++	u32 start, end, addr, pm, pm2, tmp, tmp2;
++	u32 rb_addr, rb_pm, rb_pm2;
++	unsigned long flags;
++	int ret;
++
++	if (!priv->emi_base) {
++		dev_info(dev, "no EMI window, nothing to fence\n");
++		return 0;
++	}
++
++	start = (priv->emi_base + SZ_512K - EMI_MPU_PHYS_OFFSET) >> EMI_MPU_GRANULE_SHIFT;
++	end = (priv->emi_base + SZ_1M - 1 - EMI_MPU_PHYS_OFFSET) >> EMI_MPU_GRANULE_SHIFT;
++	addr = (start << 16) | end;
++	pm = CONSYS_MPU_AX_PM << 16;
++	pm2 = CONSYS_MPU_AX_PM2 << 16;
++
++	spin_lock_irqsave(&priv->mpu_lock, flags);
++
++	ret = regmap_read(priv->emi, EMI_MPUK2, &tmp);
++	ret |= regmap_read(priv->emi, EMI_MPUK2_2ND, &tmp2);
++	if (!ret) {
++		/* region 12 keeps the lower half of both registers */
++		tmp &= 0x0000ffff;
++		tmp2 &= 0x0000ffff;
++
++		ret |= regmap_write(priv->emi, EMI_MPUK2, 0);
++		ret |= regmap_write(priv->emi, EMI_MPUK2_2ND, 0);
++		ret |= regmap_write(priv->emi, EMI_MPUF2, addr);
++		ret |= regmap_write(priv->emi, EMI_MPUK2, tmp | pm);
++		ret |= regmap_write(priv->emi, EMI_MPUK2_2ND, tmp2 | pm2);
++	}
++
++	spin_unlock_irqrestore(&priv->mpu_lock, flags);
++
++	if (ret)
++		return dev_err_probe(dev, -EIO,
++				     "failed to program EMI MPU region 13\n");
++
++	regmap_read(priv->emi, EMI_MPUF2, &rb_addr);
++	regmap_read(priv->emi, EMI_MPUK2, &rb_pm);
++	regmap_read(priv->emi, EMI_MPUK2_2ND, &rb_pm2);
++
++	dev_info(dev, "EMI MPU region 13: MPUF2 0x%08x MPUK2 0x%08x MPUK2_2ND 0x%08x\n",
++		 rb_addr, rb_pm, rb_pm2);
++
++	if (rb_addr != addr || (rb_pm & 0xffff0000) != pm ||
++	    (rb_pm2 & 0xffff0000) != pm2)
++		dev_warn(dev, "EMI MPU readback differs from the write (wanted 0x%08x, 0x%08x, 0x%08x)\n",
++			 addr, tmp | pm, tmp2 | pm2);
++
++	return 0;
++}
++
+ /*
+  * Bring the block up far enough to be identified. The caller gets the
+  * identifier back even when it is not one we recognise, because an
+@@ -396,6 +487,20 @@ static int mt8163_consys_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	spin_lock_init(&priv->mpu_lock);
++
++	if (set_emi_mpu) {
++		priv->emi = syscon_regmap_lookup_by_phandle(dev->of_node,
++							   "mediatek,emi");
++		if (IS_ERR(priv->emi))
++			return dev_err_probe(dev, PTR_ERR(priv->emi),
++					     "failed to get emi\n");
++
++		ret = mt8163_consys_set_mpu(priv);
++		if (ret)
++			return ret;
++	}
++
+ 	pm_runtime_enable(dev);
+ 
+ 	ret = mt8163_consys_power_up(priv);
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -685,2 +685,18 @@
+ 	};
+ };
++
++/*
++ * The EMI controller, for the MPU registers that fence the processor's
++ * shared memory. Only the register window is described: nothing in tree
++ * drives this block, and nothing else should be reaching into it.
++ */
++&{/soc} {
++	emi: memory-controller@10203000 {
++		compatible = "mediatek,mt8163-emi", "syscon";
++		reg = <0 0x10203000 0 0x1000>;
++	};
++};
++
++&consys {
++	mediatek,emi = <&emi>;
++};

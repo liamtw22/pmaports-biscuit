@@ -1,0 +1,48 @@
+{
+ "backup": {
+  "content": "0bdc5db27ad54bfcce3f849bf897722852ce937401ff1ed1752a775a33299042",
+  "members": {
+   "COPYING.GPL-2.0": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6 644",
+   "LICENSE": "e20299dabe11e42307e0b7a239c3dcaa3f173fbb2f57604c11a86e1bf66c5272 644",
+   "META-INF/com/google/android/update-binary": "6e587a50c7541ddaff005ad0159a56de716fbe1edd47ee7036af91a6fe4022ce 755",
+   "META-INF/com/google/android/updater-script": "6266ed44b8f8402f77a97eb6b001779eed443be18b7d7440601bba295ae837f3 644",
+   "NOTICE": "86c406e8efb6b333a80699297046d53c3f4b115c2fc872a279b818c2ab7507c7 644",
+   "assets.list": "6af3ab5c43a8a1ffc9eac78a02d224f3ee4fe5b1693c2acc09eba6702eb797b1 644",
+   "bin/biscuit-tool": "c6629126eb279fa5360ab3fb5a10a48c219149f590bfadb51ddedaff27790997 755",
+   "bin/busybox": "a364319202fcbf94904916afb5e11e7dc5e210b480696716a8b7ea387af20581 755",
+   "common/functions.sh": "778cc5acefc8d52b9f290f07b0ad60b5a8316b83b3ab3122e216f24681d94f9f 644"
+  },
+  "sha256": "295eaf0e39f1b017c1b8ea4c9f5a707c284e9628c48b282c50cb1c87e0e39bde",
+  "version": 1
+ },
+ "restore": {
+  "content": "f9df7346c55a44ef9aafa443ef44ec4a27eb5c8a858ff422fd2b018a481426c8",
+  "members": {
+   "COPYING.GPL-2.0": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6 644",
+   "LICENSE": "e20299dabe11e42307e0b7a239c3dcaa3f173fbb2f57604c11a86e1bf66c5272 644",
+   "META-INF/com/google/android/update-binary": "3f4c6cf21a52b3905bf3d6025738f950b01bf42fa754dc84319ae3e59a0274b4 755",
+   "META-INF/com/google/android/updater-script": "6266ed44b8f8402f77a97eb6b001779eed443be18b7d7440601bba295ae837f3 644",
+   "NOTICE": "86c406e8efb6b333a80699297046d53c3f4b115c2fc872a279b818c2ab7507c7 644",
+   "bin/biscuit-tool": "c6629126eb279fa5360ab3fb5a10a48c219149f590bfadb51ddedaff27790997 755",
+   "bin/busybox": "a364319202fcbf94904916afb5e11e7dc5e210b480696716a8b7ea387af20581 755",
+   "common/functions.sh": "778cc5acefc8d52b9f290f07b0ad60b5a8316b83b3ab3122e216f24681d94f9f 644"
+  },
+  "sha256": "7508286b7a425523f937b3e6287f33c38e3c723ad9636470e2bce55f711821f1",
+  "version": 1
+ },
+ "stock-restore": {
+  "content": "c36bf7ba386ba9e75bb465bc0f1de61a133e7874ff4331d19c982093dc20d9fd",
+  "members": {
+   "COPYING.GPL-2.0": "edaef632cbb643e4e7a221717a6c441a4c1a7c918e6e4d56debc3d8739b233f6 644",
+   "LICENSE": "e20299dabe11e42307e0b7a239c3dcaa3f173fbb2f57604c11a86e1bf66c5272 644",
+   "META-INF/com/google/android/update-binary": "31fb791f1c194cf9426f6964649ea19ee3803b72c003af60d774f0a549df717a 755",
+   "META-INF/com/google/android/updater-script": "6266ed44b8f8402f77a97eb6b001779eed443be18b7d7440601bba295ae837f3 644",
+   "NOTICE": "86c406e8efb6b333a80699297046d53c3f4b115c2fc872a279b818c2ab7507c7 644",
+   "bin/biscuit-tool": "c6629126eb279fa5360ab3fb5a10a48c219149f590bfadb51ddedaff27790997 755",
+   "bin/busybox": "a364319202fcbf94904916afb5e11e7dc5e210b480696716a8b7ea387af20581 755",
+   "common/functions.sh": "778cc5acefc8d52b9f290f07b0ad60b5a8316b83b3ab3122e216f24681d94f9f 644"
+  },
+  "sha256": "f9948be1151144a26df6e3b43bf7bea5de9b39bc183aa1c431ff9bb18c6935c6",
+  "version": 1
+ }
+}

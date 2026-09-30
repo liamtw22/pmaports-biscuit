@@ -1,0 +1,52 @@
+#!/sbin/openrc-run
+
+description="Announce Biscuit's real Bluetooth device identity"
+
+# bluez owns /etc/bluetooth/main.conf, so this package cannot simply ship its
+# own copy - apk would refuse the conflict, and a bluez upgrade would replace it
+# anyway. Instead the DeviceID line is ensured here, before bluetoothd starts,
+# and the edit is idempotent so an upgrade that restores the stock file is
+# silently corrected on the next boot.
+#
+# The values are stock's, from /system/etc/bluetooth/bt_did.conf:
+#   vendorIdSource 0x0001 (Bluetooth SIG), vendorId 0x0171 (Amazon),
+#   productId 0x0110, version 0x0100.
+# Without this the device advertises no DID at all and appears as a generic
+# audio sink to whatever it pairs with.
+
+CONF=/etc/bluetooth/main.conf
+WANT="DeviceID = bluetooth:0171:0110:0100"
+
+depend() {
+	before bluetooth
+	need localmount
+}
+
+start() {
+	ebegin "Setting the Bluetooth device identity"
+
+	if [ ! -f "$CONF" ]; then
+		eend 0 "no $CONF; bluez not installed"
+		return 0
+	fi
+
+	if grep -q "^${WANT}$" "$CONF"; then
+		eend 0 "already set"
+		return 0
+	fi
+
+	# Replace an existing DeviceID line whether commented or not, else append
+	# under [General]. Never write the file twice in one pass.
+	if grep -qE "^[[:space:]]*#?[[:space:]]*DeviceID[[:space:]]*=" "$CONF"; then
+		sed -i "s|^[[:space:]]*#\?[[:space:]]*DeviceID[[:space:]]*=.*|${WANT}|" "$CONF"
+	else
+		printf '%s\n' "$WANT" >> "$CONF"
+	fi
+
+	if grep -q "^${WANT}$" "$CONF"; then
+		eend 0
+	else
+		eend 1 "could not set DeviceID in $CONF"
+	fi
+	return 0
+}

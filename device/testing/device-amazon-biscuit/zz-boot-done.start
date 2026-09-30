@@ -1,0 +1,70 @@
+#!/bin/sh
+# Play stock's boot_success animation once the device has finished coming up.
+#
+# There is otherwise no way to tell from across the room whether the Echo has
+# booted - it has no screen, and the ring is dark until something asks it to
+# light up.
+#
+# Named zz- because /etc/local.d scripts run in alphabetical order and this must
+# be last: wifi.start comes earlier, so by the time this runs the network has
+# either come up or exhausted its retries. "Finished booting" for this device
+# reasonably means "on the network", so waiting for that is the point rather
+# than a side effect. The cost is that a boot where Wi-Fi never associates
+# delays the animation by however long wifi.start spends retrying.
+#
+# boot_success is stock's own resource: a cyan ring that fades out over ~2s.
+# It is the DEFAULT; the user can pick any animation or effect for this moment.
+
+FIFO=/run/biscuit-ring/control
+
+# Ring animations are user-customisable from the settings page. biscuit-settings
+# writes /opt/persist/led-anim.env with one LED_<activity> per activity, already
+# resolved to a concrete animation name. Sourced rather than parsed so no Python
+# lands on the boot path, and every use falls back to OUR act_ animation so a
+# missing or partial file can never leave the ring dark. The fallbacks used to
+# name stock animations; those are no longer shipped, so a fallback to one
+# would have left the ring dark in exactly the case it exists to cover.
+#
+# The `if` form is deliberate: `[ -r f ] && . f` evaluates false when the file is
+# absent, which aborts any caller running under `set -e`.
+if [ -r /opt/persist/led-anim.env ]; then
+	. /opt/persist/led-anim.env
+fi
+ANIM=${LED_boot:-act_boot}
+LOG=/var/log/biscuit-boot-done.log
+
+# biscuit-ring creates the FIFO when it starts. local.d runs late, so it is
+# normally already there, but do not assume it.
+i=0
+while [ ! -p "$FIFO" ] && [ $i -lt 30 ]; do
+	sleep 1
+	i=$((i + 1))
+done
+
+if [ ! -p "$FIFO" ]; then
+	echo "$(date '+%H:%M:%S') no $FIFO after ${i}s - is biscuit-ring running?" >> "$LOG"
+	exit 0
+fi
+
+# Non-blocking: if nothing is reading the FIFO the write would otherwise hang
+# and stall the rest of the boot.
+# The boot chime, alongside the ring. Failure here is ignored for the same
+# reason the ring write is: nothing about announcing a finished boot may
+# stop the boot from finishing.
+# Booting is over: retire the comet and record the fact, so a later
+# restart of biscuit-ring does not start it again on a running device.
+mkdir -p /run/biscuit-ring 2>/dev/null
+: > /run/biscuit-ring/boot-done 2>/dev/null || true
+BOOTING=${LED_booting:-act_booting}
+echo "stop $BOOTING" > "$FIFO" 2>/dev/null || true
+
+/usr/bin/biscuit-earcon boot >/dev/null 2>&1 || true
+
+if echo "play $ANIM 3" > "$FIFO" 2>/dev/null; then
+	echo "$(date '+%H:%M:%S') played $ANIM" >> "$LOG"
+else
+	echo "$(date '+%H:%M:%S') could not write $FIFO" >> "$LOG"
+fi
+
+exit 0
+

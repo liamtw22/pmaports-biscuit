@@ -1,0 +1,170 @@
+--- a/sound/soc/mediatek/mt8163/Makefile
++++ b/sound/soc/mediatek/mt8163/Makefile
+@@ -6,4 +6,5 @@
+ 	mt8163-afe-pcm.o \
+ 	mt8163-dai-i2s.o
+ 
+ obj-$(CONFIG_SND_SOC_MT8163) += snd-soc-mt8163-afe.o
++obj-$(CONFIG_SND_SOC_MT8163) += mt8163-biscuit.o
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -143,4 +143,13 @@
+                 regulator-boot-on;
+                 regulator-always-on;
+         };
+ };
++
++/ {
++	biscuit_audio: biscuit-audio {
++		compatible = "amazon,mt8163-biscuit-audio";
++		mediatek,afe = <&afe>;
++		audio-codec = <&tlv320_codec>;
++		status = "okay";
++	};
++};
+--- /dev/null
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -0,0 +1,143 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Amazon Echo Dot 2 (Biscuit) ASoC machine driver.
++ *
++ * DL1 is the memory-interface frontend exposed to userspace. I2S1 is
++ * the no-PCM backend that carries DL1 to the external TLV320 codec.
++ */
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <sound/soc.h>
++
++struct mt8163_biscuit_priv {
++	struct snd_soc_card card;
++	struct snd_soc_dai_link links[2];
++	struct snd_soc_dai_link_component cpus[2];
++	struct snd_soc_dai_link_component platforms[2];
++	struct snd_soc_dai_link_component codecs[2];
++};
++
++/*
++ * DPCM topology: the userspace DL1 frontend feeds the physical I2S1
++ * backend. Without this route, ASoC deliberately leaves the backend idle.
++ */
++static const struct snd_soc_dapm_route mt8163_biscuit_routes[] = {
++	{ "I2S1", NULL, "DL1" },
++};
++
++static int mt8163_biscuit_i2s1_init(struct snd_soc_pcm_runtime *rtd)
++{
++	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
++
++    int ret;
++
++    ret = snd_soc_dai_set_sysclk(codec_dai, 0, 9600000,
++                                 SND_SOC_CLOCK_IN);
++    dev_info(rtd->card->dev, "BISCUIT: I2S1 init sysclk 9.6MHz ret=%d\n", ret);
++    return ret;
++}
++
++static int mt8163_biscuit_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct mt8163_biscuit_priv *priv;
++	struct device_node *afe_np, *codec_np;
++	int ret;
++
++	afe_np = of_parse_phandle(dev->of_node, "mediatek,afe", 0);
++	codec_np = of_parse_phandle(dev->of_node, "audio-codec", 0);
++	if (!afe_np || !codec_np) {
++		of_node_put(afe_np);
++		of_node_put(codec_np);
++		return dev_err_probe(dev, -EINVAL,
++				     "missing AFE or codec phandle\n");
++	}
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv) {
++		of_node_put(afe_np);
++		of_node_put(codec_np);
++		return -ENOMEM;
++	}
++
++	/* DL1 frontend: the only userspace PCM. */
++	priv->cpus[0].of_node = afe_np;
++	priv->cpus[0].dai_name = "DL1";
++	priv->platforms[0].of_node = afe_np;
++	priv->codecs[0].name = "snd-soc-dummy";
++	priv->codecs[0].dai_name = "snd-soc-dummy-dai";
++
++	priv->links[0].name = "DL1 Playback";
++	priv->links[0].stream_name = "Playback";
++	priv->links[0].cpus = &priv->cpus[0];
++	priv->links[0].num_cpus = 1;
++	priv->links[0].platforms = &priv->platforms[0];
++	priv->links[0].num_platforms = 1;
++	priv->links[0].codecs = &priv->codecs[0];
++	priv->links[0].num_codecs = 1;
++	priv->links[0].dynamic = 1;
++	priv->links[0].playback_only = 1;
++	priv->links[0].trigger[SNDRV_PCM_STREAM_PLAYBACK] =
++		SND_SOC_DPCM_TRIGGER_PRE;
++	priv->links[0].trigger[SNDRV_PCM_STREAM_CAPTURE] =
++		SND_SOC_DPCM_TRIGGER_PRE;
++
++	/* I2S1 backend: connects DL1 to the physical TLV320 bus. */
++	priv->cpus[1].of_node = afe_np;
++	priv->cpus[1].dai_name = "I2S1";
++	priv->platforms[1].of_node = afe_np;
++	priv->codecs[1].of_node = codec_np;
++	priv->codecs[1].dai_name = "tlv320aic32x4-hifi";
++
++	priv->links[1].name = "I2S1-TLV320";
++	priv->links[1].stream_name = "I2S1 Playback";
++	priv->links[1].cpus = &priv->cpus[1];
++	priv->links[1].num_cpus = 1;
++	priv->links[1].platforms = &priv->platforms[1];
++	priv->links[1].num_platforms = 1;
++	priv->links[1].codecs = &priv->codecs[1];
++	priv->links[1].num_codecs = 1;
++	priv->links[1].no_pcm = 1;
++	priv->links[1].playback_only = 1;
++	priv->links[1].init = mt8163_biscuit_i2s1_init;
++	priv->links[1].dai_fmt = SND_SOC_DAIFMT_I2S |
++		SND_SOC_DAIFMT_NB_NF |
++		SND_SOC_DAIFMT_CBC_CFC;
++
++	priv->card.name = "mt8163-biscuit";
++	priv->card.owner = THIS_MODULE;
++	priv->card.dev = dev;
++	priv->card.dai_link = priv->links;
++	priv->card.num_links = ARRAY_SIZE(priv->links);
++	priv->card.dapm_routes = mt8163_biscuit_routes;
++	priv->card.num_dapm_routes = ARRAY_SIZE(mt8163_biscuit_routes);
++
++	ret = devm_snd_soc_register_card(dev, &priv->card);
++	if (ret) {
++		of_node_put(afe_np);
++		of_node_put(codec_np);
++		return dev_err_probe(dev, ret, "failed to register sound card\n");
++	}
++
++	platform_set_drvdata(pdev, priv);
++	return 0;
++}
++
++static const struct of_device_id mt8163_biscuit_of_match[] = {
++	{ .compatible = "amazon,mt8163-biscuit-audio" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, mt8163_biscuit_of_match);
++
++static struct platform_driver mt8163_biscuit_driver = {
++	.probe = mt8163_biscuit_probe,
++	.driver = {
++		.name = "mt8163-biscuit-audio",
++		.of_match_table = mt8163_biscuit_of_match,
++	},
++};
++module_platform_driver(mt8163_biscuit_driver);
++
++MODULE_DESCRIPTION("Amazon Echo Dot 2 MT8163 audio machine driver");
++MODULE_LICENSE("GPL");

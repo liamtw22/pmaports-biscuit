@@ -1,0 +1,87 @@
+From 272e70ee713d401155f4374f69ef47815deb6be6 Mon Sep 17 00:00:00 2001
+From: Claude <claude@localhost>
+Date: Mon, 10 Aug 2026 13:38:26 -0400
+Subject: [PATCH] bluetooth: run the stock RF calibration script after patch
+ download
+
+r178 brought hci0 to UP RUNNING with a clean init, but LE scanning returns
+zero advertising reports even with a known advertiser a foot away: fifteen
+seconds of scanning with duplicate filtering disabled produces only the
+three command-complete events. rfkill is clear and every scan command is
+accepted, so the controller is deaf rather than idle.
+
+Stock's mtk_wcn_soc_init() step 7 raises the PALDO, runs calibration_table
+and drops the PALDO again, between the patch download and the per-function
+Bluetooth enable. PMOS ran none of it. Two neighbouring suspects were
+eliminated first: CFG_WMT_CRYSTAL_TIMING_SET is 0 on Biscuit so stock never
+trims the crystal either, and mtk_wcn_consys_hw_wifi_paldo_ctrl() simply
+calls the BT variant, so both PALDO calls land on the same refcounted VCN33
+supply that PMOS already drives.
+
+Send WMT_CORE_START_RF_CALIBRATION in stock position. Stock's
+wmt_core_init_script() skips the event comparison for opcode 0x14 and
+enforces only the six-byte length, so compare the event header and mask out
+the device-returned values rather than matching them exactly.
+
+No firmware, patch address, fragmentation, STP, BTIF, CONSYS power, EMI,
+quirk or boot packaging behaviour changed.
+---
+ drivers/bluetooth/hci_mt8163_stp.c | 35 ++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index eb71779..e82eadf 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -138,6 +138,17 @@ static const u8 wmt_set_mcu_clk_evt[] =
+ static const u8 wmt_patch_evt[] = { 0x02, 0x01, 0x01, 0x00, 0x00 };
+ static const u8 wmt_reset_cmd[] = { 0x01, 0x07, 0x01, 0x00, 0x04 };
+ static const u8 wmt_reset_evt[] = { 0x02, 0x07, 0x01, 0x00, 0x00 };
++static const u8 wmt_rf_calibration_cmd[] = { 0x01, 0x14, 0x01, 0x00, 0x01 };
++static const u8 wmt_rf_calibration_evt[] =
++	{ 0x02, 0x14, 0x02, 0x00, 0x00, 0x01 };
++/*
++ * Stock's wmt_core_init_script() skips the event comparison entirely for
++ * opcode 0x14 ("workaround RF calibration data EVT, do not care this EVT") and
++ * only enforces the six-byte length. Match that by comparing the event header
++ * and ignoring the device-returned values.
++ */
++static const u8 wmt_rf_calibration_evt_mask[] =
++	{ 0xff, 0xff, 0x00, 0x00, 0x00, 0x00 };
+ static const u8 wmt_bt_on_cmd[] = { 0x01, 0x06, 0x02, 0x00, 0x00, 0x01 };
+ static const u8 wmt_bt_on_evt[] = { 0x02, 0x06, 0x01, 0x00, 0x00 };
+ 
+@@ -1042,6 +1053,30 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 				     "WMT patch MCU-clock programming disable failed\n");
+ 	dev_warn(stp->dev, "WMT patch-download MCU clock restored to 26 MHz\n");
+ 
++	/*
++	 * Stock step 7 raises the PALDO, runs the RF calibration script, then
++	 * drops it again before the per-function Bluetooth enable. On MT8163
++	 * wmt_plat's BT and WIFI PALDO calls both land on the same refcounted
++	 * VCN33 supply, so one enable here matches stock's pair.
++	 */
++	ret = mt8163_consys_bt_paldo_set(stp->consys_dev, true);
++	if (ret)
++		return dev_err_probe(stp->dev, ret,
++				     "failed to enable PALDO for RF calibration\n");
++	stp->bt_paldo_enabled = true;
++
++	ret = mt8163_stp_wmt_xfer_mask(stp, wmt_rf_calibration_cmd,
++				       sizeof(wmt_rf_calibration_cmd),
++				       wmt_rf_calibration_evt,
++				       wmt_rf_calibration_evt_mask,
++				       sizeof(wmt_rf_calibration_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret, "WMT RF calibration failed\n");
++	dev_warn(stp->dev, "WMT RF calibration completed\n");
++
++	mt8163_consys_bt_paldo_set(stp->consys_dev, false);
++	stp->bt_paldo_enabled = false;
++
+ 	ret = mt8163_consys_bt_paldo_set(stp->consys_dev, true);
+ 	if (ret)
+ 		return dev_err_probe(stp->dev, ret, "failed to enable BT PALDO\n");
+-- 
+2.55.0.windows.3
+

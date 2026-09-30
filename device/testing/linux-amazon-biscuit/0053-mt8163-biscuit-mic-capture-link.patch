@@ -1,0 +1,130 @@
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -22,10 +22,12 @@
+ 	struct gpio_desc *speaker_amp;
+ 	struct gpio_desc *dacmux;
+ 	struct snd_soc_card card;
+-	struct snd_soc_dai_link links[2];
+-	struct snd_soc_dai_link_component cpus[2];
+-	struct snd_soc_dai_link_component platforms[2];
+-	struct snd_soc_dai_link_component codecs[2];
++	struct snd_soc_dai_link links[3];
++	struct snd_soc_dai_link_component cpus[3];
++	struct snd_soc_dai_link_component platforms[3];
++	struct snd_soc_dai_link_component codecs[3];
++	/* The four microphone ADCs are one capture device. */
++	struct snd_soc_dai_link_component mic_codecs[4];
+     struct device *dev;
+     void __iomem *mclk_base;
+     struct clk *mm_smi_common;
+@@ -304,6 +306,36 @@
+         .hw_params = mt8163_biscuit_vendor_48k_hw_params,
+ };
+ 
++/*
++ * The microphone ADCs have no master clock of their own: the FPGA drives
++ * the bus, and they run their PLL from the bit clock it provides. Eight
++ * 24 bit slots at 16 kHz is 3.072 MHz. Clock id 3 is the codec driver's
++ * ADC3XXX_PLL_BCLK, which selects that source.
++ */
++static int mt8163_biscuit_mic_init(struct snd_soc_pcm_runtime *rtd)
++{
++	struct snd_soc_dai *codec_dai;
++	int i, ret;
++
++	/*
++	 * None of the ADCs has a master clock: the FPGA drives the bus and
++	 * they run their PLL from the bit clock it provides. Eight 24 bit
++	 * slots at 16 kHz is 3.072 MHz. Clock id 3 is the codec driver's
++	 * ADC3XXX_PLL_BCLK, which selects that source.
++	 */
++	for_each_rtd_codec_dais(rtd, i, codec_dai) {
++		ret = snd_soc_dai_set_sysclk(codec_dai, 3, 3072000,
++					     SND_SOC_CLOCK_IN);
++		if (ret) {
++			dev_err(rtd->card->dev,
++				"failed to set the bit clock on %s: %d\n",
++				codec_dai->name, ret);
++			return ret;
++		}
++	}
++
++	return 0;
++}
+ static int mt8163_biscuit_i2s1_init(struct snd_soc_pcm_runtime *rtd)
+ {
+ 	struct snd_soc_dai *codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+@@ -320,11 +352,15 @@
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct mt8163_biscuit_priv *priv;
+-	struct device_node *afe_np, *codec_np;
++	struct device_node *afe_np, *codec_np, *fpga_np;
++	int mic_count, i;
+ 	int ret;
+ 
+ 	afe_np = of_parse_phandle(dev->of_node, "mediatek,afe", 0);
+ 	codec_np = of_parse_phandle(dev->of_node, "audio-codec", 0);
++	mic_count = of_count_phandle_with_args(dev->of_node,
++					       "mic-codec", NULL);
++	fpga_np = of_parse_phandle(dev->of_node, "audio-fpga", 0);
+ 	if (!afe_np || !codec_np) {
+ 		of_node_put(afe_np);
+ 		of_node_put(codec_np);
+@@ -430,15 +466,55 @@
+ 		SND_SOC_DAIFMT_CBC_CFC;
+ 	priv->links[1].ops = &mt8163_biscuit_be_ops;
+ 
++	/*
++	 * Capture from the first microphone ADC. The FPGA aggregates all four
++	 * of them into one SPI stream, so this link exists to configure and
++	 * start the ADC; a platform driver for the SPI side follows.
++	 */
++	if (mic_count > 0 && mic_count <= ARRAY_SIZE(priv->mic_codecs) &&
++	    fpga_np) {
++		priv->cpus[2].of_node = fpga_np;
++		priv->cpus[2].dai_name = "dough-capture";
++		priv->platforms[2].of_node = fpga_np;
++		for (i = 0; i < mic_count; i++) {
++			priv->mic_codecs[i].of_node =
++				of_parse_phandle(dev->of_node, "mic-codec", i);
++			priv->mic_codecs[i].dai_name = "tlv320adc3xxx-hifi";
++		}
++
++		priv->links[2].name = "Mic Capture";
++		priv->links[2].stream_name = "Mic Capture";
++		priv->links[2].cpus = &priv->cpus[2];
++		priv->links[2].num_cpus = 1;
++		priv->links[2].platforms = &priv->platforms[2];
++		priv->links[2].num_platforms = 1;
++		priv->links[2].codecs = priv->mic_codecs;
++		priv->links[2].num_codecs = mic_count;
++		priv->links[2].capture_only = 1;
++		priv->links[2].init = mt8163_biscuit_mic_init;
++		priv->links[2].dai_fmt = SND_SOC_DAIFMT_I2S |
++			SND_SOC_DAIFMT_NB_NF |
++			SND_SOC_DAIFMT_CBP_CFP;
++	}
++
+ 	priv->card.name = "mt8163-biscuit";
+ 	priv->card.owner = THIS_MODULE;
+ 	priv->card.dev = dev;
+ 	priv->card.dai_link = priv->links;
+-	priv->card.num_links = ARRAY_SIZE(priv->links);
++	priv->card.num_links = (mic_count > 0 && fpga_np) ? 3 : 2;
+ 	snd_soc_card_set_drvdata(&priv->card, priv);
+ 	priv->card.dapm_routes = mt8163_biscuit_routes;
+ 	priv->card.num_dapm_routes = ARRAY_SIZE(mt8163_biscuit_routes);
+ 
++
++	/*
++	 * Keep the master clock running for the lifetime of the card. The
++	 * capture FPGA latches its I2S configuration when it is armed and
++	 * needs the clock present at that moment; leaving it to the
++	 * playback path meant it was still dead for a capture only stream.
++	 */
++	if (!mt8163_biscuit_enable_mclk(priv))
++		dev_info(dev, "master clock enabled for capture\n");
+ 	ret = devm_snd_soc_register_card(dev, &priv->card);
+ 	if (ret) {
+ 		of_node_put(afe_np);

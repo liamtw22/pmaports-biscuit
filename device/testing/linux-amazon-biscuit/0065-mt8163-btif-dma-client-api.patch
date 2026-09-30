@@ -1,0 +1,333 @@
+--- a/drivers/misc/mt8163-btif.c
++++ b/drivers/misc/mt8163-btif.c
+@@ -10,15 +10,18 @@
+  * WMT/STP client owns firmware loading and protocol traffic above it.
+  */
+ 
+-#include <linux/bits.h>
+-#include <linux/clk.h>
+-#include <linux/dma-mapping.h>
+-#include <linux/interrupt.h>
+-#include <linux/io.h>
+-#include <linux/iopoll.h>
+-#include <linux/mod_devicetable.h>
+-#include <linux/module.h>
+-#include <linux/platform_device.h>
++#include <linux/bits.h>
++#include <linux/clk.h>
++#include <linux/dma-mapping.h>
++#include <linux/errno.h>
++#include <linux/interrupt.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/mt8163-btif.h>
++#include <linux/mutex.h>
++#include <linux/platform_device.h>
+ 
+ #define BTIF_FAKELCR			0x0c
+ #define BTIF_IER			0x04
+@@ -38,7 +41,8 @@
+ #define DMA_INT_FLAG			0x00
+ #define DMA_INT_EN			0x04
+ #define DMA_EN				0x08
+-#define DMA_RST			0x0c
++#define DMA_RST			0x0c
++#define DMA_FLUSH			0x14
+ #define DMA_VFF_ADDR			0x1c
+ #define DMA_VFF_LEN			0x24
+ #define DMA_VFF_THRE			0x28
+@@ -52,9 +56,14 @@
+ #define DMA_TX_INT_DONE		BIT(0)
+ #define DMA_RX_INT_THRESHOLD		BIT(0)
+ #define DMA_RX_INT_DONE		BIT(1)
+-#define DMA_VFIFO_SIZE			SZ_8K
+-
+-struct mt8163_btif_dma {
++#define DMA_VFIFO_SIZE			SZ_8K
++#define DMA_PTR_MASK			GENMASK(15, 0)
++#define DMA_PTR_WRAP			BIT(16)
++
++struct mt8163_btif;
++
++struct mt8163_btif_dma {
++	struct mt8163_btif *btif;
+ 	void __iomem *base;
+ 	void *fifo;
+ 	dma_addr_t dma_addr;
+@@ -64,14 +73,113 @@
+ 	const char *name;
+ };
+ 
+-struct mt8163_btif {
++struct mt8163_btif {
+ 	struct device *dev;
+ 	void __iomem *base;
+ 	struct clk *btif_clk;
+ 	struct clk *apdma_clk;
+-	struct mt8163_btif_dma tx;
+-	struct mt8163_btif_dma rx;
+-};
++	struct mt8163_btif_dma tx;
++	struct mt8163_btif_dma rx;
++	struct mutex tx_lock;
++	struct mutex client_lock;
++	const struct mt8163_btif_client *client;
++};
++
++struct mt8163_btif *mt8163_btif_get(struct device *dev)
++{
++	if (!dev)
++		return NULL;
++
++	return dev_get_drvdata(dev);
++}
++EXPORT_SYMBOL_GPL(mt8163_btif_get);
++
++int mt8163_btif_register_client(struct mt8163_btif *btif,
++				const struct mt8163_btif_client *client)
++{
++	int ret = 0;
++
++	if (!btif || !client || !client->receive)
++		return -EINVAL;
++
++	mutex_lock(&btif->client_lock);
++	if (btif->client)
++		ret = -EBUSY;
++	else
++		WRITE_ONCE(btif->client, client);
++	mutex_unlock(&btif->client_lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt8163_btif_register_client);
++
++void mt8163_btif_unregister_client(struct mt8163_btif *btif,
++				   const struct mt8163_btif_client *client)
++{
++	if (!btif)
++		return;
++
++	mutex_lock(&btif->client_lock);
++	if (btif->client == client)
++		WRITE_ONCE(btif->client, NULL);
++	mutex_unlock(&btif->client_lock);
++
++	/* The RX callback runs from hard IRQ context. */
++	synchronize_irq(btif->rx.irq);
++}
++EXPORT_SYMBOL_GPL(mt8163_btif_unregister_client);
++
++int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len)
++{
++	struct mt8163_btif_dma *tx;
++	u32 left, valid, wpt, offset, wrap;
++	size_t first;
++	int ret = 0;
++
++	if (!btif || !buf || !len)
++		return -EINVAL;
++	if (len > MT8163_BTIF_MAX_FRAME)
++		return -EMSGSIZE;
++
++	tx = &btif->tx;
++	mutex_lock(&btif->tx_lock);
++
++	left = readl(tx->base + DMA_VFF_LEFT) & DMA_PTR_MASK;
++	if (len > left) {
++		ret = -EAGAIN;
++		goto out;
++	}
++
++	wpt = readl(tx->base + DMA_VFF_WPT);
++	offset = wpt & DMA_PTR_MASK;
++	wrap = wpt & DMA_PTR_WRAP;
++	first = min_t(size_t, len, DMA_VFIFO_SIZE - offset);
++	memcpy(tx->fifo + offset, buf, first);
++	if (first != len)
++		memcpy(tx->fifo, buf + first, len - first);
++
++	/* Publish the payload before handing its updated WPT to APDMA. */
++	dma_wmb();
++	offset += len;
++	if (offset >= DMA_VFIFO_SIZE) {
++		offset -= DMA_VFIFO_SIZE;
++		wrap ^= DMA_PTR_WRAP;
++	}
++
++	/* A completed flush clears DMA_EN; make the engine live before WPT. */
++	writel(DMA_ENABLE, tx->base + DMA_EN);
++	writel(offset | wrap, tx->base + DMA_VFF_WPT);
++
++	valid = readl(tx->base + DMA_VFF_VALID) & DMA_PTR_MASK;
++	if (valid && valid < BTIF_TX_FIFO_THRESHOLD)
++		writel(DMA_ENABLE, tx->base + DMA_FLUSH);
++
++	ret = len;
++out:
++	mutex_unlock(&btif->tx_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt8163_btif_write);
+ 
+ static int mt8163_btif_dma_reset(struct mt8163_btif_dma *dma)
+ {
+@@ -114,25 +222,77 @@
+ 	return 0;
+ }
+ 
+-static irqreturn_t mt8163_btif_dma_irq(int irq, void *data)
+-{
+-	struct mt8163_btif_dma *dma = data;
+-	u32 status;
++static void mt8163_btif_rx_consume(struct mt8163_btif_dma *rx)
++{
++	struct mt8163_btif *btif = rx->btif;
++	const struct mt8163_btif_client *client;
++	u32 valid, rpt, wpt, rpt_offset, wpt_offset, rpt_wrap;
++	size_t len, first;
++	int loops = 0;
++
++	/* Follow the vendor drain loop, but bound it to avoid an IRQ livelock. */
++	while (loops++ < 16) {
++		valid = readl(rx->base + DMA_VFF_VALID);
++		rpt = readl(rx->base + DMA_VFF_RPT);
++		wpt = readl(rx->base + DMA_VFF_WPT);
++		if (!valid && rpt == wpt)
++			break;
++
++		rpt_offset = rpt & DMA_PTR_MASK;
++		wpt_offset = wpt & DMA_PTR_MASK;
++		rpt_wrap = rpt & DMA_PTR_WRAP;
++		if ((wpt & DMA_PTR_WRAP) != rpt_wrap)
++			len = wpt_offset + DMA_VFIFO_SIZE - rpt_offset;
++		else if (wpt_offset >= rpt_offset)
++			len = wpt_offset - rpt_offset;
++		else
++			break;
++		if (!len)
++			break;
++
++		/* APDMA owns the buffer contents until WPT/RPT make them visible. */
++		dma_rmb();
++		client = READ_ONCE(btif->client);
++		if (client) {
++			first = min_t(size_t, len, DMA_VFIFO_SIZE - rpt_offset);
++			client->receive(client->data, rx->fifo + rpt_offset, first);
++			if (first != len)
++				client->receive(client->data, rx->fifo, len - first);
++		} else {
++			dev_dbg(btif->dev, "discarding %zu RX bytes without an STP client\n",
++				len);
++		}
++
++		rpt_offset += len;
++		if (rpt_offset >= DMA_VFIFO_SIZE) {
++			rpt_offset -= DMA_VFIFO_SIZE;
++			rpt_wrap ^= DMA_PTR_WRAP;
++		}
++		dma_wmb();
++		writel(rpt_offset | rpt_wrap, rx->base + DMA_VFF_RPT);
++	}
++}
++
++static irqreturn_t mt8163_btif_dma_irq(int irq, void *data)
++{
++	struct mt8163_btif_dma *dma = data;
++	u32 status;
+ 
+ 	status = readl(dma->base + DMA_INT_FLAG);
+ 	if (!status)
+ 		return IRQ_NONE;
+ 
+-	/* MT8163 APDMA DMA_INT_FLAG is write-one-to-clear. */
+-	writel(status, dma->base + DMA_INT_FLAG);
+-
+-	/*
+-	 * STP owns the virtual-FIFO producer and consumer pointers.  Before it
+-	 * binds, acknowledge only: moving raw bytes here would recreate the PIO
+-	 * bootstrap this transport replaces.
+-	 */
+-	return IRQ_HANDLED;
+-}
++	/* MT8163 APDMA DMA_INT_FLAG is write-one-to-clear. */
++	writel(status, dma->base + DMA_INT_FLAG);
++
++	if (dma == &dma->btif->rx)
++		mt8163_btif_rx_consume(dma);
++	else if ((readl(dma->base + DMA_VFF_LEFT) & DMA_PTR_MASK) ==
++		 DMA_VFIFO_SIZE)
++		writel(0, dma->base + DMA_INT_EN);
++
++	return IRQ_HANDLED;
++}
+ 
+ static ssize_t dma_state_show(struct device *dev,
+ 			      struct device_attribute *attr, char *buf)
+@@ -171,8 +331,10 @@
+ 	if (!btif)
+ 		return -ENOMEM;
+ 
+-	btif->dev = dev;
+-	platform_set_drvdata(pdev, btif);
++	btif->dev = dev;
++	mutex_init(&btif->tx_lock);
++	mutex_init(&btif->client_lock);
++	platform_set_drvdata(pdev, btif);
+ 
+ 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+ 	if (ret)
+@@ -200,12 +362,14 @@
+ 		return dev_err_probe(dev, PTR_ERR(btif->apdma_clk),
+ 				     "failed to enable APDMA clock\n");
+ 
+-	btif->tx.name = "TX";
++	btif->tx.name = "TX";
++	btif->tx.btif = btif;
+ 	btif->tx.irq = platform_get_irq_byname(pdev, "tx-dma");
+ 	btif->tx.int_enable = DMA_TX_INT_DONE;
+ 	btif->tx.mode_bit = BTIF_DMA_EN_TX;
+ 
+-	btif->rx.name = "RX";
++	btif->rx.name = "RX";
++	btif->rx.btif = btif;
+ 	btif->rx.irq = platform_get_irq_byname(pdev, "rx-dma");
+ 	btif->rx.int_enable = DMA_RX_INT_THRESHOLD | DMA_RX_INT_DONE;
+ 	btif->rx.mode_bit = BTIF_DMA_EN_RX;
+--- /dev/null
++++ b/include/linux/mt8163-btif.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_MT8163_BTIF_H
++#define _LINUX_MT8163_BTIF_H
++
++#include <linux/types.h>
++
++struct device;
++struct mt8163_btif;
++
++/* STP frames are at most 2014 bytes on the vendor implementation. */
++#define MT8163_BTIF_MAX_FRAME	2048
++
++/**
++ * struct mt8163_btif_client - in-kernel STP/WMT endpoint
++ * @receive: Called in hard IRQ context with one or two FIFO segments.
++ * @data: Opaque client data passed to @receive.
++ *
++ * The callback must copy or queue data before it returns and may not sleep.
++ */
++struct mt8163_btif_client {
++	void (*receive)(void *data, const u8 *buf, size_t len);
++	void *data;
++};
++
++struct mt8163_btif *mt8163_btif_get(struct device *dev);
++int mt8163_btif_register_client(struct mt8163_btif *btif,
++				const struct mt8163_btif_client *client);
++void mt8163_btif_unregister_client(struct mt8163_btif *btif,
++				   const struct mt8163_btif_client *client);
++int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len);
++
++#endif /* _LINUX_MT8163_BTIF_H */

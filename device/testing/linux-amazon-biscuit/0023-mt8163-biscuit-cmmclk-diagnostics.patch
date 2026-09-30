@@ -1,0 +1,51 @@
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -107,20 +107,24 @@
+     if (priv->mclk_enabled)
+         return 0;
+ 
+     ret = pm_runtime_resume_and_get(priv->dev);
++    dev_info(priv->dev, "CMMCLK: runtime resume ret=%d\n", ret);
+     if (ret < 0)
+         return ret;
+ 
+     ret = clk_prepare_enable(priv->img_sen_tg);
++    dev_info(priv->dev, "CMMCLK: img-sen-tg enable ret=%d\n", ret);
+     if (ret)
+         goto err_put_pm;
+ 
+     ret = clk_prepare_enable(priv->camtg_sel);
++    dev_info(priv->dev, "CMMCLK: camtg selector enable ret=%d\n", ret);
+     if (ret)
+         goto err_disable_img;
+ 
+     ret = clk_set_parent(priv->camtg_sel, priv->univ_48m);
++    dev_info(priv->dev, "CMMCLK: camtg parent ret=%d\n", ret);
+     if (ret)
+         goto err_disable_camtg;
+ 
+     /*
+@@ -142,8 +146,9 @@
+     mt8163_biscuit_mclk_rmw(priv, MT8163_MCLK_SENINF1_CTRL,
+                             0x00000001, 0x00000001);
+ 
+     priv->mclk_enabled = true;
++    dev_info(priv->dev, "CMMCLK: sensor timing programmed\n");
+     return 0;
+ 
+ err_disable_camtg:
+     clk_disable_unprepare(priv->camtg_sel);
+@@ -175,10 +180,12 @@
+     if (ret)
+         return ret;
+ 
+     codec_dai = snd_soc_rtd_to_codec(rtd, 0);
+-    return snd_soc_dai_set_sysclk(codec_dai, 0, 9600000,
++    ret = snd_soc_dai_set_sysclk(codec_dai, 0, 9600000,
+                                   SND_SOC_CLOCK_OUT);
++    dev_info(priv->dev, "CMMCLK: codec sysclk ret=%d\n", ret);
++    return ret;
+ }
+ 
+ static const struct snd_soc_ops mt8163_biscuit_be_ops = {
+ 	.startup = mt8163_biscuit_be_startup,

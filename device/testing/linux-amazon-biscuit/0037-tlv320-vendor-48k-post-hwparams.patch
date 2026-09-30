@@ -1,0 +1,36 @@
+--- a/sound/soc/codecs/tlv320aic32x4.c
++++ b/sound/soc/codecs/tlv320aic32x4.c
+@@ -835,6 +835,33 @@
+ 			     params_channels(params),
+ 			     params_physical_width(params));
+ 
++	/*
++	 * Biscuit vendor TLV320AIC32x4 recipe for 9.6 MHz MCLK / 48 kHz.
++	 * Apply after the generic clock chooser, which otherwise overwrites it.
++	 */
++	if (params_rate(params) == 48000) {
++		snd_soc_component_write(component, 0x04, 0x03);
++		snd_soc_component_write(component, 0x05, 0xd1);
++		snd_soc_component_write(component, 0x06, 0x30);
++		snd_soc_component_write(component, 0x07, 0x00);
++		snd_soc_component_write(component, 0x08, 0x00);
++		snd_soc_component_write(component, 0x0b, 0x85);
++		snd_soc_component_write(component, 0x0c, 0x83);
++		snd_soc_component_write(component, 0x0d, 0x00);
++		snd_soc_component_write(component, 0x0e, 0x80);
++		snd_soc_component_write(component, 0x12, 0x85);
++		snd_soc_component_write(component, 0x13, 0x83);
++		snd_soc_component_write(component, 0x14, 0x80);
++		snd_soc_component_write(component, 0x1e, 0x81);
++		snd_soc_component_write(component, 0x44, 0x0f);
++		/* stock codec state, captured live from FireOS during playback */
++		snd_soc_component_write(component, 0x3c, 0x02);
++		snd_soc_component_write(component, 0x3f, 0xd6);
++		snd_soc_component_write(component, 0x40, 0x08);
++		dev_info(component->dev,
++			 "BISCUIT: enforced vendor TLV320 9.6MHz/48k recipe\n");
++	}
++
+ 	switch (params_physical_width(params)) {
+ 	case 16:
+ 		iface1_reg |= (AIC32X4_WORD_LEN_16BITS <<

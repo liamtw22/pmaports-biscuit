@@ -1,0 +1,21 @@
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -50,8 +50,18 @@
+ &mt6323_vusb_reg {
+ 	regulator-always-on;
+ };
+ 
++&mt6323_vemc3v3_reg {
++        regulator-boot-on;
++        regulator-always-on;
++};
++
++&mt6323_vio18_reg {
++        regulator-boot-on;
++        regulator-always-on;
++};
++
+ &thermal {
+ 	status = "disabled";
+ };
+ 

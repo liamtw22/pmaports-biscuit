@@ -1,0 +1,28 @@
+#!/bin/sh
+# Open /boot for writing so apk can actually install the kernel into it.
+#
+# /boot is mounted READ-ONLY on this device (biscuit-persist, boot runlevel,
+# t+9s) because it is journal-less ext2 that postmarketOS never fsck's and that
+# initramfs stage 1 cannot boot without.
+#
+# That silently broke every kernel install. apk extracts files BEFORE any
+# trigger runs, so it hit a read-only filesystem, reported a bare "1 error"
+# naming nothing, and left the previous kernel in place - and boot-deploy then
+# packed THAT stale kernel into boot.img. Caught by `apk audit --system`
+# reporting `U boot/vmlinuz`, and confirmed by the build counter: the installed
+# image said #239 while the package contained #240.
+#
+# mkinitfs's own 05-boot-rw.hook cannot cover this: hooks run during
+# boot-deploy, which is the trigger, which is already too late.
+#
+# Not put back here, for the same reason that hook does not put it back: this
+# runs before the install, and remounting ro underneath apk would fail the very
+# write it exists to allow. biscuit-persist closes /boot again at the next boot.
+if [ -d /boot ] && grep -q " /boot .*[( ,]ro[, )]" /proc/mounts 2>/dev/null; then
+	if mount -o remount,rw /boot 2>/dev/null; then
+		echo "==> /boot remounted rw for the kernel install"
+	else
+		echo "==> WARNING: could not remount /boot rw; the kernel will not update" >&2
+	fi
+fi
+exit 0

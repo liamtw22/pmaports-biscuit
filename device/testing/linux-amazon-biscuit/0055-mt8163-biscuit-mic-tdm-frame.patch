@@ -1,0 +1,96 @@
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -312,26 +312,72 @@
+  * 24 bit slots at 16 kHz is 3.072 MHz. Clock id 3 is the codec driver's
+  * ADC3XXX_PLL_BCLK, which selects that source.
+  */
++/*
++ * Sixteen slots of 24 bits, which is a 6.144 MHz bit clock at 16 kHz. The
++ * four converters occupy pairs at the head of the frame. The vendor enables
++ * only slots 0..6: the last converter's second output is unused and must be
++ * tri-stated rather than left as an eighth microphone.
++ */
++#define MT8163_BISCUIT_MIC_SLOTS	16
++#define MT8163_BISCUIT_MIC_SLOT_WIDTH	24
++#define MT8163_BISCUIT_MIC_RX_MASK	0x7f
++
+ static int mt8163_biscuit_mic_init(struct snd_soc_pcm_runtime *rtd)
+ {
+ 	struct snd_soc_dai *codec_dai;
+ 	int i, ret;
+ 
+ 	/*
+-	 * None of the ADCs has a master clock: the FPGA drives the bus and
+-	 * they run their PLL from the bit clock it provides. Eight 24 bit
+-	 * slots at 16 kHz is 3.072 MHz. Clock id 3 is the codec driver's
+-	 * ADC3XXX_PLL_BCLK, which selects that source.
++	 * The four ADCs share one data line. It carries eight 24 bit slots
++	 * per frame, a stereo pair from each of them, which is what the FPGA
++	 * expects to unpack; plain I2S would only ever describe the first
++	 * pair. Only the first ADC drives the bit and frame clocks, matching
++	 * the stock firmware -- otherwise all four would drive the same two
++	 * lines at once.
+ 	 */
+ 	for_each_rtd_codec_dais(rtd, i, codec_dai) {
+-		ret = snd_soc_dai_set_sysclk(codec_dai, 3, 3072000,
+-					     SND_SOC_CLOCK_IN);
++		unsigned int fmt = SND_SOC_DAIFMT_DSP_B |
++			SND_SOC_DAIFMT_NB_NF |
++			(i == 0 ? SND_SOC_DAIFMT_CBP_CFP :
++				  SND_SOC_DAIFMT_CBC_CFC);
++
++		ret = snd_soc_dai_set_fmt(codec_dai, fmt);
++		if (ret) {
++			dev_err(rtd->card->dev,
++				"failed to set the format on %s: %d\n",
++				codec_dai->name, ret);
++			return ret;
++		}
++
++		/*
++		 * The one that drives the bus cannot derive its clock from the
++		 * bit clock it is itself generating: it runs its PLL from the
++		 * 9.6 MHz MCLK. The others take the 6.144 MHz bit clock it
++		 * produces. Clock id 1 is ADC3XXX_PLL_ENABLE, 3 is
++		 * ADC3XXX_PLL_BCLK.
++		 */
++		ret = i == 0 ?
++			snd_soc_dai_set_sysclk(codec_dai, 1, 9600000,
++					       SND_SOC_CLOCK_IN) :
++			snd_soc_dai_set_sysclk(codec_dai, 3, 6144000,
++					       SND_SOC_CLOCK_IN);
+ 		if (ret) {
+ 			dev_err(rtd->card->dev,
+ 				"failed to set the bit clock on %s: %d\n",
+ 				codec_dai->name, ret);
+ 			return ret;
+ 		}
++
++		ret = snd_soc_dai_set_tdm_slot(codec_dai, 0x3 << (2 * i),
++					       MT8163_BISCUIT_MIC_RX_MASK,
++					       MT8163_BISCUIT_MIC_SLOTS,
++					       MT8163_BISCUIT_MIC_SLOT_WIDTH);
++		if (ret) {
++			dev_err(rtd->card->dev,
++				"failed to place %s in the frame: %d\n",
++				codec_dai->name, ret);
++			return ret;
++		}
+ 	}
+ 
+ 	return 0;
+@@ -491,10 +535,11 @@
+ 		priv->links[2].codecs = priv->mic_codecs;
+ 		priv->links[2].num_codecs = mic_count;
+ 		priv->links[2].capture_only = 1;
++		/*
++		 * No dai_fmt here: the ADCs do not all take the same one, so
++		 * mt8163_biscuit_mic_init sets each of them itself.
++		 */
+ 		priv->links[2].init = mt8163_biscuit_mic_init;
+-		priv->links[2].dai_fmt = SND_SOC_DAIFMT_I2S |
+-			SND_SOC_DAIFMT_NB_NF |
+-			SND_SOC_DAIFMT_CBP_CFP;
+ 	}
+ 
+ 	priv->card.name = "mt8163-biscuit";

@@ -1,0 +1,73 @@
+Brotli==1.2.0
+SoundCard==0.4.6
+aioesphomeapi==45.3.1
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+async-timeout==4.0.3
+async_interrupt==1.2.2
+attrs==26.1.0
+cffi==2.1.1
+chacha20poly1305-reuseable==0.13.2
+charset-normalizer==3.5.1
+cryptography==50.0.1
+expandvars==1.1.2
+frozenlist==1.8.0
+getmac==0.9.5
+idna-ssl==1.1.0
+idna==3.19
+ifaddr==0.2.0
+linux-voice-assistant @ git+https://github.com/OHF-Voice/linux-voice-assistant@b0c53c41c11e9c5cea0b4a60766860c8225eb5b4
+multidict==6.7.1
+netifaces2==0.0.22
+noiseprotocol==0.3.1
+numpy==2.5.2
+packaging==26.3
+propcache==0.5.2
+protobuf==7.36.0
+pybind11==3.1.0
+pycparser==3.0
+# pymicro-features is the one entry here that is not a PyPI version or a git
+# commit. It used to read:
+#
+#   pymicro-features @ file:///tmp/pymicro_features-2.0.2-cp39-abi3-linux_aarch64.whl#sha256=c652c460...
+#
+# which recorded a path on one machine at one moment rather than a source. The
+# file is gone - /tmp on the device has since been reclaimed entirely - so the
+# line documented nothing a rebuild could act on.
+#
+# The installed wheel's own metadata says what it really is: its WHEEL tag is
+# cp39-abi3-linux_aarch64, a bare linux_* platform tag, which PyPI does not
+# accept for upload. So it was built locally for this rootfs rather than
+# downloaded, from the upstream below, and the sha256 is what identifies it.
+#
+#   upstream: https://github.com/rhasspy/pymicro-features  (2.0.2)
+#   artifact: sha256 c652c4606b9088afb1ee5cc3c267263fdf116364622f38b62f7e92a665a9de20
+#
+# Naming the version means a rebuild resolves the real project instead of
+# failing on a missing file.
+pymicro-features==2.0.2
+pymicro-wakeword==2.4.1
+# pyopen-wakeword stays because linux-voice-assistant imports it, but since
+# r294 the bundle does not carry openWakeWord's pretrained wake-word models
+# (CC BY-NC-SA 4.0) or either package's x86-64 glibc libtensorflowlite_c.so.
+# A venv rebuilt from this file must delete them again:
+#   site-packages/wakewords/openWakeWord/
+#   site-packages/pyopen_wakeword/models/ (all but melspectrogram.tflite and
+#     embedding_model.tflite)
+#   site-packages/pyopen_wakeword/lib/libtensorflowlite_c.so
+#   site-packages/pymicro_wakeword/lib/libtensorflowlite_c.so.glibc
+# and add linux-voice-assistant/THIRD_PARTY_LICENSES/. The APKBUILD refuses
+# to package a venv that still has the models.
+pyopen-wakeword==1.1.0
+python-mpv==1.0.8
+setuptools==73.0.1
+types-protobuf==7.35.1.20260826
+typing_extensions==4.16.0
+tzdata==2026.3
+tzlocal==5.4.4
+webrtc_noise_gain==1.3.0
+websockets==12.0
+wheel==0.48.0
+yarl==1.24.5
+zeroconf==0.150.0

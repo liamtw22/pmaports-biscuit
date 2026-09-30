@@ -1,0 +1,87 @@
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -215,3 +215,84 @@
+ &mmsys {
+ 	status = "okay";
+ };
++
++/* Biscuit r100: preserve vendor MT6323 board rails */
++&mt6323_vtcxo_reg {
++	regulator-name = "vtcxo";
++	regulator-min-microvolt = <2800000>;
++	regulator-max-microvolt = <2800000>;
++	regulator-enable-ramp-delay = <90>;
++	regulator-always-on;
++	regulator-boot-on;
++};
++
++&mt6323_va_reg {
++	regulator-name = "va";
++	regulator-min-microvolt = <2800000>;
++	regulator-max-microvolt = <2800000>;
++	regulator-enable-ramp-delay = <216>;
++	regulator-always-on;
++	regulator-boot-on;
++};
++
++&mt6323_vmch_reg {
++	regulator-name = "vmch";
++	regulator-min-microvolt = <3000000>;
++	regulator-max-microvolt = <3300000>;
++	regulator-enable-ramp-delay = <36>;
++	regulator-always-on;
++	regulator-boot-on;
++};
++
++&mt6323_vgp1_reg {
++	regulator-name = "vgp1";
++	regulator-min-microvolt = <3300000>;
++	regulator-max-microvolt = <3300000>;
++	regulator-enable-ramp-delay = <216>;
++	regulator-always-on;
++	regulator-boot-on;
++};
++
++&mt6323_vgp2_reg {
++	regulator-name = "vgp2";
++	regulator-min-microvolt = <1200000>;
++	regulator-max-microvolt = <1200000>;
++	regulator-enable-ramp-delay = <216>;
++	regulator-always-on;
++	regulator-boot-on;
++};
++
++&mt6323_vcamaf_reg {
++	regulator-name = "vcamaf";
++	regulator-min-microvolt = <1800000>;
++	regulator-max-microvolt = <1800000>;
++	regulator-enable-ramp-delay = <216>;
++	regulator-always-on;
++	regulator-boot-on;
++};
++
++&mt6323_vibr_reg {
++	regulator-name = "vibr";
++	regulator-min-microvolt = <3300000>;
++	regulator-max-microvolt = <3300000>;
++	regulator-enable-ramp-delay = <36>;
++	regulator-always-on;
++	regulator-boot-on;
++};
++
++&mt6323_vm_reg {
++	regulator-name = "vm";
++	regulator-min-microvolt = <1200000>;
++	regulator-max-microvolt = <1800000>;
++	regulator-enable-ramp-delay = <216>;
++	regulator-always-on;
++	regulator-boot-on;
++};
++
++&mt6323_vrtc_reg {
++	regulator-name = "vrtc";
++	regulator-min-microvolt = <2800000>;
++	regulator-max-microvolt = <2800000>;
++	regulator-always-on;
++	regulator-boot-on;
++};

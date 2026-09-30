@@ -1,0 +1,128 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index d42cd32..70881d3 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -101,6 +101,8 @@ struct mt8163_stp {
+ 	u8 payload_type;
+ 	bool framed;
+ 	bool hci_registered;
++	u8 trace_rx;
++	u8 trace_xfer;
+ };
+ 
+ static int mt8163_stp_btif_write(struct mt8163_stp *stp, const u8 *buf,
+@@ -291,6 +293,9 @@ static void mt8163_stp_receive(void *data, const u8 *buf, size_t len)
+ 	struct mt8163_stp *stp = data;
+ 	unsigned long flags;
+ 
++	if (!stp->trace_rx++)
++		dev_warn(stp->dev, "STP RX callback received %zu bytes\n", len);
++
+ 	spin_lock_irqsave(&stp->rx_lock, flags);
+ 	if (kfifo_avail(&stp->rx_fifo) < len)
+ 		kfifo_reset(&stp->rx_fifo);
+@@ -325,10 +330,14 @@ static int mt8163_stp_wmt_xfer(struct mt8163_stp *stp, bool framed,
+ 		ret = mt8163_stp_send_raw(stp, cmd, cmd_len);
+ 	if (ret)
+ 		goto cancel;
++	if (stp->trace_xfer++ < 4)
++		mt8163_btif_dump_state(stp->btif,
++				      framed ? "framed-wmt-queued" : "raw-wmt-queued");
+ 
+-	if (!wait_for_completion_timeout(&stp->wmt_done, MT8163_STP_WMT_TIMEOUT))
++	if (!wait_for_completion_timeout(&stp->wmt_done, MT8163_STP_WMT_TIMEOUT)) {
++		mt8163_btif_dump_state(stp->btif, "wmt-timeout");
+ 		ret = -ETIMEDOUT;
+-	else
++	} else
+ 		ret = READ_ONCE(stp->wmt_result);
+ 	if (!ret)
+ 		return 0;
+diff --git a/drivers/misc/mt8163-btif.c b/drivers/misc/mt8163-btif.c
+index ac61af7..d9f5f97 100644
+--- a/drivers/misc/mt8163-btif.c
++++ b/drivers/misc/mt8163-btif.c
+@@ -87,6 +87,9 @@ struct mt8163_btif {
+ 	bool active;
+ 	bool tx_irq_requested;
+ 	bool rx_irq_requested;
++	u8 trace_tx;
++	u8 trace_irq;
++	u8 trace_rx;
+ };
+ 
+ struct mt8163_btif *mt8163_btif_get(struct device *dev)
+@@ -136,6 +139,30 @@ void mt8163_btif_unregister_client(struct mt8163_btif *btif,
+ }
+ EXPORT_SYMBOL_GPL(mt8163_btif_unregister_client);
+ 
++void mt8163_btif_dump_state(struct mt8163_btif *btif, const char *tag)
++{
++	if (!btif || !READ_ONCE(btif->active))
++		return;
++
++	dev_warn(btif->dev,
++		 "BTIF trace %s: core dma_en=%#x handshake=%#x; tx en=%#x int=%#x flag=%#x valid=%u left=%u wpt=%#x rpt=%#x; rx en=%#x int=%#x flag=%#x valid=%u left=%u wpt=%#x rpt=%#x\n",
++		 tag, readl(btif->base + BTIF_DMA_EN),
++		 readl(btif->base + BTIF_HANDSHAKE),
++		 readl(btif->tx.base + DMA_EN), readl(btif->tx.base + DMA_INT_EN),
++		 readl(btif->tx.base + DMA_INT_FLAG),
++		 readl(btif->tx.base + DMA_VFF_VALID) & DMA_PTR_MASK,
++		 readl(btif->tx.base + DMA_VFF_LEFT) & DMA_PTR_MASK,
++		 readl(btif->tx.base + DMA_VFF_WPT),
++		 readl(btif->tx.base + DMA_VFF_RPT),
++		 readl(btif->rx.base + DMA_EN), readl(btif->rx.base + DMA_INT_EN),
++		 readl(btif->rx.base + DMA_INT_FLAG),
++		 readl(btif->rx.base + DMA_VFF_VALID) & DMA_PTR_MASK,
++		 readl(btif->rx.base + DMA_VFF_LEFT) & DMA_PTR_MASK,
++		 readl(btif->rx.base + DMA_VFF_WPT),
++		 readl(btif->rx.base + DMA_VFF_RPT));
++}
++EXPORT_SYMBOL_GPL(mt8163_btif_dump_state);
++
+ int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len)
+ {
+ 	struct mt8163_btif_dma *tx;
+@@ -182,6 +209,8 @@ int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len)
+ 	valid = readl(tx->base + DMA_VFF_VALID) & DMA_PTR_MASK;
+ 	if (valid && valid < BTIF_TX_FIFO_THRESHOLD)
+ 		writel(DMA_ENABLE, tx->base + DMA_FLUSH);
++	if (!btif->trace_tx++)
++		mt8163_btif_dump_state(btif, "first-tx-queued");
+ 
+ 	/*
+ 	 * This API reports only success (0) or a negative errno.  In particular,
+@@ -248,6 +277,10 @@ static void mt8163_btif_rx_consume(struct mt8163_btif_dma *rx)
+ 		valid = readl(rx->base + DMA_VFF_VALID);
+ 		rpt = readl(rx->base + DMA_VFF_RPT);
+ 		wpt = readl(rx->base + DMA_VFF_WPT);
++		if (loops == 1 && btif->trace_rx++ < 4)
++			dev_warn(btif->dev,
++				 "BTIF RX drain: valid=%#x wpt=%#x rpt=%#x\n",
++				 valid, wpt, rpt);
+ 		if (!valid && rpt == wpt)
+ 			break;
+ 
+@@ -295,6 +328,10 @@ static irqreturn_t mt8163_btif_dma_irq(int irq, void *data)
+ 	if (!status)
+ 		return IRQ_NONE;
+ 
++	if (dma->btif->trace_irq++ < 4)
++		dev_warn(dma->btif->dev, "BTIF %s DMA IRQ %d: status=%#x\n",
++			 dma->name, irq, status);
++
+ 	/* MT8163 APDMA DMA_INT_FLAG is write-one-to-clear. */
+ 	writel(status, dma->base + DMA_INT_FLAG);
+ 
+diff --git a/include/linux/mt8163-btif.h b/include/linux/mt8163-btif.h
+index 6f4758b..d896ee1 100644
+--- a/include/linux/mt8163-btif.h
++++ b/include/linux/mt8163-btif.h
+@@ -25,6 +25,7 @@ struct mt8163_btif_client {
+ struct mt8163_btif *mt8163_btif_get(struct device *dev);
+ int mt8163_btif_start(struct mt8163_btif *btif);
+ void mt8163_btif_stop(struct mt8163_btif *btif);
++void mt8163_btif_dump_state(struct mt8163_btif *btif, const char *tag);
+ int mt8163_btif_register_client(struct mt8163_btif *btif,
+ 				const struct mt8163_btif_client *client);
+ void mt8163_btif_unregister_client(struct mt8163_btif *btif,

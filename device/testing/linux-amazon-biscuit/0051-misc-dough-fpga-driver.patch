@@ -1,0 +1,941 @@
+--- /dev/null
++++ b/drivers/misc/dough-fpga.c
+@@ -0,0 +1,911 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Amazon "dough" audio bridge FPGA (Echo Dot 2nd gen, codename biscuit)
++ *
++ * The FPGA sits in series on the I2S data line between the SoC's AFE and the
++ * TLV320AIC32x4 codec; the bit and frame clocks reach the codec directly. Its
++ * primary job is aggregating the four microphone ADCs into a 9-channel SPI
++ * capture stream, but the same bitstream also gates the playback data line, so
++ * nothing is audible until the device has been configured.
++ *
++ * Configuration lives in SRAM and is lost whenever the board loses power, so
++ * the bitstream has to be sent on every boot, then the device armed with a
++ * command byte that selects I2S passthrough.
++ *
++ * Copyright (c) 2026
++ */
++
++#include <linux/delay.h>
++#include <linux/firmware.h>
++#include <linux/gpio/consumer.h>
++#include <linux/mod_devicetable.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/kthread.h>
++#include <linux/sched.h>
++#include <linux/spi/spi.h>
++#include <sound/pcm.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++
++#define DOUGH_FW_NAME		"i2s_to_spi_v34.bin"
++
++/* Command bytes, each sent as the first byte of a 32 byte frame. */
++#define DOUGH_CMD_OFF		0x80
++#define DOUGH_CMD_I2S		0x81
++#define DOUGH_CMD_TPG		0x83
++
++#define DOUGH_FRAME_LEN		32
++#define DOUGH_REV_OFFSET	26
++#define DOUGH_MODE_OFFSET	22
++#define DOUGH_I2S_INACTIVE_OFFSET	24
++#define DOUGH_REV_MIN		30
++#define DOUGH_REV_MAX		251
++#define DOUGH_MODE_I2S		0x01
++
++/* The configuration engine needs the reset edge to land while CS is low. */
++#define DOUGH_RESET_HOLD_MS	100
++#define DOUGH_HOUSEKEEPING_US	1200
++#define DOUGH_ARM_DELAY_MS	50
++
++/* Largest transfer we hand to the controller in one go. */
++#define DOUGH_CHUNK_LEN		4096
++
++/*
++ * The vendor clocks every transfer at 50 MHz. Configuration stays at the
++ * rate known to program the device reliably, because a bitstream that does
++ * not take also silences playback.
++ */
++#define DOUGH_CFG_SPEED_HZ		12000000
++#define DOUGH_READ_SPEED_HZ	50000000
++
++/*
++ * Capture stream. The device returns a status frame followed by a fixed
++ * number of audio frames, each holding one 24 bit sample for every
++ * channel: eight microphones plus a copy of what the DAC is playing,
++ * which the echo canceller needs as its reference.
++ */
++#define DOUGH_CHANNELS		9
++#define DOUGH_SAMPLE_BYTES	3
++#define DOUGH_AUDIO_FRAME	(DOUGH_CHANNELS * DOUGH_SAMPLE_BYTES)
++#define DOUGH_FRAMES_PER_READ	255
++#define DOUGH_READ_BYTES	((DOUGH_FRAMES_PER_READ + 1) * DOUGH_AUDIO_FRAME)
++#define DOUGH_RATE		16000
++/*
++ * A block is just under 16 ms of audio. The vendor reads continuously at
++ * realtime priority with a short settle between transfers rather than
++ * waiting a whole block period, so the device is always being drained.
++ */
++#define DOUGH_POLL_US		6000
++#define DOUGH_POLL_MAX_US	7000
++#define DOUGH_PERIOD_BYTES	(DOUGH_FRAMES_PER_READ * DOUGH_CHANNELS * DOUGH_SAMPLE_BYTES)
++
++struct dough_priv {
++	struct spi_device *spi;
++	struct gpio_desc *reset;
++	/* Kept for the lifetime of the device: used as a tx buffer. */
++	u8 idle_cmd[DOUGH_FRAME_LEN];
++
++	/* Capture */
++	struct snd_pcm_substream *substream;
++	struct task_struct *thread;
++	struct mutex lock;		/* serialises SPI access */
++	bool running;		/* set from trigger, read by the thread */
++	bool armed;		/* armed for the current stream */
++	/* Diagnostics, exported through sysfs. */
++	unsigned long reads;
++	unsigned long read_errors;
++	unsigned int last_nonzero;
++	unsigned int last_nframes;
++	/* Result of the last one-shot raw read, for raw_read. */
++	char raw_result[400];
++	u8 *xfer_buf;
++	u8 *tx_buf;		/* zeros, clocked out while reading */
++	snd_pcm_uframes_t written;	/* frames pushed into the ring */
++	unsigned int period_pos;	/* frames since the last period */
++};
++
++/* Callers that may race the capture thread must hold priv->lock. */
++static int dough_read_status(struct spi_device *spi, u8 *status)
++{
++	u8 *tx;
++	int ret;
++
++	tx = kzalloc(DOUGH_FRAME_LEN, GFP_KERNEL);
++	if (!tx)
++		return -ENOMEM;
++
++	ret = spi_write_then_read(spi, tx, 0, status, DOUGH_FRAME_LEN);
++	kfree(tx);
++
++	return ret;
++}
++
++static int dough_send_cmd(struct spi_device *spi, u8 cmd)
++{
++	u8 *buf;
++	int ret;
++
++	buf = kzalloc(DOUGH_FRAME_LEN, GFP_KERNEL);
++	if (!buf)
++		return -ENOMEM;
++
++	buf[0] = cmd;
++	ret = spi_write(spi, buf, DOUGH_FRAME_LEN);
++	kfree(buf);
++
++	return ret;
++}
++
++static bool dough_rev_valid(u8 rev)
++{
++	return rev >= DOUGH_REV_MIN && rev <= DOUGH_REV_MAX;
++}
++
++/*
++ * The configuration engine only enters slave SPI mode if the reset is released
++ * while the chip select is already asserted, and it expects the chip select to
++ * stay asserted for the whole bitstream. Leaving cs_change set on the final
++ * transfer of a message keeps the chip select asserted afterwards, which lets
++ * the reset edge and the bitstream share a single window.
++ *
++ * This requires a GPIO chip select: the controller drives its native chip
++ * select from hardware for the duration of each transfer and cannot hold it
++ * across one.
++ */
++static int dough_load_bitstream(struct dough_priv *priv, const u8 *data,
++				size_t len)
++{
++	struct spi_device *spi = priv->spi;
++	struct spi_transfer *xfers;
++	struct spi_transfer cs_hold = {
++		.tx_buf = priv->idle_cmd,
++		.len = DOUGH_FRAME_LEN,
++		.cs_change = 1,
++		.speed_hz = DOUGH_CFG_SPEED_HZ,
++	};
++	struct spi_message msg;
++	unsigned int nchunks, i;
++	int ret;
++
++	nchunks = DIV_ROUND_UP(len, DOUGH_CHUNK_LEN);
++	xfers = kcalloc(nchunks, sizeof(*xfers), GFP_KERNEL);
++	if (!xfers)
++		return -ENOMEM;
++
++	spi_bus_lock(spi->controller);
++
++	/* Assert CS and leave it asserted for everything that follows. */
++	spi_message_init(&msg);
++	spi_message_add_tail(&cs_hold, &msg);
++	ret = spi_sync_locked(spi, &msg);
++	if (ret)
++		goto out_unlock;
++
++	gpiod_set_value(priv->reset, 1);
++	msleep(DOUGH_RESET_HOLD_MS);
++
++	/* Release reset while CS is still low: this selects slave SPI mode. */
++	gpiod_set_value(priv->reset, 0);
++	msleep(DOUGH_RESET_HOLD_MS);
++
++	spi_message_init(&msg);
++	for (i = 0; i < nchunks; i++) {
++		xfers[i].tx_buf = data + i * DOUGH_CHUNK_LEN;
++		xfers[i].len = min_t(size_t, DOUGH_CHUNK_LEN,
++				     len - i * DOUGH_CHUNK_LEN);
++		xfers[i].speed_hz = DOUGH_CFG_SPEED_HZ;
++		spi_message_add_tail(&xfers[i], &msg);
++	}
++	ret = spi_sync_locked(spi, &msg);
++
++out_unlock:
++	spi_bus_unlock(spi->controller);
++	kfree(xfers);
++
++	return ret;
++}
++
++static int dough_configure(struct dough_priv *priv)
++{
++	struct spi_device *spi = priv->spi;
++	struct device *dev = &spi->dev;
++	const struct firmware *fw;
++	u8 status[DOUGH_FRAME_LEN];
++	struct gpio_descs *i2s;
++	size_t padded;
++	u8 *image;
++	int ret;
++
++	ret = request_firmware(&fw, DOUGH_FW_NAME, dev);
++	if (ret) {
++		dev_err(dev, "cannot load %s: %d\n", DOUGH_FW_NAME, ret);
++		return ret;
++	}
++
++	/*
++	 * The configuration engine expects trailing clocks after the bitstream;
++	 * round up and add a spare kilobyte of zeros, matching the vendor.
++	 */
++	padded = roundup(fw->size, 1024) + 1024;
++	image = kzalloc(padded, GFP_KERNEL);
++	if (!image) {
++		release_firmware(fw);
++		return -ENOMEM;
++	}
++	memcpy(image, fw->data, fw->size);
++	release_firmware(fw);
++
++	/*
++	 * Reprogramming a device that is already running would clock a fresh
++	 * bitstream in while the I2S lines are live, which leaves it passing
++	 * nothing. Rebinding this driver at runtime is therefore a no-op.
++	 */
++	if (!dough_read_status(spi, status) &&
++	    dough_rev_valid(status[DOUGH_REV_OFFSET]) &&
++	    status[DOUGH_MODE_OFFSET] == DOUGH_MODE_I2S) {
++		dev_info(dev, "already configured, revision %u\n",
++			 status[DOUGH_REV_OFFSET]);
++		kfree(image);
++		return 0;
++	}
++
++	/*
++	 * Configuration only succeeds while the I2S pins are parked: whatever
++	 * the boot loader left driving them is enough to upset the engine.
++	 * Requesting them as inputs switches them to their GPIO function, and
++	 * they are handed straight back so the audio driver can claim them.
++	 */
++	i2s = gpiod_get_array_optional(dev, "i2s", GPIOD_IN);
++	if (IS_ERR(i2s)) {
++		dev_warn(dev, "cannot park the I2S pins (%pe), continuing\n",
++			 i2s);
++		i2s = NULL;
++	}
++
++	/*
++	 * The idle command doubles as the transfer that asserts the chip
++	 * select for the configuration sequence.
++	 */
++	ret = dough_load_bitstream(priv, image, padded);
++
++	if (i2s)
++		gpiod_put_array(i2s);
++
++	if (ret) {
++		dev_err(dev, "bitstream transfer failed: %d\n", ret);
++		goto out_free;
++	}
++
++	/*
++	 * The vendor verifies the revision with a full sized full duplex
++	 * transfer, not a short status read, and does it before arming the
++	 * device. Clocking a whole block through at this point may be what
++	 * starts its serialiser: ours has only ever seen 32 byte reads here,
++	 * and afterwards it hands over its status frame and nothing else.
++	 */
++	msleep(DOUGH_RESET_HOLD_MS);
++	{
++		struct spi_transfer prime = {
++			.tx_buf = priv->tx_buf,
++			.rx_buf = priv->xfer_buf,
++			.len = DOUGH_READ_BYTES,
++			.speed_hz = DOUGH_READ_SPEED_HZ,
++		};
++		struct spi_message msg;
++
++		spi_message_init(&msg);
++		spi_message_add_tail(&prime, &msg);
++		ret = spi_sync(spi, &msg);
++	}
++	if (ret) {
++		dev_err(dev, "priming transfer failed: %d\n", ret);
++		goto out_free;
++	}
++	memcpy(status, priv->xfer_buf, DOUGH_FRAME_LEN);
++	dev_info(dev, "primed with %u bytes, revision %u\n",
++		 (unsigned int)DOUGH_READ_BYTES, status[DOUGH_REV_OFFSET]);
++
++	if (!dough_rev_valid(status[DOUGH_REV_OFFSET])) {
++		dev_err(dev, "configuration failed, revision reads %u\n",
++			status[DOUGH_REV_OFFSET]);
++		ret = -EIO;
++		goto out_free;
++	}
++
++	ret = dough_send_cmd(spi, DOUGH_CMD_I2S);
++	if (ret) {
++		dev_err(dev, "failed to select I2S mode: %d\n", ret);
++		goto out_free;
++	}
++	msleep(DOUGH_ARM_DELAY_MS);
++
++	ret = dough_read_status(spi, status);
++	if (ret) {
++		dev_err(dev, "status read failed: %d\n", ret);
++		goto out_free;
++	}
++
++	if (status[DOUGH_MODE_OFFSET] != DOUGH_MODE_I2S) {
++		dev_err(dev, "device did not enter I2S mode (mode 0x%02x)\n",
++			status[DOUGH_MODE_OFFSET]);
++		ret = -EIO;
++		goto out_free;
++	}
++
++	dev_info(dev, "configured, revision %u, I2S passthrough active\n",
++		 status[DOUGH_REV_OFFSET]);
++	ret = 0;
++
++out_free:
++	kfree(image);
++
++	return ret;
++}
++
++
++/*
++ * Capture support.
++ *
++ * There is no interrupt line, so a thread polls the device: each transfer
++ * returns a status frame and a block of audio frames, which are unpacked
++ * from 24 bit big endian into the 32 bit samples ALSA was promised.
++ */
++
++static const struct snd_pcm_hardware dough_pcm_hardware = {
++	.info			= SNDRV_PCM_INFO_INTERLEAVED |
++					  SNDRV_PCM_INFO_BLOCK_TRANSFER,
++	/*
++	 * The device frames 24 bit samples packed into three bytes. Using
++	 * the matching ALSA format keeps the wire layout and the buffer
++	 * layout identical, and makes the ADCs emit the word length the
++	 * device expects.
++	 */
++	.formats		= SNDRV_PCM_FMTBIT_S24_3LE,
++	.rates			= SNDRV_PCM_RATE_16000,
++	.rate_min		= DOUGH_RATE,
++	.rate_max		= DOUGH_RATE,
++	/*
++	 * The device always returns every channel. A stream may ask for fewer,
++	 * which is what happens when the link carries a single stereo ADC, and
++	 * then only the leading channels of each frame are handed over.
++	 */
++	.channels_min		= 2,
++	.channels_max		= DOUGH_CHANNELS,
++	.period_bytes_min	= 4096,
++	.period_bytes_max	= DOUGH_PERIOD_BYTES * 8,
++	.periods_min		= 2,
++	.periods_max		= 16,
++	.buffer_bytes_max	= DOUGH_PERIOD_BYTES * 32,
++};
++
++/*
++ * One transfer for the whole block. The device appears to track its
++ * position within a transfer rather than within a chip select window, so
++ * splitting the read makes it return a status frame and no audio.
++ */
++static int dough_read_block(struct dough_priv *priv)
++{
++	struct spi_transfer xfer = {
++		.tx_buf = priv->tx_buf,
++		.rx_buf = priv->xfer_buf,
++		.len = DOUGH_READ_BYTES,
++		.speed_hz = DOUGH_READ_SPEED_HZ,
++	};
++	struct spi_message msg;
++
++	spi_message_init(&msg);
++	spi_message_add_tail(&xfer, &msg);
++
++	return spi_sync(priv->spi, &msg);
++}
++/* Copy one block into the ring buffer, wrapping as it goes. */
++static void dough_deliver(struct dough_priv *priv)
++{
++	struct snd_pcm_substream *substream = priv->substream;
++	struct snd_pcm_runtime *runtime = substream->runtime;
++	const u8 *src = priv->xfer_buf + DOUGH_AUDIO_FRAME;
++	unsigned int channels = runtime->channels;
++	unsigned int copy = channels * DOUGH_SAMPLE_BYTES;
++	bool elapsed = false;
++	unsigned int f, nframes;
++
++	/*
++	 * The status frame says how many of the block's frames actually hold
++	 * audio; the rest is whatever was left in the device's buffer. Copying
++	 * all of them regardless interleaves stale data with real samples and
++	 * makes speech sound torn and grainy.
++	 */
++	nframes = priv->xfer_buf[19] | (priv->xfer_buf[20] << 8);
++	if (nframes > DOUGH_FRAMES_PER_READ)
++		nframes = DOUGH_FRAMES_PER_READ;
++
++	for (f = 0; f < nframes; f++) {
++		u8 *dst = runtime->dma_area +
++			 (priv->written % runtime->buffer_size) * copy;
++
++		/*
++		 * Both sides are packed 24 bit little endian, so the
++		 * leading channels can be taken verbatim.
++		 */
++		memcpy(dst, src + f * DOUGH_AUDIO_FRAME, copy);
++
++		priv->written++;
++		if (++priv->period_pos >= runtime->period_size) {
++			priv->period_pos = 0;
++			elapsed = true;
++		}
++	}
++
++	if (elapsed)
++		snd_pcm_period_elapsed(substream);
++}
++static int dough_capture_thread(void *data)
++{
++	struct dough_priv *priv = data;
++
++	/*
++	 * The device has a bounded internal buffer and no way to signal
++	 * readiness, so a late transfer loses audio. Run at realtime
++	 * priority, as the vendor's reader does.
++	 */
++	sched_set_fifo(current);
++
++	while (!kthread_should_stop()) {
++		if (!READ_ONCE(priv->running)) {
++			usleep_range(DOUGH_POLL_US, DOUGH_POLL_MAX_US);
++			continue;
++		}
++
++		mutex_lock(&priv->lock);
++		priv->reads++;
++		if (dough_read_block(priv)) {
++			priv->read_errors++;
++			dev_err_ratelimited(&priv->spi->dev,
++					    "capture transfer failed\n");
++		} else {
++			unsigned int k, nz = 0;
++
++			for (k = 0; k < DOUGH_READ_BYTES; k++)
++				if (priv->xfer_buf[k])
++					nz++;
++			priv->last_nonzero = nz;
++			priv->last_nframes = priv->xfer_buf[19] |
++					    (priv->xfer_buf[20] << 8);
++
++			/*
++			 * The device latches its framing when the I2S mode
++			 * command arrives. At probe the microphone bus is still
++			 * idle, so a device armed only there never synchronises
++			 * and reports no frames. Arm it again the moment the bus
++			 * is seen carrying data, which is once the ADCs have been
++			 * powered up for this stream.
++			 */
++			if (!priv->armed &&
++			    !priv->xfer_buf[DOUGH_I2S_INACTIVE_OFFSET]) {
++				dough_send_cmd(priv->spi, DOUGH_CMD_I2S);
++				priv->armed = true;
++			}
++
++			if (READ_ONCE(priv->substream))
++				dough_deliver(priv);
++		}
++		mutex_unlock(&priv->lock);
++
++		usleep_range(DOUGH_POLL_US, DOUGH_POLL_MAX_US);
++	}
++
++	return 0;
++}
++
++static int dough_pcm_open(struct snd_soc_component *component,
++			  struct snd_pcm_substream *substream)
++{
++	struct dough_priv *priv = snd_soc_component_get_drvdata(component);
++
++	snd_soc_set_runtime_hwparams(substream, &dough_pcm_hardware);
++	WRITE_ONCE(priv->substream, substream);
++
++	return snd_pcm_hw_constraint_integer(substream->runtime,
++					     SNDRV_PCM_HW_PARAM_PERIODS);
++}
++
++static int dough_pcm_close(struct snd_soc_component *component,
++			   struct snd_pcm_substream *substream)
++{
++	struct dough_priv *priv = snd_soc_component_get_drvdata(component);
++
++	WRITE_ONCE(priv->running, false);
++	WRITE_ONCE(priv->substream, NULL);
++
++	if (priv->thread) {
++		kthread_stop(priv->thread);
++		priv->thread = NULL;
++	}
++
++	return 0;
++}
++
++static int dough_pcm_prepare(struct snd_soc_component *component,
++		     struct snd_pcm_substream *substream)
++{
++	struct dough_priv *priv = snd_soc_component_get_drvdata(component);
++
++	priv->written = 0;
++	priv->period_pos = 0;
++	priv->armed = false;
++
++	/*
++	 * Start the thread here rather than in trigger, which runs with a
++	 * spinlock held and so must not sleep. It idles until triggered.
++	 */
++	if (!priv->thread) {
++		priv->thread = kthread_run(dough_capture_thread, priv,
++				   "dough-capture");
++		if (IS_ERR(priv->thread)) {
++			int ret = PTR_ERR(priv->thread);
++
++			priv->thread = NULL;
++			return ret;
++		}
++	}
++
++	return 0;
++}
++
++static int dough_pcm_trigger(struct snd_soc_component *component,
++		     struct snd_pcm_substream *substream, int cmd)
++{
++	struct dough_priv *priv = snd_soc_component_get_drvdata(component);
++
++	/* Runs in atomic context: only ever set a flag here. */
++	switch (cmd) {
++	case SNDRV_PCM_TRIGGER_START:
++	case SNDRV_PCM_TRIGGER_RESUME:
++	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
++		WRITE_ONCE(priv->running, true);
++		return 0;
++	case SNDRV_PCM_TRIGGER_STOP:
++	case SNDRV_PCM_TRIGGER_SUSPEND:
++	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
++		WRITE_ONCE(priv->running, false);
++		return 0;
++	default:
++		return -EINVAL;
++	}
++}
++static snd_pcm_uframes_t dough_pcm_pointer(struct snd_soc_component *component,
++					   struct snd_pcm_substream *substream)
++{
++	struct dough_priv *priv = snd_soc_component_get_drvdata(component);
++
++	return priv->written % substream->runtime->buffer_size;
++}
++
++static int dough_pcm_construct(struct snd_soc_component *component,
++		       struct snd_soc_pcm_runtime *rtd)
++{
++	snd_pcm_set_managed_buffer_all(rtd->pcm, SNDRV_DMA_TYPE_VMALLOC,
++				       component->dev, 0, 0);
++
++	return 0;
++}
++
++static const struct snd_soc_component_driver dough_component = {
++	.name			= "dough-capture",
++	.open			= dough_pcm_open,
++	.close			= dough_pcm_close,
++	.prepare		= dough_pcm_prepare,
++	.trigger		= dough_pcm_trigger,
++	.pointer		= dough_pcm_pointer,
++	.pcm_construct	= dough_pcm_construct,
++	.legacy_dai_naming	= 1,
++};
++
++static struct snd_soc_dai_driver dough_dai = {
++	.name = "dough-capture",
++	.capture = {
++		.stream_name	= "Mic Capture",
++		.channels_min	= 2,
++		.channels_max	= DOUGH_CHANNELS,
++		.rates		= SNDRV_PCM_RATE_16000,
++		.formats	= SNDRV_PCM_FMTBIT_S24_3LE,
++	},
++};
++/*
++ * Debug interface. The status frame says whether the device is seeing the
++ * DAC feed and the microphone bus, and the mode can be switched to the
++ * built in test pattern to exercise the capture path on its own.
++ */
++static ssize_t fpga_status_show(struct device *dev,
++				struct device_attribute *attr, char *buf)
++{
++	struct dough_priv *priv = dev_get_drvdata(dev);
++	u8 status[DOUGH_FRAME_LEN];
++	int ret;
++
++	mutex_lock(&priv->lock);
++	ret = dough_read_status(priv->spi, status);
++	mutex_unlock(&priv->lock);
++	if (ret)
++		return ret;
++
++	return sysfs_emit(buf,
++				  "revision %u mode 0x%02x dac_inactive %u i2s_inactive %u overrun %u nframes %u timestamp %u\n",
++				  status[DOUGH_REV_OFFSET], status[DOUGH_MODE_OFFSET],
++				  status[23], status[24], status[25],
++				  (status[19] << 8) | status[20],
++				  (status[15] << 24) | (status[16] << 16) |
++				  (status[17] << 8) | status[18]);
++}
++static DEVICE_ATTR_RO(fpga_status);
++
++static ssize_t capture_debug_show(struct device *dev,
++				  struct device_attribute *attr, char *buf)
++{
++	struct dough_priv *priv = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf,
++				  "reads %lu errors %lu last_nonzero_bytes %u of %u last_nframes %u running %u\n",
++				  priv->reads, priv->read_errors, priv->last_nonzero,
++				  (unsigned int)DOUGH_READ_BYTES, priv->last_nframes,
++				  READ_ONCE(priv->running));
++}
++static DEVICE_ATTR_RO(capture_debug);
++
++static ssize_t fpga_mode_store(struct device *dev,
++				       struct device_attribute *attr,
++				       const char *buf, size_t count)
++{
++	struct dough_priv *priv = dev_get_drvdata(dev);
++	unsigned int mode;
++	int ret;
++
++	ret = kstrtouint(buf, 0, &mode);
++	if (ret)
++		return ret;
++
++	/* Only the documented command bytes are accepted. */
++	if (mode != DOUGH_CMD_OFF && mode != DOUGH_CMD_I2S &&
++	    mode != DOUGH_CMD_TPG)
++		return -EINVAL;
++
++	mutex_lock(&priv->lock);
++	ret = dough_send_cmd(priv->spi, mode);
++	mutex_unlock(&priv->lock);
++
++	return ret ? ret : count;
++}
++static DEVICE_ATTR_WO(fpga_mode);
++
++/*
++ * The head of the last block read, with offsets. Where the non-zero bytes stop
++ * is the thing worth knowing: the status frame occupies the first 27, so data
++ * ending there means the audio never arrived, while data further in means it
++ * did and is being unpacked from the wrong place.
++ */
++static ssize_t capture_dump_show(struct device *dev,
++				 struct device_attribute *attr, char *buf)
++{
++	struct dough_priv *priv = dev_get_drvdata(dev);
++	unsigned int i, count = 0, first = DOUGH_READ_BYTES, last = 0;
++	int len = 0;
++
++	mutex_lock(&priv->lock);
++
++	for (i = 0; i < DOUGH_READ_BYTES; i++) {
++		if (!priv->xfer_buf[i])
++			continue;
++		if (i < first)
++			first = i;
++		last = i;
++		count++;
++	}
++
++	len += sysfs_emit_at(buf, len,
++				    "nonzero %u of %u, first %d, last %d\n",
++				    count, (unsigned int)DOUGH_READ_BYTES,
++				    count ? (int)first : -1, count ? (int)last : -1);
++
++	for (i = 0; i < 128; i += 16)
++		len += sysfs_emit_at(buf, len, "%04x: %*ph\n", i, 16,
++					     priv->xfer_buf + i);
++
++	mutex_unlock(&priv->lock);
++
++	return len;
++}
++static DEVICE_ATTR_RO(capture_dump);
++
++/*
++ * A one-shot read of an arbitrary length, to find out whether the device
++ * stops after its first frame because of how the controller segments the
++ * transfer. The DMA path splits a transfer into 1024 byte packets, and 6912
++ * is not a multiple of that, so comparing a packet aligned length against
++ * the usual block size says whether the segmentation is what truncates it.
++ * Write the length in bytes, then read back what came out.
++ */
++static ssize_t raw_read_store(struct device *dev,
++			      struct device_attribute *attr,
++			      const char *buf, size_t count)
++{
++	struct dough_priv *priv = dev_get_drvdata(dev);
++	unsigned int len, i, nz = 0, first, last = 0;
++	struct spi_transfer xfer = {};
++	struct spi_message msg;
++	u8 *rx, *tx;
++	int ret;
++
++	ret = kstrtouint(buf, 0, &len);
++	if (ret)
++		return ret;
++	if (len < DOUGH_FRAME_LEN || len > DOUGH_READ_BYTES)
++		return -EINVAL;
++
++	rx = kzalloc(len, GFP_KERNEL);
++	tx = kzalloc(len, GFP_KERNEL);
++	if (!rx || !tx) {
++		kfree(rx);
++		kfree(tx);
++		return -ENOMEM;
++	}
++
++	/*
++	 * Fill the receive buffer with a sentinel first. A tail that still
++	 * reads 0xa5 afterwards was never written by the controller at all;
++	 * a tail of zeros means it really did clock zeros in off the wire.
++	 */
++	memset(rx, 0xa5, len);
++
++	first = len;
++	xfer.tx_buf = tx;
++	xfer.rx_buf = rx;
++	xfer.len = len;
++	xfer.speed_hz = DOUGH_READ_SPEED_HZ;
++	spi_message_init(&msg);
++	spi_message_add_tail(&xfer, &msg);
++
++	mutex_lock(&priv->lock);
++	ret = spi_sync(priv->spi, &msg);
++	mutex_unlock(&priv->lock);
++
++	if (ret) {
++		scnprintf(priv->raw_result, sizeof(priv->raw_result),
++			  "len %u failed %d\n", len, ret);
++	} else {
++		for (i = 0; i < len; i++) {
++			if (!rx[i])
++				continue;
++			if (i < first)
++				first = i;
++			last = i;
++			nz++;
++		}
++		scnprintf(priv->raw_result, sizeof(priv->raw_result),
++			  "len %u nonzero %u first %d last %d\n%*ph\n%*ph\n",
++			  len, nz, nz ? (int)first : -1, nz ? (int)last : -1,
++			  (int)min(len, 32u), rx,
++			  len > 32 ? (int)min(len - 32, 32u) : 0, rx + 32);
++	}
++
++	kfree(rx);
++	kfree(tx);
++
++	return count;
++}
++
++static ssize_t raw_read_show(struct device *dev,
++			     struct device_attribute *attr, char *buf)
++{
++	struct dough_priv *priv = dev_get_drvdata(dev);
++
++	return sysfs_emit(buf, "%s", priv->raw_result);
++}
++static DEVICE_ATTR_RW(raw_read);
++
++static struct attribute *dough_attrs[] = {
++	&dev_attr_fpga_status.attr,
++	&dev_attr_capture_debug.attr,
++	&dev_attr_capture_dump.attr,
++	&dev_attr_raw_read.attr,
++	&dev_attr_fpga_mode.attr,
++	NULL,
++};
++ATTRIBUTE_GROUPS(dough);
++
++static void dough_free_buf(void *buf)
++{
++	kfree(buf);
++}
++
++static int dough_probe(struct spi_device *spi)
++{
++	struct device *dev = &spi->dev;
++	struct dough_priv *priv;
++	int ret;
++
++	priv = devm_kzalloc(dev, sizeof(*priv), GFP_KERNEL);
++	if (!priv)
++		return -ENOMEM;
++
++	priv->spi = spi;
++	priv->idle_cmd[0] = DOUGH_CMD_OFF;
++	mutex_init(&priv->lock);
++
++	priv->reset = devm_gpiod_get(dev, "reset", GPIOD_OUT_LOW);
++	if (IS_ERR(priv->reset))
++		return dev_err_probe(dev, PTR_ERR(priv->reset),
++				     "cannot get reset gpio\n");
++
++	spi->mode = SPI_MODE_3;
++	spi->bits_per_word = 8;
++	ret = spi_setup(spi);
++	if (ret)
++		return dev_err_probe(dev, ret, "spi_setup failed\n");
++
++	spi_set_drvdata(spi, priv);
++
++	/*
++	 * The controller only uses DMA when both buffers are four byte aligned,
++	 * and falls back to a single FIFO load of 32 bytes otherwise, silently
++	 * dropping the rest of the block. devm_kzalloc hands back a pointer into
++	 * a larger devres allocation and makes no such promise, so allocate these
++	 * outright.
++	 */
++	priv->xfer_buf = kzalloc(DOUGH_READ_BYTES, GFP_KERNEL);
++	if (!priv->xfer_buf)
++		return -ENOMEM;
++	ret = devm_add_action_or_reset(dev, dough_free_buf, priv->xfer_buf);
++	if (ret)
++		return ret;
++
++	priv->tx_buf = kzalloc(DOUGH_READ_BYTES, GFP_KERNEL);
++	if (!priv->tx_buf)
++		return -ENOMEM;
++	ret = devm_add_action_or_reset(dev, dough_free_buf, priv->tx_buf);
++	if (ret)
++		return ret;
++
++	dev_info(dev,
++			 "capture block %u bytes, tx align %lu, rx align %lu, dma %s\n",
++			 (unsigned int)DOUGH_READ_BYTES,
++			 (unsigned long)priv->tx_buf % 4,
++			 (unsigned long)priv->xfer_buf % 4,
++			 (((unsigned long)priv->tx_buf % 4) ||
++				  ((unsigned long)priv->xfer_buf % 4)) ? "NO" : "yes");
++
++	ret = dough_configure(priv);
++	if (ret)
++		return ret;
++
++	return devm_snd_soc_register_component(dev, &dough_component,
++					      &dough_dai, 1);
++}
++
++static const struct of_device_id dough_of_match[] = {
++	{ .compatible = "amzn,dough" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, dough_of_match);
++
++static const struct spi_device_id dough_spi_ids[] = {
++	{ "dough" },
++	{ }
++};
++MODULE_DEVICE_TABLE(spi, dough_spi_ids);
++
++static struct spi_driver dough_driver = {
++	.driver = {
++		.name = "dough-fpga",
++		.dev_groups = dough_groups,
++		.of_match_table = dough_of_match,
++	},
++	.id_table = dough_spi_ids,
++	.probe = dough_probe,
++};
++module_spi_driver(dough_driver);
++
++MODULE_DESCRIPTION("Amazon Echo Dot 2 audio bridge FPGA");
++MODULE_LICENSE("GPL");
++MODULE_FIRMWARE(DOUGH_FW_NAME);
+--- a/drivers/misc/Kconfig
++++ b/drivers/misc/Kconfig
+@@ -660,4 +660,17 @@
+ source "drivers/misc/keba/Kconfig"
+ source "drivers/misc/amd-sbi/Kconfig"
+ source "drivers/misc/rp1/Kconfig"
++
++config DOUGH_FPGA
++	tristate "Amazon Echo Dot (biscuit) audio bridge FPGA"
++	depends on SPI
++	help
++	  The Amazon Echo Dot (2nd generation) routes its I2S playback data
++	  line through an SRAM configured FPGA on the way to the audio codec,
++	  and aggregates the microphone ADCs through the same device. The
++	  configuration is lost on every power cycle, so this driver sends the
++	  bitstream at probe time and selects I2S passthrough. Without it the
++	  speaker stays silent.
++
++	  If unsure, say N.
+ endmenu
+--- a/drivers/misc/Makefile
++++ b/drivers/misc/Makefile
+@@ -75,3 +75,4 @@
+ obj-y				+= keba/
+ obj-y				+= amd-sbi/
+ obj-$(CONFIG_MISC_RP1)		+= rp1/
++obj-$(CONFIG_DOUGH_FPGA)		+= dough-fpga.o

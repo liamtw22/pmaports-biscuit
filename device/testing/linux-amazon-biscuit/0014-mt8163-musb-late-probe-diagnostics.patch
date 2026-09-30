@@ -1,0 +1,70 @@
+--- a/drivers/usb/musb/mediatek.c
++++ b/drivers/usb/musb/mediatek.c
+@@ -17,6 +17,8 @@
+ #include <linux/usb/usb_phy_generic.h>
+ #include "musb_core.h"
+ #include "musb_dma.h"
++#include <linux/jiffies.h>
++#include <linux/workqueue.h>
+ 
+ #define USB_L1INTS		0x00a0
+ #define USB_L1INTM		0x00a4
+@@ -49,7 +51,8 @@
+ 	enum phy_mode phy_mode;
+ 	struct clk_bulk_data clks[MTK_MUSB_CLKS_NUM];
+ 	enum usb_role role;
+-	struct usb_role_switch *role_sw;
++	struct usb_role_switch *role_sw;	struct delayed_work report_work;
++
+ };
+ 
+ static int mtk_musb_clks_get(struct mtk_glue *glue)
+@@ -397,6 +400,21 @@
+ 	.dma_mask = DMA_BIT_MASK(32),
+ };
+ 
++/*
++ * Serial output drops early messages on this board. Report after userspace
++ * is underway whether the MUSB child driver remained bound.
++ */
++static void mtk_musb_late_report(struct work_struct *work)
++{
++	struct mtk_glue *glue = container_of(
++		to_delayed_work(work), struct mtk_glue, report_work);
++	struct device *child = &glue->musb_pdev->dev;
++	const char *driver = child->driver ? child->driver->name : "<none>";
++
++	dev_info(glue->dev, "MT8163-USB: child=%s driver=%s\n",
++		 dev_name(child), driver);
++}
++
+ static int mtk_musb_probe(struct platform_device *pdev)
+ {
+ 	struct musb_hdrc_platform_data *pdata;
+@@ -415,6 +433,8 @@
+ 	if (!pdata)
+ 		return -ENOMEM;
+ 
++	INIT_DELAYED_WORK(&glue->report_work, mtk_musb_late_report);
++
+ 	ret = of_platform_populate(np, NULL, NULL, dev);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret,
+@@ -492,6 +512,8 @@
+ 		goto err_device_register;
+ 	}
+ 
++	schedule_delayed_work(&glue->report_work, msecs_to_jiffies(12000));
++
+ 	return 0;
+ 
+ err_device_register:
+@@ -509,6 +531,8 @@
+ 	struct mtk_glue *glue = platform_get_drvdata(pdev);
+ 	struct platform_device *usb_phy = glue->usb_phy;
+ 
++	cancel_delayed_work_sync(&glue->report_work);
++
+ 	platform_device_unregister(glue->musb_pdev);
+ 	usb_phy_generic_unregister(usb_phy);
+ }

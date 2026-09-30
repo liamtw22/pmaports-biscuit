@@ -1,0 +1,179 @@
+#!/sbin/openrc-run
+
+description="First-boot Wi-Fi setup: broadcast an open network and serve a captive portal"
+
+# Both written by biscuit-setup.sh itself (PIDFILE, LOCKDIR there), so spelled
+# out rather than derived from the service name.
+pidfile="/run/biscuit-setup.pid"
+lockdir="/run/biscuit-setup.lock"
+script="/usr/bin/biscuit-setup.sh"
+
+# Deliberately NOT in any runlevel. Nothing should broadcast an open network on
+# every boot; this is started on demand, and every caller uses this one entry
+# point rather than invoking the script directly:
+#
+#   * /etc/local.d/wifi.start, when no network is configured
+#   * /etc/local.d/wifi.start, when the configured network cannot be joined
+#   * a button handler, to put a working device back into setup
+#   * Home Assistant, over ssh, for the same reason
+#
+# USE "restart", NOT "start". This is a one-shot task: biscuit-setup.sh exits
+# when setup completes or the 600 s window closes, but openrc keeps the service
+# marked started, so a second "start" is refused with "has already been started"
+# and setup never comes up - silently breaking every re-entry path above.
+# "restart" stops (clearing the marker) then starts, and works whether or not a
+# session is already running. Verified on hardware: re-entering setup this way
+# leaves an associated wlan0 untouched.
+#
+# This script deliberately does NOT use command/command_background supervision.
+# biscuit-setup.sh starts hostapd, dnsmasq and the portal as SIBLINGS rather
+# than children, and exits normally when finished. Under supervision that gave
+# two wrong behaviours: a successful setup reported "crashed" (wrong for the
+# Home Assistant sensor this feeds), and "stop" failed against the dead pid,
+# which skipped the teardown and left an open network broadcasting.
+#
+# Nor does it leave OpenRC a daemon record, which is what still made every
+# finished session "crashed" after supervision went: see start().
+
+depend() {
+	# localmount only. There must be NO "after local".
+	#
+	# wifi.start runs from /etc/local.d, i.e. during the "local" service's own
+	# start, and it is what asks for setup mode. Declaring "after local" made
+	# openrc wait for local to finish before starting this - while local was
+	# blocked waiting for wifi.start to return. Boot deadlocked with both
+	# services stuck in "starting", no setup AP, and zz-boot-done never
+	# reached. Observed on the first r219 boot.
+	need localmount
+}
+
+start_pre() {
+	if [ ! -e /proc/net/wlan/p2p_mode ]; then
+		eerror "/proc/net/wlan/p2p_mode is missing - needs kernel r218 or later"
+		return 1
+	fi
+	for bin in hostapd dnsmasq python3 wpa_passphrase; do
+		if ! command -v "$bin" >/dev/null 2>&1; then
+			eerror "$bin is not installed"
+			return 1
+		fi
+	done
+	return 0
+}
+
+start() {
+	ebegin "Starting first-boot Wi-Fi setup"
+	# A pidfile with no session holding the lock can only be a leftover, and
+	# the wait below must not mistake it for the new session's.
+	[ -d "$lockdir" ] || rm -f "$pidfile"
+	# Still daemonised by start-stop-daemon - its own session, stdio on
+	# /dev/null, none of openrc-run's descriptors - but with RC_SVCNAME
+	# unset, and without --make-pidfile.
+	#
+	# start-stop-daemon writes a record under /run/openrc/daemons/<service>
+	# whenever RC_SVCNAME is set, and that record is all `rc-status --crashed`
+	# goes on: a started service whose recorded pid has gone is "crashed".
+	# This one-shot's pid always goes - when the owner finishes, when the
+	# window closes - so every successful setup was listed as a crash, and
+	# stayed listed until the next restart or reboot. Without the record,
+	# OpenRC has nothing to call crashed; status() below and the lock
+	# directory remain the truth about whether a session is running. The
+	# state machine is otherwise unchanged: the service is still "started"
+	# afterwards, so "restart" still runs stop() and then this.
+	#
+	# The pidfile is now written by biscuit-setup.sh itself, once it holds
+	# the lock, and removed with the lock. --make-pidfile wrote it before the
+	# lock was taken, so a duplicate start - which exits at once because a
+	# session holds the lock - replaced the live session's pid with its own
+	# dead one, and a later stop signalled that instead.
+	(
+		unset RC_SVCNAME
+		start-stop-daemon --start --background --exec "$script" -- run
+	)
+	_rc=$?
+	# Report started only once the session has taken its lock and named
+	# itself - milliseconds, but a stop arriving before then would find no
+	# lock, skip the signal and leave a session running that OpenRC calls
+	# stopped. Bounded at three seconds, so a launch that dies before it gets
+	# that far cannot hold up the caller. (A duplicate finds the running
+	# session's pidfile already there and returns at once.)
+	_i=0
+	while [ $_rc -eq 0 ] && [ ! -f "$pidfile" ] && [ $_i -lt 30 ]; do
+		sleep 0.1
+		_i=$((_i + 1))
+	done
+	eend $_rc
+}
+
+stop() {
+	ebegin "Stopping first-boot Wi-Fi setup"
+
+	# The script's own teardown first: hostapd, dnsmasq, the portal and p2p0
+	# are siblings of the session's pid, so killing that pid alone would leave
+	# an open network broadcasting with nothing listening on it.
+	"$script" stop >/dev/null 2>&1
+
+	# --oknodo, so a session that already finished on its own is not an error.
+	# Without it openrc reports "failed to stop", and a failed stop skips the
+	# cleanup below and leaves the service marked started - which is exactly what
+	# broke re-entry.
+	#
+	# --retry, so this BLOCKS until the old session is really gone. Without it
+	# "restart" races: start-stop-daemon signals the old session and returns
+	# immediately, start() launches a new one that creates the lock directory,
+	# and only then does the old session's EXIT trap fire and remove the lock the
+	# NEW session is holding. The AP stays up while status reports "not running"
+	# - worse than either, because the Home Assistant sensor then reads the
+	# opposite of the truth.
+	# Only while a session holds its lock: a finished one has no process, and
+	# its pid may have been reused by something else since. (The session
+	# writes the pidfile after taking the lock and removes it before letting
+	# go, so the two agree.)
+	if [ -d "$lockdir" ]; then
+		start-stop-daemon --stop --quiet --oknodo --retry TERM/5/KILL/5 --pidfile "$pidfile" 2>/dev/null
+	fi
+
+	rm -f "$pidfile" 2>/dev/null
+	# In case the session was killed before its own EXIT trap could run.
+	rmdir "$lockdir" 2>/dev/null
+	# Likewise its pause of the settings page (for port 80, which the setup
+	# page needs, or to keep the default account's page off the open setup
+	# network): left behind, the page would stay down until a reboot.
+	# Not on a restart: the new session pauses it again straight away, and a
+	# start still in flight is what makes that pause race.
+	if [ -f /run/biscuit-setup/settings-paused ] && [ "${RC_CMD:-}" != restart ]; then
+		rm -f /run/biscuit-setup/settings-paused
+		setsid rc-service biscuit-settings start </dev/null >/dev/null 2>&1 &
+	fi
+	# And its SSH rule for the setup network (biscuit-setup.sh
+	# setup_network_ssh), which the teardown above normally removes. Left
+	# behind it would refuse SSH from 192.168.4.0/24 until a reboot, and that
+	# is some owners' house network. Kept while any hostapd still runs, since
+	# then the open network may still be up.
+	if [ -f /run/biscuit-sshd/setup-network.conf ] && ! pidof hostapd >/dev/null 2>&1; then
+		rm -f /run/biscuit-sshd/setup-network.conf
+		rc-service --ifstarted sshd reload >/dev/null 2>&1
+	fi
+	# And the secrets its portal wrote - the Wi-Fi passphrase and the account
+	# password. The session deletes each as soon as it has used it, and all of
+	# them on its way out, but a KILLed session does neither. Nothing can need
+	# them: a new session waits for a new submission, which writes them again.
+	rm -f /run/biscuit-setup/psk /run/biscuit-setup/account_pass \
+		/run/biscuit-setup/account_user /run/biscuit-setup/account_reset
+
+	eend 0
+}
+
+status() {
+	# A finished setup is not a crash.
+	#
+	# The lock directory is the real source of truth: biscuit-setup.sh creates
+	# it while a session is live and removes it on every exit path. The pidfile
+	# is not, because the process is gone by the time setup succeeds.
+	if [ -d "$lockdir" ]; then
+		einfo "setup mode is running"
+		return 0
+	fi
+	einfo "setup mode is not running"
+	return 3
+}

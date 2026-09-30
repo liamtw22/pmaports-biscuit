@@ -1,0 +1,24 @@
+diff --git a/drivers/misc/mt8163-btif.c b/drivers/misc/mt8163-btif.c
+index 158a65e..5b2d0f2 100644
+--- a/drivers/misc/mt8163-btif.c
++++ b/drivers/misc/mt8163-btif.c
+@@ -32,3 +32,4 @@
++#define BTIF_IER_RXFEN			BIT(0)
+ #define BTIF_DMA_EN_RX			BIT(0)
+ #define BTIF_DMA_EN_TX			BIT(1)
+ #define BTIF_DMA_EN_AUTORST		BIT(2)
+@@ -465,7 +466,13 @@ int mt8163_btif_start(struct mt8163_btif *btif)
+ 		BTIF_TRI_LVL_RX(BTIF_RX_FIFO_THRESHOLD),
+ 		btif->base + BTIF_TRI_LVL);
+ 	writel(BTIF_DMA_EN_AUTORST, btif->base + BTIF_DMA_EN);
+-	writel(0, btif->base + BTIF_IER);
++	/*
++	 * Keep the BTIF core receive gate open, as the vendor driver does before
++	 * it switches both directions to APDMA.  r163 programmed this register
++	 * to zero, leaving the AP-side receive path gated despite RX DMA being
++	 * armed.  TXE remains disabled; APDMA owns TX completion interrupts.
++	 */
++	writel(BTIF_IER_RXFEN, btif->base + BTIF_IER);
+ 
+ 	ret = mt8163_btif_dma_setup(btif, &btif->tx);
+ 	if (ret)

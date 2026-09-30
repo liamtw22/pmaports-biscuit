@@ -1,0 +1,73 @@
+From: Biscuit port <none@example.com>
+Date: Sun, 17 Aug 2026 16:00:00 +0000
+Subject: [PATCH] mt8163-stp: expose WMT Wi-Fi function control at runtime
+
+Stock enables the WMT Wi-Fi function as part of bringing Wi-Fi up, immediately
+before the WLAN firmware download. This driver enables it during Bluetooth
+bootstrap at t~1.77 s, and the WLAN driver then downloads and starts anywhere
+from t~16 s to t~60 s - tens of seconds with the function enabled and nothing
+driving it. Pulling stock's WMT userspace (6620_wmt_concurrency, 6620_launcher)
+confirmed the rest of the split is already correct: WMT powers the chip,
+downloads the ROM patch and toggles functions, and the WLAN driver downloads
+its own firmware. The enable timing is the difference that is left.
+
+Expose the function-control command as a write-only module parameter so it can
+be toggled off and on again immediately before the WLAN driver is loaded,
+reproducing stock's ordering without a cross-driver call and without a new
+kernel command line per experiment.
+---
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -1020,6 +1020,44 @@
+  * Writable and read at probe, so it can be toggled by unbinding and rebinding
+  * soc:bluetooth rather than by rebooting with a different command line.
+  */
++/*
++ * Set to 0 or 1 to disable or enable the WMT Wi-Fi function at runtime.
++ *
++ * Stock issues this immediately before the WLAN firmware download; we issue it
++ * during BT bootstrap, tens of seconds earlier. Toggling it off and on again
++ * just before loading the WLAN driver reproduces stock's ordering without a
++ * cross-driver call.
++ */
++static struct mt8163_stp *stp_for_param;
++
++static int wifi_func_set(const char *val, const struct kernel_param *kp)
++{
++	static const u8 off_cmd[] = { 0x01, 0x06, 0x02, 0x00, 0x03, 0x00 };
++	struct mt8163_stp *stp = stp_for_param;
++	bool on;
++	int ret;
++
++	ret = kstrtobool(val, &on);
++	if (ret)
++		return ret;
++	if (!stp)
++		return -ENODEV;
++
++	ret = mt8163_stp_wmt_xfer(stp, on ? wmt_wifi_on_cmd : off_cmd,
++				  on ? sizeof(wmt_wifi_on_cmd) : sizeof(off_cmd),
++				  wmt_wifi_on_evt, sizeof(wmt_wifi_on_evt));
++	dev_info(stp->dev, "WMT Wi-Fi function %s -> %d\n",
++		 on ? "enable" : "disable", ret);
++	return ret ? ret : 0;
++}
++
++static const struct kernel_param_ops wifi_func_ops = {
++	.set = wifi_func_set,
++};
++module_param_cb(wifi_func, &wifi_func_ops, NULL, 0200);
++MODULE_PARM_DESC(wifi_func,
++		 "write 1/0 to enable/disable the WMT Wi-Fi function now");
++
+ static bool skip_ilm_patch;
+ module_param(skip_ilm_patch, bool, 0644);
+ MODULE_PARM_DESC(skip_ilm_patch,
+@@ -1293,6 +1331,7 @@
+ 			 ret);
+ 	else
+ 		dev_info(stp->dev, "WMT Wi-Fi function enabled\n");
++	stp_for_param = stp;
+ 
+ 	dev_info(stp->dev, "WMT/STP bootstrap complete\n");
+ 	return 0;

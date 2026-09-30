@@ -1,0 +1,10 @@
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -188,3 +188,7 @@
+ 		status = "okay";
+ 	};
+ };
++
++&mmsys {
++	status = "okay";
++};

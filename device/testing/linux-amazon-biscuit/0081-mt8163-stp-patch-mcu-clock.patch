@@ -1,0 +1,132 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index b328687..60d1d64 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -92,6 +92,28 @@ static const u8 wmt_patch_address_cmd[] = {
+ };
+ static const u8 wmt_patch_address_evt[] =
+ 	{ 0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01 };
++static const u8 wmt_set_mcu_clk_enable_cmd[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x34, 0x03, 0x00, 0x80, 0x00, 0x00, 0x01, 0x00,
++	0xff, 0xff, 0xff, 0xff,
++};
++static const u8 wmt_set_mcu_clk_138_cmd[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x0c, 0x01, 0x00, 0x80, 0x59, 0x4d, 0x84, 0x00,
++	0xff, 0xff, 0xff, 0xff,
++};
++static const u8 wmt_set_mcu_clk_26_cmd[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x0c, 0x01, 0x00, 0x80, 0x00, 0x4d, 0x84, 0x00,
++	0xff, 0xff, 0xff, 0xff,
++};
++static const u8 wmt_set_mcu_clk_disable_cmd[] = {
++	0x01, 0x08, 0x10, 0x00, 0x01, 0x01, 0x00, 0x01,
++	0x34, 0x03, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
++	0xff, 0xff, 0xff, 0xff,
++};
++static const u8 wmt_set_mcu_clk_evt[] =
++	{ 0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01 };
+ static const u8 wmt_patch_evt[] = { 0x02, 0x01, 0x01, 0x00, 0x00 };
+ static const u8 wmt_reset_cmd[] = { 0x01, 0x07, 0x01, 0x00, 0x04 };
+ static const u8 wmt_reset_evt[] = { 0x02, 0x07, 0x01, 0x00, 0x00 };
+@@ -690,7 +712,7 @@ static int mt8163_stp_download_patch(struct mt8163_stp *stp,
+ 		0xc8, 0x04, 0x09, 0x02, 0x00, 0x00, 0x00, 0x00,
+ 		0xff, 0xff, 0xff, 0xff,
+ 	};
+-	unsigned int fragment = 0;
++	unsigned int fragment = 0, fragments;
+ 	int ret;
+ 
+ 	ret = request_firmware_direct(&fw, name, stp->dev);
+@@ -716,19 +738,38 @@ static int mt8163_stp_download_patch(struct mt8163_stp *stp,
+ 
+ 	data = fw->data + MT8163_WMT_PATCH_HEADER_LEN;
+ 	remaining = fw->size - MT8163_WMT_PATCH_HEADER_LEN;
++	fragments = DIV_ROUND_UP(remaining, MT8163_WMT_PATCH_FRAGMENT);
++	dev_info(stp->dev, "WMT patch %s body=%zu fragments=%u\n",
++		 name, remaining, fragments);
+ 	while (remaining) {
++		bool last;
++
+ 		len = min_t(size_t, remaining, MT8163_WMT_PATCH_FRAGMENT);
++		last = remaining == len;
+ 		cmd[0] = 0x01;
+ 		cmd[1] = 0x01;
+ 		cmd[2] = (len + 1) & 0xff;
+ 		cmd[3] = (len + 1) >> 8;
+-		cmd[4] = remaining == len ? 0x03 : fragment ? 0x02 : 0x01;
++		cmd[4] = last ? 0x03 : fragment ? 0x02 : 0x01;
+ 		memcpy(cmd + 5, data, len);
++		if (last)
++			dev_warn(stp->dev,
++				 "WMT patch %s final fragment %u/%u data=%zu wmt=%zu stp=%zu flag=%#x\n",
++				 name, fragment + 1, fragments, len, len + 5,
++				 len + 11, cmd[4]);
+ 
+ 		ret = mt8163_stp_wmt_xfer(stp, cmd, len + 5,
+ 					  wmt_patch_evt, sizeof(wmt_patch_evt));
+-		if (ret)
++		if (ret) {
++			if (last)
++				dev_err(stp->dev,
++					"WMT patch %s final fragment failed: %d\n",
++					name, ret);
+ 			goto out;
++		}
++		if (last)
++			dev_warn(stp->dev,
++				 "WMT patch %s final fragment acknowledged\n", name);
+ 		data += len;
+ 		remaining -= len;
+ 		fragment++;
+@@ -817,6 +858,24 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 	if (ret)
+ 		return dev_err_probe(stp->dev, ret, "framed WMT STP query failed\n");
+ 
++	/* Stock raises the MT8163 connectivity MCU clock for patch download. */
++	ret = mt8163_stp_wmt_xfer(stp, wmt_set_mcu_clk_enable_cmd,
++				  sizeof(wmt_set_mcu_clk_enable_cmd),
++				  wmt_set_mcu_clk_evt,
++				  sizeof(wmt_set_mcu_clk_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret,
++				     "WMT patch MCU-clock programming enable failed\n");
++	ret = mt8163_stp_wmt_xfer(stp, wmt_set_mcu_clk_138_cmd,
++				  sizeof(wmt_set_mcu_clk_138_cmd),
++				  wmt_set_mcu_clk_evt,
++				  sizeof(wmt_set_mcu_clk_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret,
++				     "WMT patch MCU-clock 138.67-MHz select failed\n");
++	dev_warn(stp->dev,
++		 "WMT patch-download MCU clock selected at 138.67 MHz\n");
++
+ 	for (i = 0; i < ARRAY_SIZE(patches); i++) {
+ 		ret = mt8163_stp_download_patch(stp, patches[i].name,
+ 						patches[i].address);
+@@ -829,6 +888,23 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 			return dev_err_probe(stp->dev, ret, "WMT patch reset failed\n");
+ 	}
+ 
++	/* Stock restores 26 MHz and closes the clock-programming window. */
++	ret = mt8163_stp_wmt_xfer(stp, wmt_set_mcu_clk_26_cmd,
++				  sizeof(wmt_set_mcu_clk_26_cmd),
++				  wmt_set_mcu_clk_evt,
++				  sizeof(wmt_set_mcu_clk_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret,
++				     "WMT patch MCU-clock 26-MHz restore failed\n");
++	ret = mt8163_stp_wmt_xfer(stp, wmt_set_mcu_clk_disable_cmd,
++				  sizeof(wmt_set_mcu_clk_disable_cmd),
++				  wmt_set_mcu_clk_evt,
++				  sizeof(wmt_set_mcu_clk_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret,
++				     "WMT patch MCU-clock programming disable failed\n");
++	dev_warn(stp->dev, "WMT patch-download MCU clock restored to 26 MHz\n");
++
+ 	ret = mt8163_consys_bt_paldo_set(stp->consys_dev, true);
+ 	if (ret)
+ 		return dev_err_probe(stp->dev, ret, "failed to enable BT PALDO\n");

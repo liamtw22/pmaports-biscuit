@@ -1,0 +1,61 @@
+#!/sbin/openrc-run
+
+name="biscuit-btproxy"
+description="Passive Bluetooth LE proxy for Home Assistant (ESPHome API)"
+
+command="/usr/bin/python3"
+command_args="/usr/lib/biscuit-btproxy/biscuit-btproxy.py"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/biscuit-btproxy.log"
+error_log="/var/log/biscuit-btproxy.log"
+
+supervisor="supervise-daemon"
+respawn_delay=5
+respawn_max=0
+respawn_period=1800
+
+depend() {
+	# bluetooth for the controller, net because Home Assistant connects over it.
+	# `after` rather than `need`: the service is useful the moment either
+	# arrives and re-reads the adapter address itself, so a slow Bluetooth
+	# bring-up should not hold up the runlevel. Bluetooth on this device
+	# deliberately arrives ~40 s in, after Wi-Fi - see wifi.start.
+	after bluetooth net biscuit-persist
+	use bluetooth
+}
+
+start_pre() {
+	# The service runs enabled-or-idle from one config file, so it is always in
+	# the runlevel and toggling it from :8080 or Home Assistant is a restart
+	# rather than an rc-update. That keeps "enabled" in one place instead of
+	# splitting it between a config file and a runlevel symlink, which is the
+	# split that made biscuit-mic-pump hard to reason about.
+	checkpath -d -m 0755 /run/biscuit-btproxy
+	if [ ! -f /opt/persist/btproxy.env ]; then
+		# Default OFF. Scanning costs roughly half the 2.4 GHz Wi-Fi
+		# throughput on this hardware, so it is opt-in rather than something
+		# a user discovers by wondering why their Wi-Fi got slower.
+		mkdir -p /opt/persist
+		cat > /opt/persist/btproxy.env <<-EOF
+			BTPROXY_ENABLED=0
+			BTPROXY_SCAN_SECS=10
+			BTPROXY_IDLE_SECS=50
+			BTPROXY_PORT=6054
+			BTPROXY_NAME=biscuit-btproxy
+		EOF
+	fi
+
+	# Keep the mDNS advertisement's port in step with the configured one.
+	# Shipping a fixed 6054 in the avahi file while the config can change the
+	# port is exactly the kind of quiet divergence that ends with "Home
+	# Assistant discovered it but cannot connect".
+	_port=$(sed -n 's/^BTPROXY_PORT=//p' /opt/persist/btproxy.env 2>/dev/null | tr -dc '0-9')
+	: "${_port:=6054}"
+	_svc=/etc/avahi/services/biscuit-btproxy.service
+	if [ -f "$_svc" ] && ! grep -q "<port>${_port}</port>" "$_svc"; then
+		sed -i "s|<port>[0-9]*</port>|<port>${_port}</port>|" "$_svc"
+		einfo "mDNS advertisement updated to port ${_port}"
+	fi
+	return 0
+}

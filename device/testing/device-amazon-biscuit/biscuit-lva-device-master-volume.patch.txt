@@ -1,0 +1,110 @@
+--- linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/peripheral_api.py
++++ linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/peripheral_api.py
+@@ -362,14 +362,17 @@ class PeripheralAPIServer:
+         elif command in (LVACommand.VOLUME_UP, LVACommand.VOLUME_DOWN):
+             delta = self._volume_step if command == LVACommand.VOLUME_UP else -self._volume_step
+             new_vol = max(0.0, min(1.0, state.volume + delta))
+-            vol_pct = int(round(new_vol * 100))
+ 
+-            state.music_player.set_volume(vol_pct)
+-            state.tts_player.set_volume(vol_pct)
++            # biscuit-audio owns the appliance master.  VolumeChanged is
++            # relayed to it by biscuit-va-leds, which changes the codec and
++            # biscuit-dsp loudness curve together.  Do not also attenuate mpv:
++            # that would apply the same user volume twice.
+ 
+             if state.media_player_entity is not None:
+                 state.media_player_entity.volume = new_vol
+                 state.media_player_entity.previous_volume = new_vol
++                if new_vol > 0.0:
++                    state.media_player_entity.muted = False
+ 
+                 # Push the new volume to HA so its media player entity updates in real time
+                 if satellite is not None:
+@@ -396,14 +399,16 @@ class PeripheralAPIServer:
+                 return
+ 
+             new_vol = max(0.0, min(1.0, float(volume)))
+-            vol_pct = int(round(new_vol * 100))
+ 
+-            state.music_player.set_volume(vol_pct)
+-            state.tts_player.set_volume(vol_pct)
+ 
+             if state.media_player_entity is not None:
+                 state.media_player_entity.volume = new_vol
+                 state.media_player_entity.previous_volume = new_vol
++                # Raising the physical volume is an explicit unmute.  Without
++                # this, an HA media mute followed by the hardware volume-up
++                # button could leave the entity reporting muted indefinitely.
++                if new_vol > 0.0:
++                    state.media_player_entity.muted = False
+ 
+                 # Push the new volume to HA so its media player entity updates in real time
+                 if satellite is not None:
+@@ -419,7 +423,9 @@ class PeripheralAPIServer:
+                         ]
+                     )
+ 
+-            # persist_volume also emits VOLUME_CHANGED via models.py
++            # This updates LVA/HA state and emits VOLUME_CHANGED.  The bridge
++            # sees that the device is already at this volume and suppresses the
++            # echo; mpv remains at unity.
+             state.persist_volume(new_vol)
+ 
+         elif command == LVACommand.STOP_TIMER_RINGING:
+--- linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/entity.py
++++ linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/entity.py
+@@ -181,8 +181,10 @@ class MediaPlayerEntity(ESPHomeEntity):
+                     if not self.muted:
+                         self.previous_volume = self.volume
+                         self.volume = 0
+-                        self.music_player.set_volume(0)
+-                        self.announce_player.set_volume(0)
++                        # The device codec/DSP is the one master volume.  Its
++                        # VolumeChanged bridge immediately applies this zero;
++                        # keeping the local players at unity avoids a second
++                        # attenuation after unmute.
+                         self.muted = True
+                         if hasattr(self.server, "state") and getattr(self.server, "state", None) is not None:
+                             self.server.state.persist_volume(self.volume)
+@@ -192,8 +194,6 @@ class MediaPlayerEntity(ESPHomeEntity):
+                     self._log.debug("Executing UNMUTE")
+                     if self.muted:
+                         self.volume = self.previous_volume
+-                        self.music_player.set_volume(int(self.volume * 100))
+-                        self.announce_player.set_volume(int(self.volume * 100))
+                         self.muted = False
+                         if hasattr(self.server, "state") and getattr(self.server, "state", None) is not None:
+                             self.server.state.persist_volume(self.volume)
+@@ -262,10 +262,11 @@ class MediaPlayerEntity(ESPHomeEntity):
+         remember: bool = True,
+     ) -> None:
+         normalized = max(0.0, min(1.0, float(volume)))
+-        volume_percent = int(round(normalized * 100))
+ 
+-        self.music_player.set_volume(volume_percent)
+-        self.announce_player.set_volume(volume_percent)
++        # ``volume`` represents biscuit-audio's physical master on this
++        # appliance.  It controls the codec, DSP loudness table and ring.  The
++        # mpv players must stay at unity so a 50% master is not rendered as
++        # 50% at the codec multiplied by 50% in mpv.
+ 
+         self.volume = normalized
+ 
+--- linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/__main__.py
++++ linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/__main__.py
+@@ -466,9 +466,11 @@ async def main() -> None:
+     if args.enable_thinking_sound or args.mic_auto_gain or args.mic_noise_suppression:
+         state.save_preferences()
+ 
+-    initial_volume_percent = int(round(initial_volume * 100))
+-    state.music_player.set_volume(initial_volume_percent)
+-    state.tts_player.set_volume(initial_volume_percent)
++    # biscuit-audio owns the device master volume.  LVA keeps the same value
++    # for its ESPHome media-player state, but its two mpv outputs remain at
++    # unity; otherwise a persisted 50% master attenuates twice on restart.
++    state.music_player.set_volume(100)
++    state.tts_player.set_volume(100)
+ 
+     # ------------------------------------------------------------------
+     # Peripheral API (optional – LEDs, buttons, HAT boards)

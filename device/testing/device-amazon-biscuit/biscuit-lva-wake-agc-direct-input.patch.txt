@@ -1,0 +1,436 @@
+--- a/linux_voice_assistant/__main__.py	2026-09-02 16:51:16.942212300 -0400
++++ b/linux_voice_assistant/__main__.py	2026-09-02 16:51:17.252014100 -0400
+@@ -4,7 +4,10 @@
+ import errno
+ import json
+ import logging
++import os
++import math
+ import sys
++import subprocess
+ import threading
+ import time
+ from pathlib import Path
+@@ -40,6 +43,70 @@
+ 
+ 
+ # -----------------------------------------------------------------------------
++class CommandRecorder:
++    """Read exact PCM16 blocks from a device-owned capture command."""
++
++    def __init__(self, command: Path, samplerate: int, channels: int):
++        if samplerate != 16000:
++            raise ValueError("command microphone requires 16000 Hz")
++        if channels != 1:
++            raise ValueError("command microphone currently supports mono only")
++        self.command = command
++        self.channels = channels
++        self.process: Optional[subprocess.Popen[bytes]] = None
++
++    def __enter__(self):
++        self.process = subprocess.Popen(
++            [str(self.command)],
++            stdout=subprocess.PIPE,
++        )
++        if self.process.stdout is None:
++            raise RuntimeError("capture command has no stdout")
++        return self
++
++    def __exit__(self, exc_type, exc_value, traceback):
++        if self.process is None:
++            return
++        self.process.terminate()
++        try:
++            self.process.wait(timeout=3)
++        except subprocess.TimeoutExpired:
++            self.process.kill()
++            self.process.wait()
++
++    def record_bytes(self, frames: int) -> bytes:
++        """Return exactly one mono S16LE block without float conversion."""
++        if self.process is None or self.process.stdout is None:
++            raise RuntimeError("capture command is not running")
++        needed = frames * self.channels * 2
++        chunks: list[bytes] = []
++        received = 0
++        while received < needed:
++            chunk = self.process.stdout.read(needed - received)
++            if not chunk:
++                returncode = self.process.poll()
++                raise RuntimeError(
++                    f"capture command ended after {received}/{needed} bytes "
++                    f"(status={returncode})"
++                )
++            chunks.append(chunk)
++            received += len(chunk)
++        return b"".join(chunks)
++
++
++class CommandMicrophone:
++    """Minimal soundcard-compatible microphone backed by an executable."""
++
++    def __init__(self, command: Path):
++        self.command = command
++        self.name = f"command/{command}"
++
++    def recorder(self, *, samplerate: int, channels: int, blocksize: int):
++        del blocksize
++        return CommandRecorder(self.command, samplerate, channels)
++
++
++# -----------------------------------------------------------------------------
+ 
+ 
+ async def main() -> None:
+@@ -53,6 +120,13 @@
+         help="Name for the audio input device (see --list-input-devices)",
+     )
+     parser.add_argument(
++        "--audio-input-command",
++        type=Path,
++        help=(
++            "Executable that emits mono 16 kHz S16LE microphone PCM on stdout"
++        ),
++    )
++    parser.add_argument(
+         "--list-input-devices",
+         action="store_true",
+         help="List audio input devices and exit",
+@@ -87,6 +161,45 @@
+         ),
+     )
+     parser.add_argument(
++        "--wake-input-gain-db",
++        type=float,
++        default=0.0,
++        help=(
++            "Fixed gain applied only to wake/stop-model feature extraction. "
++            "Command audio sent to Home Assistant remains byte-transparent."
++        ),
++    )
++    parser.add_argument(
++        "--wake-input-agc",
++        action="store_true",
++        help=(
++            "Normalise the wake/stop-model input level instead of applying a "
++            "fixed gain. Slow by design (see WakeInputAgc). Command audio sent "
++            "to Home Assistant remains byte-transparent either way."
++        ),
++    )
++    parser.add_argument(
++        "--wake-agc-target-dbfs",
++        type=float,
++        default=-12.0,
++        help="Peak level the wake-input AGC aims for (default: -12 dBFS).",
++    )
++    parser.add_argument(
++        "--wake-agc-max-gain-db",
++        type=float,
++        default=36.0,
++        help="Upper bound on wake-input AGC gain (default: 36 dB).",
++    )
++    parser.add_argument(
++        "--wake-agc-noise-ceiling-dbfs",
++        type=float,
++        default=-38.0,
++        help=(
++            "Do not amplify a room past this noise-floor level, so a quiet "
++            "room is not lifted until its own floor reaches the model."
++        ),
++    )
++    parser.add_argument(
+         "--audio-input-channels",
+         type=int,
+         default=1,
+@@ -258,6 +371,20 @@
+     )
+     args = parser.parse_args()
+ 
++    if not -24.0 <= args.wake_input_gain_db <= 24.0:
++        parser.error("--wake-input-gain-db must be between -24 and +24 dB")
++
++    if not -40.0 <= args.wake_agc_target_dbfs <= 0.0:
++        parser.error("--wake-agc-target-dbfs must be between -40 and 0 dBFS")
++    if not 0.0 <= args.wake_agc_max_gain_db <= 60.0:
++        parser.error("--wake-agc-max-gain-db must be between 0 and 60 dB")
++    if not -80.0 <= args.wake_agc_noise_ceiling_dbfs <= 0.0:
++        parser.error("--wake-agc-noise-ceiling-dbfs must be between -80 and 0 dBFS")
++    if args.wake_input_agc and args.wake_input_gain_db:
++        parser.error(
++            "--wake-input-agc replaces --wake-input-gain-db; pass only one"
++        )
++
+     if args.colored_debug:
+         args.debug = True
+         _setup_logging(args)
+@@ -338,7 +465,11 @@
+     args.download_dir.mkdir(parents=True, exist_ok=True)
+ 
+     # Resolve microphone
+-    if args.audio_input_device is not None:
++    if args.audio_input_command is not None:
++        if args.audio_input_device is not None:
++            parser.error("use only one of --audio-input-command/--audio-input-device")
++        mic = CommandMicrophone(args.audio_input_command)
++    elif args.audio_input_device is not None:
+         try:
+             args.audio_input_device = int(args.audio_input_device)
+         except ValueError:
+@@ -491,8 +622,32 @@
+         listen_during_wake_sound=args.listen_during_wake_sound,
+         processed_mic_input=bool(args.processed_mic_profile),
+         mic_input_profile=args.processed_mic_profile,
++        wake_input_gain=10.0 ** (args.wake_input_gain_db / 20.0),
++        wake_input_agc=(
++            {
++                "target_dbfs": args.wake_agc_target_dbfs,
++                "max_gain_db": args.wake_agc_max_gain_db,
++                "noise_ceiling_dbfs": args.wake_agc_noise_ceiling_dbfs,
++            }
++            if args.wake_input_agc
++            else None
++        ),
+     )
+ 
++    if args.wake_input_agc:
++        _LOGGER.info(
++            "Wake/stop-model input AGC: target %.1f dBFS, max %+.1f dB, "
++            "noise ceiling %.1f dBFS (command audio unchanged)",
++            args.wake_agc_target_dbfs,
++            args.wake_agc_max_gain_db,
++            args.wake_agc_noise_ceiling_dbfs,
++        )
++    elif args.wake_input_gain_db:
++        _LOGGER.info(
++            "Wake/stop-model input gain: %+.2f dB (command audio unchanged)",
++            args.wake_input_gain_db,
++        )
++
+     if fallback_used:
+         # Fallback to the default model was used, save as active wake words
+         _LOGGER.debug("Fallback was used, save default wake words in Preferences.")
+@@ -671,6 +826,92 @@
+ # -----------------------------------------------------------------------------
+ 
+ 
++class WakeInputAgc:
++    """Slow level normaliser for the wake/stop model input only.
++
++    The deployed microWakeWord model is strongly level dependent: on the
++    retained paired captures the same audio scores 2-3 of 6 at the level the
++    AFE actually delivers and 5-6 of 6 once its peak reaches roughly -20 to
++    -12 dBFS, with background false accepts unchanged at zero. A single fixed
++    gain cannot cover that, because the delivered level moves by 20 dB or more
++    between a near talker and a far one in a noisy room.
++
++    It must be slow. A fast AGC measurably makes things worse -- it moves
++    within a single "Alexa" and distorts the envelope the model keys on, which
++    scored 1 of 6 against 3 of 6 for a plain fixed gain. The defaults here move
++    at 1 dB/s upward and 3 dB/s downward, so the gain is effectively constant
++    across any one utterance and only tracks the room.
++
++    A noise-floor ceiling stops a quiet room from being amplified until its own
++    noise reaches the model. Command audio sent to Home Assistant never passes
++    through this; only the feature extractors see it.
++    """
++
++    def __init__(
++        self,
++        target_dbfs: float = -12.0,
++        max_gain_db: float = 36.0,
++        min_gain_db: float = 0.0,
++        noise_ceiling_dbfs: float = -38.0,
++        env_release_s: float = 20.0,
++        rise_db_s: float = 1.0,
++        fall_db_s: float = 3.0,
++        rate: int = 16000,
++    ) -> None:
++        self.target = (10.0 ** (target_dbfs / 20.0)) * 32768.0
++        self.ceiling = (10.0 ** (noise_ceiling_dbfs / 20.0)) * 32768.0
++        self.max_gain_db = max_gain_db
++        self.min_gain_db = min_gain_db
++        self.env_release_s = env_release_s
++        self.rise_db_s = rise_db_s
++        self.fall_db_s = fall_db_s
++        self.rate = rate
++        self.env = 0.0
++        self.noise = 1e-6
++        self.gain_db = min_gain_db
++        # Slewing up from 0 dB at 1 dB/s would leave the wake model starved
++        # for half a minute after every restart, so the first chunk seeds the
++        # gain outright and the slew limits only apply from then on.
++        self.primed = False
++
++    def process(self, chunk: bytes) -> bytes:
++        samples = np.frombuffer(chunk, dtype="<i2")
++        if samples.size == 0:
++            return chunk
++        dt = samples.size / float(self.rate)
++        peak = float(np.max(np.abs(samples.astype(np.int32))))
++        rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2))) + 1e-9
++
++        self.env = max(peak, self.env * math.exp(-dt / self.env_release_s))
++        # Slow-rising, fast-falling floor: it must follow a room getting
++        # quieter at once, but never chase speech upward.
++        if rms < self.noise:
++            self.noise = rms
++        else:
++            self.noise = min(rms, self.noise * math.exp(dt / self.env_release_s))
++
++        want = 20.0 * math.log10(self.target / max(self.env, 1e-6))
++        cap = 20.0 * math.log10(max(self.ceiling / max(self.noise, 1e-6), 1e-6))
++        want = min(want, cap, self.max_gain_db)
++        want = max(want, self.min_gain_db)
++
++        if self.primed:
++            step = (self.rise_db_s if want > self.gain_db else self.fall_db_s) * dt
++            self.gain_db += max(-step, min(step, want - self.gain_db))
++        else:
++            self.gain_db = want
++            self.primed = True
++
++        if abs(self.gain_db) < 0.05:
++            return chunk
++        scaled = np.clip(
++            np.rint(samples.astype(np.float32) * (10.0 ** (self.gain_db / 20.0))),
++            -32768.0,
++            32767.0,
++        ).astype("<i2")
++        return scaled.tobytes()
++
++
+ def process_audio(state: ServerState, mic, block_size: int):
+     """Process audio chunks from the microphone."""
+     n_channels = state.audio_input_channels
+@@ -685,27 +926,35 @@
+ 
+     last_active: Optional[float] = None
+     webrtc: Optional[WebRTCProcessor] = None
++    wake_agc: Optional[WakeInputAgc] = None
++    if state.wake_input_agc is not None:
++        wake_agc = WakeInputAgc(**state.wake_input_agc)
+ 
+     try:
+         _LOGGER.debug("Opening audio input device: %s", mic.name)
+         with mic.recorder(samplerate=16000, channels=n_channels, blocksize=block_size) as mic_in:
+             while True:
+-                # Shape: (block_size, n_channels) for stereo, (block_size, 1) for mono.
+-                raw = mic_in.record(block_size)  # float32, range [-1, 1]
+-                mic_vol_scalar = 1.0 if state.processed_mic_input else max(
+-                    0.1, min(1.0, state.mic_volume / 100.0)
+-                )
++                if hasattr(mic_in, "record_bytes"):
++                    # Biscuit's direct device path is already mono S16LE. Keep
++                    # its beamformer output byte-exact for both the wake model
++                    # and command stream; float round-tripping is unnecessary.
++                    channel_chunks = [mic_in.record_bytes(block_size)]
++                else:
++                    # Shape: (block_size, n_channels) for stereo, (block_size, 1) for mono.
++                    raw = mic_in.record(block_size)  # float32, range [-1, 1]
++                    mic_vol_scalar = 1.0 if state.processed_mic_input else max(
++                        0.1, min(1.0, state.mic_volume / 100.0)
++                    )
++                    # Build per-channel byte arrays. Channel 0 is the primary
++                    # microphone; channel 1 (when present) is the reference.
++                    channel_chunks = []
++                    for ch in range(n_channels):
++                        col = raw[:, ch] if n_channels > 1 else raw.reshape(-1)
++                        chunk = (np.clip(col * mic_vol_scalar, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
++                        channel_chunks.append(chunk)
+ 
+-                # Build per-channel byte arrays.  Channel 0 is the primary
+-                # microphone; channel 1 (when present) is the reference/speaker
+-                # feed used for server-side AEC.
+-                channel_chunks: list[bytes] = []
+-                for ch in range(n_channels):
+-                    col = raw[:, ch] if n_channels > 1 else raw.reshape(-1)
+-                    chunk = (np.clip(col * mic_vol_scalar, -1.0, 1.0) * 32767.0).astype("<i2").tobytes()
+-                    channel_chunks.append(chunk)
+-
+-                # Primary channel drives WebRTC and wake-word detection.
++                # Primary channel drives WebRTC and is the byte-transparent
++                # command stream sent to Home Assistant.
+                 audio_chunk = channel_chunks[0]
+                 agc = 0 if state.processed_mic_input else (state.preferences.mic_auto_gain or 0)
+                 ns = 0 if state.processed_mic_input else (state.preferences.mic_noise_suppression or 0)
+@@ -719,6 +968,25 @@
+                     if not audio_chunk:
+                         continue
+ 
++                # The deployed wake model needs a different presentation level
++                # from stock's proprietary classifier. Keep that calibration at
++                # the model boundary: never raise the AFE/command stream or feed
++                # the scaled samples back into AEC. This is a fixed model input
++                # mapping, not AGC, and the explicit clip makes overflow safe.
++                wake_audio_chunk = audio_chunk
++                if wake_agc is not None:
++                    wake_audio_chunk = wake_agc.process(audio_chunk)
++                elif state.wake_input_gain != 1.0:
++                    wake_samples = np.frombuffer(audio_chunk, dtype="<i2").astype(
++                        np.float32
++                    )
++                    wake_samples = np.clip(
++                        np.rint(wake_samples * state.wake_input_gain),
++                        -32768.0,
++                        32767.0,
++                    ).astype("<i2")
++                    wake_audio_chunk = wake_samples.tobytes()
++
+                 # WAKE WORD
+                 if (not wake_words) or (state.wake_words_changed and state.wake_words):
+                     # Update list of wake word models to process
+@@ -811,12 +1079,16 @@
+ 
+                     assert micro_features is not None
+                     micro_inputs.clear()
+-                    micro_inputs.extend(micro_features.process_streaming(audio_chunk))
++                    micro_inputs.extend(
++                        micro_features.process_streaming(wake_audio_chunk)
++                    )
+ 
+                     if has_oww:
+                         assert oww_features is not None
+                         oww_inputs.clear()
+-                        oww_inputs.extend(oww_features.process_streaming(audio_chunk))
++                        oww_inputs.extend(
++                            oww_features.process_streaming(wake_audio_chunk)
++                        )
+ 
+                     for wake_word_index, wake_word in enumerate(wake_words):
+                         activated = False
+@@ -894,7 +1166,19 @@
+                     _LOGGER.exception("Unexpected error handling audio")
+     except Exception:  # pylint: disable=broad-except
+         _LOGGER.exception("Unexpected error processing audio")
+-        sys.exit(1)
++        # process_audio runs in a daemon thread, where sys.exit() raises
++        # SystemExit that threading catches to end *only this thread*.  The
++        # process then stays up looking perfectly healthy - Home Assistant
++        # connected, every entity answering, commands accepted - while nothing
++        # consumes the microphone.  The device is permanently deaf and says so
++        # nowhere.  Observed live: the wake counter froze while the capture
++        # chain and API both looked fine.
++        #
++        # Take the whole process down instead.  supervise-daemon runs this with
++        # respawn_delay=5 and respawn_max=0, so it comes straight back with a
++        # fresh capture command, which is what the original sys.exit() intended.
++        logging.shutdown()
++        os._exit(1)
+ 
+ 
+ # -----------------------------------------------------------------------------
+--- a/linux_voice_assistant/models.py	2026-09-02 16:51:17.190380000 -0400
++++ b/linux_voice_assistant/models.py	2026-09-02 16:51:17.323989200 -0400
+@@ -250,6 +250,12 @@
+     listen_during_wake_sound: bool = False
+     processed_mic_input: bool = False
+     mic_input_profile: Optional[str] = None
++    # Fixed classifier-front-end calibration. The Home Assistant command
++    # stream always retains the byte-transparent AFE level.
++    wake_input_gain: float = 1.0
++    # None keeps the fixed-gain behaviour; a dict of WakeInputAgc kwargs
++    # switches the wake/stop-model branch to level normalisation.
++    wake_input_agc: Optional[Dict[str, float]] = None
+ 
+     def broadcast(self, msgs: "Iterable[message.Message]") -> None:
+         """Send messages to every connected API client.

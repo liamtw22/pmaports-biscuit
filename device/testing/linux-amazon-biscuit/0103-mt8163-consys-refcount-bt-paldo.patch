@@ -1,0 +1,72 @@
+Refcount the CONSYS BT PALDO, which has two users.
+
+mt8163_consys_bt_paldo_set() is reached from two independent drivers. The
+Bluetooth side takes VCN33_BT when the chip is powered and holds it for as long
+as the link exists. The WLAN driver takes the same rail: the vendor's
+mtk_wcn_consys_hw_wifi_paldo_ctrl() is a one-line wrapper around the Bluetooth
+PALDO call, and our glue mirrors that, so HifAhbProbe() enables it and the WLAN
+power-down path disables it again.
+
+mt8163_consys_enable_supply() records state in a bool. The second enable is
+therefore a no-op, and the first disable calls regulator_disable() outright -
+so unloading the WLAN driver drops the rail while Bluetooth is still using it.
+
+Counting users at this entry point fixes that without disturbing the internal
+CONSYS power sequence, which has its own ordering requirements and keeps the
+existing bool semantics.
+
+Found by inspection while tracing a CONSYS firmware assert; the assert turned
+out to have another cause, but this is a real fault on the WLAN cleanup path.
+
+diff -urN a/drivers/misc/mt8163-consys.c b/drivers/misc/mt8163-consys.c
+--- a/drivers/misc/mt8163-consys.c	2026-08-14 15:24:58.921098765 +0000
++++ b/drivers/misc/mt8163-consys.c	2026-08-14 15:24:58.921641377 +0000
+@@ -172,6 +172,11 @@
+ 	spinlock_t mpu_lock;
+ 	struct regulator_bulk_data supplies[MT8163_CONSYS_NUM_SUPPLIES];
+ 	bool supply_enabled[MT8163_CONSYS_NUM_SUPPLIES];
++	/*
++	 * External users of the BT PALDO. Bluetooth and WLAN share this rail;
++	 * see mt8163_consys_bt_paldo_set().
++	 */
++	unsigned int bt_paldo_users;
+ 	phys_addr_t emi_base;
+ 	phys_addr_t emi_size;
+ 	void __iomem *emi_shared;
+@@ -675,11 +680,31 @@
+ 		goto out;
+ 	}
+ 
+-	if (on)
+-		ret = mt8163_consys_enable_supply(priv, MT8163_CONSYS_VCN33_BT,
+-						  3300000);
+-	else
+-		mt8163_consys_disable_supply(priv, MT8163_CONSYS_VCN33_BT);
++	/*
++	 * Refcounted, because this rail has two independent users. Bluetooth
++	 * takes it when the chip is brought up and holds it for the life of
++	 * the link; the WLAN driver takes the same rail through
++	 * mtk_wcn_consys_hw_wifi_paldo_ctrl(), which is a straight wrapper
++	 * around this call in the vendor tree, and releases it on its cleanup
++	 * path. mt8163_consys_enable_supply() tracks a plain bool, so without
++	 * a count the second enable is a no-op and the first disable takes the
++	 * rail out from under whoever still needs it - which shows up as
++	 * Bluetooth dying when the WLAN driver unloads.
++	 */
++	if (on) {
++		if (priv->bt_paldo_users == 0) {
++			ret = mt8163_consys_enable_supply(priv,
++							  MT8163_CONSYS_VCN33_BT,
++							  3300000);
++			if (ret)
++				goto out;
++		}
++		priv->bt_paldo_users++;
++	} else if (priv->bt_paldo_users > 0) {
++		if (--priv->bt_paldo_users == 0)
++			mt8163_consys_disable_supply(priv,
++						     MT8163_CONSYS_VCN33_BT);
++	}
+ out:
+ 	mutex_unlock(&priv->state_lock);
+ 	return ret;

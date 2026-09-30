@@ -1,0 +1,312 @@
+#!/sbin/openrc-run
+description="Configure USB RNDIS networking on the MT8163 MUSB UDC"
+
+G=/sys/kernel/config/usb_gadget/biscuit-rndis
+OLD_G=/sys/kernel/config/usb_gadget/g1
+DHCP_TEMPLATE=/usr/share/biscuit/udhcpd-usb.conf
+DHCP_CONF=/run/udhcpd-usb.conf
+
+depend() {
+	need dev
+	after modules
+	before sshd
+}
+
+clear_duplicate_usb_addresses() {
+	# Our address belongs on exactly one interface.
+	#
+	# pmOS's initramfs puts 172.16.42.1/24 on its own g1 ncm netdev, and on this
+	# device that is usb0 while ours is usb1. This used to be cleaned up before
+	# the gadget was composed, which works on a restart and NOT on a cold boot:
+	# measured after a real reboot, usb0 still had the address, so two interfaces
+	# in one subnet were answering for it. Running it last, after the mode is
+	# composed and everything has settled, is what makes it hold.
+	_keep=$1
+	[ -n "$_keep" ] || return 0
+	for path in /sys/class/net/usb*; do
+		[ -e "$path" ] || continue
+		candidate="${path##*/}"
+		[ "$candidate" = "$_keep" ] && continue
+		if ip addr del 172.16.42.1/24 dev "$candidate" 2>/dev/null; then
+			einfo "Removed a duplicate 172.16.42.1 from $candidate"
+		fi
+	done
+}
+
+start_usb_dhcp() {
+	# Hand the host an address. Without this the computer needs a static IP set
+	# by hand, which needs administrator rights on Windows and does not survive
+	# the adapter being reset - and it did not survive: mid-session Windows reset
+	# the adapter, the address vanished and the link went with it.
+	#
+	# The config was written for this months ago and then never packaged: nothing
+	# installed it, nothing substituted @IFACE@ and nothing started the daemon.
+	# The recorded diagnosis - that Windows' DISCOVER broadcasts were not reaching
+	# the device, probably an RNDIS packet filter - came from reading a udhcpd log
+	# that had no DISCOVER in it because no udhcpd was running. Measured after
+	# this landed: 112 packets received in 8 s and 172.16.42.2 answers ping, so
+	# the link carries traffic in both directions perfectly well.
+	#
+	# One lease, no router option and no DNS, so the cable cannot take over the
+	# host's networking.
+	#
+	# Called LAST, after any USB mode has been composed: a mode change can create
+	# a different netdev, and a DHCP server left bound to the old name serves
+	# nobody while looking like it is running.
+	_iface=$1
+	[ -n "$_iface" ] || return 0
+	if [ ! -r "$DHCP_TEMPLATE" ] || ! command -v udhcpd >/dev/null 2>&1; then
+		ewarn "no USB DHCP template at $DHCP_TEMPLATE; the host needs a static address"
+		return 0
+	fi
+	for _pid in /run/udhcpd.usb*.pid; do
+		[ -e "$_pid" ] || continue
+		start-stop-daemon --stop --quiet --pidfile "$_pid" 2>/dev/null || :
+		rm -f "$_pid"
+	done
+	mkdir -p /var/lib/misc
+	: > /var/lib/misc/udhcpd."$_iface".leases
+	sed "s/@IFACE@/$_iface/g" "$DHCP_TEMPLATE" > "$DHCP_CONF"
+	if start-stop-daemon --start --quiet --exec /usr/sbin/udhcpd -- -S "$DHCP_CONF"; then
+		einfo "USB DHCP serving 172.16.42.2 on $_iface"
+	else
+		ewarn "could not start udhcpd on $_iface"
+	fi
+}
+
+start() {
+	ebegin "Configuring USB RNDIS gadget"
+
+	mkdir -p /sys/kernel/config
+	if ! grep -qs ' /sys/kernel/config configfs ' /proc/mounts; then
+		mount -t configfs none /sys/kernel/config || {
+			eend 1
+			return 1
+		}
+	fi
+
+	# pmOS may have configured its generic g1 gadget in the initramfs. Release
+	# that UDC before binding Biscuit's separate gadget.
+	#
+	# Only when it actually holds one. Writing to an already-empty UDC returns 1,
+	# and this used to treat that as fatal - so the service started exactly once
+	# per boot and every `rc-service usb-rndis restart` afterwards died here,
+	# before binding anything. That is the same symptom as the recorded USB fault:
+	# the link goes away when the host resets the adapter and cannot be brought
+	# back without rebooting the device.
+	if [ -e "$OLD_G/UDC" ] && [ -n "$(cat "$OLD_G/UDC" 2>/dev/null)" ]; then
+		printf '\n' > "$OLD_G/UDC" || {
+			eerror "could not release the UDC from the generic g1 gadget"
+			eend 1
+			return 1
+		}
+	fi
+
+	mkdir -p "$G"
+	printf '%s' 0x1d6b > "$G/idVendor"
+	printf '%s' 0x0104 > "$G/idProduct"
+	printf '%s' 0x0200 > "$G/bcdUSB"
+	printf '%s' 0x0100 > "$G/bcdDevice"
+	printf '%s' 0xef > "$G/bDeviceClass"
+	printf '%s' 0x02 > "$G/bDeviceSubClass"
+	printf '%s' 0x01 > "$G/bDeviceProtocol"
+
+	mkdir -p "$G/strings/0x409"
+	printf '%s' Biscuit > "$G/strings/0x409/manufacturer"
+	printf '%s' 'Echo Dot 2 USB Network' > "$G/strings/0x409/product"
+	printf '%s' biscuit-rndis > "$G/strings/0x409/serialnumber"
+
+	mkdir -p "$G/configs/c.1/strings/0x409"
+	printf '%s' 120 > "$G/configs/c.1/MaxPower"
+	printf '%s' 'RNDIS network' > "$G/configs/c.1/strings/0x409/configuration"
+
+	mkdir -p "$G/functions/rndis.usb0"
+	printf '%s' 02:16:42:00:00:01 > "$G/functions/rndis.usb0/dev_addr"
+	printf '%s' 02:16:42:00:00:02 > "$G/functions/rndis.usb0/host_addr"
+	if [ ! -L "$G/configs/c.1/rndis.usb0" ]; then
+		( cd "$G" && ln -s functions/rndis.usb0 configs/c.1 ) || {
+			eend 1
+			return 1
+		}
+	fi
+
+	printf '%s' 1 > "$G/os_desc/use"
+	printf '%s' 0xcd > "$G/os_desc/b_vendor_code"
+	printf '%s' MSFT100 > "$G/os_desc/qw_sign"
+	printf '%s' RNDIS > \
+		"$G/functions/rndis.usb0/os_desc/interface.rndis/compatible_id"
+	printf '%s' 5162001 > \
+		"$G/functions/rndis.usb0/os_desc/interface.rndis/sub_compatible_id"
+	if [ ! -L "$G/os_desc/c.1" ]; then
+		( cd "$G" && ln -s configs/c.1 os_desc ) || {
+			eend 1
+			return 1
+		}
+	fi
+
+	if [ -e "$OLD_G/UDC" ] && [ -n "$(cat "$OLD_G/UDC")" ]; then
+	        eerror "generic g1 still owns UDC: $(cat "$OLD_G/UDC")"
+	        eend 1
+	        return 1
+	fi
+
+	# Charging only, the default since r272, binds nothing: the computer sees
+	# no device, and g1 was released above. The gadget itself is still built,
+	# because biscuit-usbmode only recomposes an existing gadget; without it,
+	# every mode chosen later on the settings page's USB panel failed. The
+	# check comes BEFORE binding, since binding and then unbinding would flash
+	# an RNDIS adapter on the host at every boot.
+	if [ -x /usr/bin/biscuit-usbmode ] && [ "$(/usr/bin/biscuit-usbmode get)" = power ]; then
+		einfo "USB mode: charging only; gadget built but not bound"
+		eend 0
+		return 0
+	fi
+	# Audio without the network: compose it directly. Binding the network
+	# function first, as below, would show the computer an adapter for a
+	# moment and serve DHCP on a link that is about to go away.
+	if [ -x /usr/bin/biscuit-usbmode ] && ! /usr/bin/biscuit-usbmode wants net; then
+		einfo "USB mode: $(/usr/bin/biscuit-usbmode get), without the network"
+		if ! /usr/bin/biscuit-usbmode apply; then
+			ewarn "USB audio did not compose; left on the network"
+		fi
+		eend 0
+		return 0
+	fi
+
+	RNDIS_NET_BEFORE=
+	for path in /sys/class/net/usb*; do
+	        [ -e "$path" ] || continue
+	        RNDIS_NET_BEFORE="$RNDIS_NET_BEFORE ${path##*/}"
+	done
+
+	UDC=
+	attempt=0
+	while [ "$attempt" -lt 20 ]; do
+	        attempt=$((attempt + 1))
+	        set -- /sys/class/udc/*
+	        if [ -e "$1" ]; then
+	                candidate="${1##*/}"
+	                printf '%s' "$candidate" > "$G/UDC" || true
+	                if [ "$(cat "$G/UDC")" = "$candidate" ]; then
+	                        UDC="$candidate"
+	                        break
+	                fi
+	        fi
+	        sleep 1
+	done
+
+	if [ -z "$UDC" ]; then
+	        eerror "No usable UDC after 20 seconds"
+	        eend 1
+	        return 1
+	fi
+	einfo "USB RNDIS bound to UDC: $UDC"
+	# Which netdev is ours.
+	#
+	# configfs publishes it: the function directory carries an ifname the kernel
+	# filled in when it created the device. Ask that first, because the previous
+	# rule - whichever usb* interface appeared AFTER binding - is only true on a
+	# cold start. On a restart both interfaces already exist, so nothing is new,
+	# and the fallback picked usb* in readdir order. That is usb0, which on this
+	# device belongs to the leftover g1 ncm function and has NO CARRIER: the
+	# service then moved the address off the live link onto a dead one and served
+	# DHCP there.
+	#
+	# Second choice is the MAC we set ourselves in dev_addr, which is also exact.
+	# The appearance heuristic is kept last, for a kernel that fills in neither.
+	RNDIS_NET=$(cat "$G/functions/rndis.usb0/ifname" 2>/dev/null)
+	if [ -n "$RNDIS_NET" ] && [ ! -e "/sys/class/net/$RNDIS_NET" ]; then
+		RNDIS_NET=
+	fi
+	if [ -z "$RNDIS_NET" ]; then
+		for path in /sys/class/net/usb*; do
+			[ -e "$path/address" ] || continue
+			if [ "$(cat "$path/address")" = 02:16:42:00:00:01 ]; then
+				RNDIS_NET="${path##*/}"
+				break
+			fi
+		done
+	fi
+	if [ -z "$RNDIS_NET" ]; then
+		for path in /sys/class/net/usb*; do
+			[ -e "$path" ] || continue
+			candidate="${path##*/}"
+			case " $RNDIS_NET_BEFORE " in
+				*" $candidate "*) ;;
+				*) RNDIS_NET="$candidate"; break ;;
+			esac
+		done
+	fi
+	if [ -z "$RNDIS_NET" ]; then
+		eerror "No USB network interface appeared after RNDIS binding"
+		eend 1
+		return 1
+	fi
+
+
+	ip link set dev "$RNDIS_NET" up
+	ip addr replace 172.16.42.1/24 dev "$RNDIS_NET"
+	einfo "USB RNDIS network ready: $RNDIS_NET at 172.16.42.1/24"
+
+	# There used to be a second, hardcoded `ip link set usb0 up` here putting the
+	# same address on usb0 whatever RNDIS_NET turned out to be. On this device the
+	# kernel allocates usb0 to the leftover g1 ncm function and usb1 to our rndis
+	# one, so that line addressed the interface with NO CARRIER and created a
+	# second route for 172.16.42.0/24 out of a dead netdev. Detecting the
+	# interface and then ignoring the answer is worse than not detecting it.
+
+
+	# If a USB mode other than plain network was chosen, re-compose the
+	# gadget now. This runs AFTER the network gadget is up and bound, so
+	# the network path above is still the fallback: if biscuit-usbmode
+	# cannot build the requested mode it restores network-only by itself.
+	# Charging only never gets here; it returned before the gadget was built.
+	if [ -x /usr/bin/biscuit-usbmode ]; then
+		mode=$(/usr/bin/biscuit-usbmode get)
+		if [ -n "$mode" ] && [ "$mode" != net ]; then
+			einfo "Applying USB mode: $mode"
+			if ! /usr/bin/biscuit-usbmode apply; then
+				ewarn "USB mode $mode failed; left on network"
+			fi
+		fi
+	fi
+
+	# After usbmode, and re-read from configfs in case it recomposed.
+	_dhcp_iface=$(cat "$G/functions/rndis.usb0/ifname" 2>/dev/null)
+	[ -n "$_dhcp_iface" ] || _dhcp_iface=$RNDIS_NET
+	clear_duplicate_usb_addresses "$_dhcp_iface"
+	start_usb_dhcp "$_dhcp_iface"
+	eend 0
+}
+
+stop() {
+	ebegin "Unbinding USB RNDIS gadget"
+	for _pid in /run/udhcpd.usb*.pid; do
+		[ -e "$_pid" ] || continue
+		start-stop-daemon --stop --quiet --pidfile "$_pid" 2>/dev/null || :
+		rm -f "$_pid"
+	done
+	# Release the controller for real. The old `printf '%s' ''` was a zero-byte
+	# write, which never reaches configfs's store method, so the gadget stayed
+	# bound. That did not matter while stop only ran at shutdown; biscuit-usbmode
+	# now restarts this service to change mode, and a restart into charging
+	# only stayed connected.
+	if [ -e "$G/UDC" ] && [ -n "$(cat "$G/UDC" 2>/dev/null)" ]; then
+		printf '\n' > "$G/UDC" 2>/dev/null || :
+		sleep 1
+	fi
+	# Keep only the network function, so the next start composes the chosen
+	# mode from a clean gadget: a stale uac2 link otherwise survived a switch
+	# to network. biscuit-usbmode adds the audio function back when wanted.
+	for _l in "$G"/configs/c.1/*.*; do
+		[ -L "$_l" ] || continue
+		case "$_l" in */rndis.usb0) continue ;; esac
+		rm -f "$_l"
+	done
+	for _f in "$G"/functions/*.*; do
+		[ -d "$_f" ] || continue
+		case "$_f" in */rndis.usb0) continue ;; esac
+		rmdir "$_f" 2>/dev/null || :
+	done
+	eend 0
+}

@@ -1,0 +1,191 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -1621,36 +1621,55 @@
+ 	return 0;
+ }
+ 
+-static int mt8163_stp_probe(struct platform_device *pdev)
++/*
++ * Stock's CONSYS bring-up is not expected to succeed on the first attempt: a
++ * healthy stock boot logs "do common driver init failed, ret:-1" and a chip-ID
++ * read of 0x00000000, then retries for about sixteen seconds before Wi-Fi
++ * appears.  This bring-up used to be single-shot, so one transient WMT failure
++ * left the controller down until the device was power-cycled.
++ *
++ * mt8163_stp_wmt_xfer_mask() already retries an individual transfer, but only
++ * once the link is in full STP mode; bootstrap opens in mandatory mode, so its
++ * first exchanges had no cover at all.
++ *
++ * A partly-completed bootstrap can leave the controller framed in STP mode, so
++ * re-running the WMT exchange in place would fail deterministically.  Every
++ * attempt therefore starts from a genuine CONSYS power cycle.
++ */
++#define MT8163_STP_BRINGUP_ATTEMPTS	3
++#define MT8163_STP_BRINGUP_BACKOFF_MS	200
++
++static void mt8163_stp_bringup_unwind(struct mt8163_stp *stp)
+ {
+-	struct mt8163_stp *stp;
+-	struct device *btif_dev;
+-	int ret;
++	/* Finish the bounded EMI/DLM snapshot before CONSYS is powered down. */
++	flush_work(&stp->assert_diag_work);
++	if (stp->bt_paldo_enabled) {
++		mt8163_consys_bt_paldo_set(stp->consys_dev, false);
++		stp->bt_paldo_enabled = false;
++	}
++	if (stp->btif) {
++		mt8163_btif_unregister_client(stp->btif, &stp->btif_client);
++		mt8163_btif_stop(stp->btif);
++		stp->btif = NULL;
++	}
++	mt8163_consys_release(stp->consys_dev);
+ 
+-	stp = devm_kzalloc(&pdev->dev, sizeof(*stp), GFP_KERNEL);
+-	if (!stp)
+-		return -ENOMEM;
+-	stp->dev = &pdev->dev;
+-	spin_lock_init(&stp->rx_lock);
+-	spin_lock_init(&stp->wmt_lock);
+-	mutex_init(&stp->tx_lock);
+-	init_completion(&stp->wmt_done);
+-	INIT_WORK(&stp->rx_work, mt8163_stp_rx_work);
+-	INIT_WORK(&stp->tx_work, mt8163_stp_tx_work);
+-	INIT_WORK(&stp->assert_diag_work, mt8163_stp_assert_diag_work);
+-	skb_queue_head_init(&stp->txq);
++	/* Drop anything the failed attempt left in flight. */
++	cancel_work_sync(&stp->rx_work);
++	cancel_work_sync(&stp->tx_work);
++	skb_queue_purge(&stp->txq);
++	kfifo_reset(&stp->rx_fifo);
++}
+ 
+-	ret = kfifo_alloc(&stp->rx_fifo, MT8163_STP_RX_FIFO_SIZE, GFP_KERNEL);
+-	if (ret)
+-		return ret;
++static int mt8163_stp_bringup(struct mt8163_stp *stp,
++			      struct platform_device *pdev)
++{
++	struct device *btif_dev;
++	int ret;
+ 
+-	ret = mt8163_stp_get_phandle_device(&pdev->dev, "mediatek,consys",
+-					    &stp->consys_dev);
+-	if (ret)
+-		goto err_fifo;
+ 	ret = mt8163_consys_acquire(stp->consys_dev);
+ 	if (ret)
+-		goto err_consys_dev;
++		return ret;
+ 
+ 	/*
+ 	 * Stock Biscuit leaves about 77 ms between CONSYS chip-ID readiness
+@@ -1675,38 +1694,89 @@
+ 
+ 	/* CONSYS now owns and powers BTIF/APDMA; hardware setup is safe here. */
+ 	ret = mt8163_btif_start(stp->btif);
+-	if (ret)
++	if (ret) {
++		stp->btif = NULL;
+ 		goto err_consys;
++	}
+ 
+ 	stp->btif_client.receive = mt8163_stp_receive;
+ 	stp->btif_client.data = stp;
+ 	ret = mt8163_btif_register_client(stp->btif, &stp->btif_client);
+-	if (ret)
+-		goto err_btif;
++	if (ret) {
++		mt8163_btif_stop(stp->btif);
++		stp->btif = NULL;
++		goto err_consys;
++	}
+ 
+ 	ret = mt8163_stp_bootstrap(stp);
++	if (ret) {
++		mt8163_stp_bringup_unwind(stp);
++		return ret;
++	}
++
++	return 0;
++
++err_consys:
++	mt8163_consys_release(stp->consys_dev);
++	return ret;
++}
++
++static int mt8163_stp_probe(struct platform_device *pdev)
++{
++	struct mt8163_stp *stp;
++	unsigned int attempt;
++	int ret;
++
++	stp = devm_kzalloc(&pdev->dev, sizeof(*stp), GFP_KERNEL);
++	if (!stp)
++		return -ENOMEM;
++	stp->dev = &pdev->dev;
++	spin_lock_init(&stp->rx_lock);
++	spin_lock_init(&stp->wmt_lock);
++	mutex_init(&stp->tx_lock);
++	init_completion(&stp->wmt_done);
++	INIT_WORK(&stp->rx_work, mt8163_stp_rx_work);
++	INIT_WORK(&stp->tx_work, mt8163_stp_tx_work);
++	INIT_WORK(&stp->assert_diag_work, mt8163_stp_assert_diag_work);
++	skb_queue_head_init(&stp->txq);
++
++	ret = kfifo_alloc(&stp->rx_fifo, MT8163_STP_RX_FIFO_SIZE, GFP_KERNEL);
+ 	if (ret)
+-		goto err_client;
+-	ret = mt8163_stp_hci_register(stp);
++		return ret;
++
++	ret = mt8163_stp_get_phandle_device(&pdev->dev, "mediatek,consys",
++					    &stp->consys_dev);
+ 	if (ret)
+-		goto err_client;
++		goto err_fifo;
++	for (attempt = 1; ; attempt++) {
++		ret = mt8163_stp_bringup(stp, pdev);
++		if (!ret)
++			break;
++		/* A missing BTIF is a dependency problem, not a flaky one. */
++		if (ret == -EPROBE_DEFER)
++			goto err_consys_dev;
++		if (attempt >= MT8163_STP_BRINGUP_ATTEMPTS) {
++			dev_err(&pdev->dev,
++				"CONSYS bring-up failed after %u attempts (%d)\n",
++				attempt, ret);
++			goto err_consys_dev;
++		}
++		dev_warn(&pdev->dev,
++			 "CONSYS bring-up attempt %u failed (%d); power-cycling and retrying\n",
++			 attempt, ret);
++		msleep(MT8163_STP_BRINGUP_BACKOFF_MS * attempt);
++	}
++
++	ret = mt8163_stp_hci_register(stp);
++	if (ret) {
++		mt8163_stp_bringup_unwind(stp);
++		goto err_consys_dev;
++	}
+ 
+ 	platform_set_drvdata(pdev, stp);
+ 	dev_info(&pdev->dev, "Bluetooth HCI registered after WMT bootstrap\n");
+ 	return 0;
+ 
+-err_client:
+-	/* Finish the bounded EMI/DLM snapshot before CONSYS is powered down. */
+-	flush_work(&stp->assert_diag_work);
+-	if (stp->bt_paldo_enabled) {
+-		mt8163_consys_bt_paldo_set(stp->consys_dev, false);
+-		stp->bt_paldo_enabled = false;
+-	}
+-	mt8163_btif_unregister_client(stp->btif, &stp->btif_client);
+-err_btif:
+-	mt8163_btif_stop(stp->btif);
+-err_consys:
+-	mt8163_consys_release(stp->consys_dev);
+ err_consys_dev:
+ 	put_device(stp->consys_dev);
+ err_fifo:

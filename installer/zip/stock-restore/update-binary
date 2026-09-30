@@ -1,0 +1,103 @@
+#!/sbin/sh
+# amazon-biscuit-stock-restore: take an Echo back from postmarketOS to Fire OS 6.
+#
+# Restores, from this Echo's backup (made by amazon-biscuit-backup):
+#   the stock amonet v2 partition table (system_a, system_b, cache, userdata)
+#   persist, boot_a, boot_b and misc as they were before postmarketOS
+# and clears system_a, system_b, cache and userdata. Fire OS itself is then
+# installed the way amonet's own guide does it, from Amazon's Fire OS 6 update
+# (the steps are printed at the end). amonet's bootloaders, kaeru and TWRP are
+# left as they are, so the Echo stays unlocked.
+#
+# On postmarketOS's layout TWRP has no /sdcard, so push the backup first:
+#   adb push biscuit-backup/<serial> /tmp/biscuit-backup/<serial>
+
+OUTFD=$2
+ZIP=$3
+WORK=/dev/tmp/biscuit
+LOG=/tmp/biscuit-stock-restore.log
+rm -rf $WORK
+mkdir -p $WORK
+: > $LOG
+# TWRP's unzip ignores wildcards - it extracts nothing and still succeeds -
+# so every member is named.
+ok=1
+unzip -o "$ZIP" zip.prop bin/busybox bin/biscuit-tool common/functions.sh -d $WORK >> $LOG 2>&1 || ok=0
+for f in zip.prop bin/busybox bin/biscuit-tool common/functions.sh; do [ -s $WORK/$f ] || ok=0; done
+[ $ok = 1 ] || { echo -e "ui_print (!) Could not unpack the zip\nui_print" >> /proc/self/fd/$OUTFD; exit 1; }
+chmod 755 $WORK/bin/*
+. $WORK/common/functions.sh
+fix_outfd
+
+banner
+check_device
+read_layout
+case "$KIND" in
+	v2_merged_geometry|v2_merged_without_stubs) ;;
+	v2_stock_geometry) abort "This Echo already has the stock layout. Install Fire OS 6 with amonet's guide." ;;
+	*) abort "The partition table is '$KIND'; not restoring over an unknown layout." ;;
+esac
+
+BACKUP=$(find_backup) ||
+	abort "No backup in /tmp. Push it first: adb push biscuit-backup/$SERIAL /tmp/biscuit-backup/$SERIAL"
+ui_print "Checking the backup in $BACKUP ..."
+verify_backup "$BACKUP"
+for f in gpt-head.bin gpt-tail.bin persist.img boot_a.img boot_b.img misc.img; do
+	[ -f "$BACKUP/raw/$f" ] || abort "The backup has no raw/$f."
+done
+
+# The saved table must be the stock one, and for a disk of exactly this size.
+# A sparse stand-in for the disk. Its size comes from the tail's seek, not from
+# truncate: TOTAL * 512 passes 2 GiB, and TWRP's sh does 32-bit arithmetic.
+rm -f $WORK/disk.img
+$BB dd if="$BACKUP/raw/gpt-head.bin" of=$WORK/disk.img conv=notrunc 2>>$LOG
+$BB dd if="$BACKUP/raw/gpt-tail.bin" of=$WORK/disk.img bs=512 seek=$((TOTAL - 33)) conv=notrunc 2>>$LOG
+saved=$($BT gpt-kind $WORK/disk.img 2>&1)
+rm -f $WORK/disk.img
+case "$saved" in
+	"v2_stock_geometry $TOTAL "*) ;;
+	*) abort "The backed-up table is not the stock layout for this disk ($saved)." ;;
+esac
+
+ui_print " "
+ui_print "Restoring the stock layout. Do not unplug the Echo."
+unmount_all
+write_range "$BACKUP/raw/gpt-tail.bin" $((TOTAL - 33))
+write_range "$BACKUP/raw/gpt-head.bin" 0
+sync
+read_layout
+[ "$KIND" = v2_stock_geometry ] || abort "The partition table reads back as '$KIND'."
+$BB blockdev --rereadpt $DISK >> $LOG 2>&1
+
+for name in persist boot_a boot_b misc; do
+	ui_print "Restoring $name ..."
+	set -- $(prefix_range $name)
+	write_range "$BACKUP/raw/$name.img" $1
+done
+
+ui_print "Clearing system, cache and userdata (about 3 minutes) ..."
+span=$((LAST + 1 - MERGED_FIRST))
+mib=$((span / 2048))
+$BB dd if=/dev/zero of=$DISK bs=1048576 seek=$((MERGED_FIRST / 2048)) count=$mib conv=notrunc,fsync 2>>$LOG ||
+	abort "Could not clear the old postmarketOS area."
+rest=$((span - mib * 2048))
+[ $rest = 0 ] || $BB dd if=/dev/zero of=$DISK bs=512 seek=$((MERGED_FIRST + mib * 2048)) count=$rest conv=notrunc,fsync 2>>$LOG
+sync
+
+ui_print " "
+ui_print "The stock layout and this Echo's own partitions are back."
+# userdata is now zeroes: it has no filesystem, so TWRP has no /sdcard until
+# "format data" makes one ("wipe data" expects one it can mount). The update
+# goes to /tmp, which a restart of TWRP empties, so it is pushed each time.
+ui_print "Now install Fire OS 6 as amonet's guide does, from Amazon's update:"
+ui_print "  adb reboot recovery"
+ui_print "  adb shell twrp wipe cache"
+ui_print "  adb shell twrp format data"
+ui_print "  adb push update-kindle-biscuit_<version>.bin /tmp/update.zip"
+ui_print "  adb shell twrp install /tmp/update.zip"
+ui_print "  adb reboot recovery"
+ui_print "  adb push update-kindle-biscuit_<version>.bin /tmp/update.zip"
+ui_print "  adb shell twrp install /tmp/update.zip"
+ui_print "  adb reboot"
+ui_print "(Twice, because the Echo has two system slots.)"
+exit 0

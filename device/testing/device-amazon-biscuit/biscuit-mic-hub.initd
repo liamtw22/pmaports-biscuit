@@ -1,0 +1,28 @@
+#!/sbin/openrc-run
+name="biscuit-mic-hub"
+description="Shared microphone capture with separate assistant and call processing"
+# Keep audio off CPU 0, which handles USB/SPI interrupt bursts.
+# Apply before exec so supervised replacements and pump children inherit it.
+command="/usr/bin/taskset"
+command_args="-c 1-3 /usr/bin/chrt -f 44 /usr/bin/python3 /usr/bin/biscuit-mic-hub.py"
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+output_log="/var/log/biscuit-mic-hub.log"
+error_log="/var/log/biscuit-mic-hub.log"
+depend() {
+    need biscuit-dsp biscuit-audio biscuit-mic-coeff biscuit-audio-clock
+    after biscuit-persist
+}
+start_pre() {
+    checkpath -d -m 0750 -o root:root /run/biscuit-mic
+    # Re-link any owner-imported stock assets before the chain looks for them.
+    # An upgrade replaces /usr/share/biscuit and takes the links with it, and
+    # the install script that should have re-made them is not something to rely
+    # on here - post-install does not run on upgrades, and this device's has
+    # already shipped once exiting before most of its own work. A no-op when
+    # nothing is imported; never fatal, because the chain falls back cleanly.
+    if [ -x /usr/bin/biscuit-import-assets ]; then
+        /usr/bin/biscuit-import-assets activate >/dev/null 2>&1 || true
+    fi
+}

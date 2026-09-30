@@ -1,0 +1,146 @@
+Program the unit's real BD address, read from Amazon's IDME block.
+
+The controller has been running as 00:00:46:81:63:01 since Bluetooth first came
+up. That address was never ours: hci_mt8163_stp.c sets no address anywhere, so
+it is the firmware's own default.
+
+The real per-unit address is in Amazon's IDME identity block, which the
+bootloader passes through the device tree. It needs no root and no second
+device - each field is a sub-node with a value property, so it does not appear
+in a naive property dump:
+
+	/proc/device-tree/idme/bt_mac_addr/value = "6854FDxxxxxx"
+
+which is 68:54:FD:xx:xx:xx, an Amazon Technologies OUI (the unit-specific
+half is redacted here). Alongside it sit mac_addr (the Wi-Fi MAC), wifi_mfg
+(RF calibration), miccal.0..6 (per-microphone trims) and serial, which
+matches the flash scripts' Device #1 guard.
+
+Worth recording: IDME's bt_mfg blob begins 00 00 46 81 63 01 - exactly the
+default the controller runs with. bt_mfg is the BT manufacturing data with its
+address field at offset 0 left unprogrammed; stock patches bt_mac_addr into it
+before downloading it to the chip. We never download bt_mfg, so the chip keeps
+the default.
+
+Rather than reproduce that whole path, this uses MediaTek's vendor command.
+Confirmed by hand on Device #1 before writing any code:
+
+	< HCI Command: ogf 0x3f, ocf 0x001a, plen 6   xx xx xx FD 54 68
+	> 01 1A FC 00                                  status 0x00
+	< HCI Command: ogf 0x04, ocf 0x0009            Read BD_ADDR
+	> 01 09 10 00 xx xx xx FD 54 68                68:54:FD:xx:xx:xx
+
+So 0xfc1a works on this older WMT/STP part, not just the btmtk USB/SDIO ones.
+
+The implementation is the idiomatic kernel path: hdev->set_bdaddr sends the
+vendor command, the address is parsed from IDME into hdev->public_addr, and
+HCI_QUIRK_INVALID_BDADDR tells the core to program it during setup
+(hci_sync.c: if invalid_bdaddr && public_addr && hdev->set_bdaddr).
+
+The quirk is set only when an address was actually recovered. On its own it
+makes the core bring the device up HCI_UNCONFIGURED and unusable, so a unit
+whose IDME cannot be read is deliberately left on the firmware default with a
+warning rather than bricked into an unconfigured state.
+
+diff -urN stpwork/drivers/bluetooth/hci_mt8163_stp.c stpnew/drivers/bluetooth/hci_mt8163_stp.c
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -13,6 +13,7 @@
+ #include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/firmware.h>
++#include <linux/hex.h>
+ #include <linux/kfifo.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -1329,6 +1330,66 @@
+  * post_init runs straight after hci_init_sync() with req_lock held, so correct
+  * the recorded command support and re-send the mask there.
+  */
++/*
++ * MediaTek's vendor command for setting the public address. Confirmed by hand
++ * on Device #1: the controller answers 0xfc1a with status 0x00 and a following
++ * Read BD_ADDR returns the new value.
++ */
++#define MT8163_STP_HCI_OP_SET_BDADDR	0xfc1a
++
++/*
++ * The unit's real address lives in Amazon's IDME block, which the bootloader
++ * passes through the device tree as twelve ASCII hex digits with no separators
++ * at /idme/bt_mac_addr/value. It has to be read per unit rather than written
++ * into the device tree, since every device carries its own.
++ *
++ * Without this the controller keeps the firmware default, 00:00:46:81:63:01 -
++ * which is also the unprogrammed address field at the head of IDME's bt_mfg
++ * manufacturing blob, the blob stock patches with bt_mac_addr before
++ * downloading it. We never download bt_mfg, hence the default.
++ */
++static int mt8163_stp_bdaddr_from_idme(bdaddr_t *bdaddr)
++{
++	struct device_node *np;
++	const char *value;
++	u8 bytes[sizeof(bdaddr->b)];
++	unsigned int i;
++	int ret;
++
++	np = of_find_node_by_path("/idme/bt_mac_addr");
++	if (!np)
++		return -ENODEV;
++
++	ret = of_property_read_string(np, "value", &value);
++	of_node_put(np);
++	if (ret)
++		return ret;
++
++	if (strlen(value) != 2 * sizeof(bytes))
++		return -EINVAL;
++
++	if (hex2bin(bytes, value, sizeof(bytes)))
++		return -EINVAL;
++
++	/* IDME stores it most significant byte first; bdaddr_t is the reverse. */
++	for (i = 0; i < sizeof(bytes); i++)
++		bdaddr->b[i] = bytes[sizeof(bytes) - 1 - i];
++
++	return 0;
++}
++
++static int mt8163_stp_set_bdaddr(struct hci_dev *hdev, const bdaddr_t *bdaddr)
++{
++	int ret;
++
++	ret = __hci_cmd_sync_status(hdev, MT8163_STP_HCI_OP_SET_BDADDR,
++				    sizeof(*bdaddr), bdaddr, HCI_CMD_TIMEOUT);
++	if (ret)
++		bt_dev_err(hdev, "setting BD address failed: %d", ret);
++
++	return ret;
++}
++
+ static int mt8163_stp_hci_post_init(struct hci_dev *hdev)
+ {
+ 	struct hci_cp_le_set_event_mask cp = {};
+@@ -1415,6 +1476,23 @@
+ 	 */
+ 	hci_set_quirk(hdev, HCI_QUIRK_BROKEN_LOCAL_EXT_FEATURES_PAGE_2);
+ 
++	hdev->set_bdaddr = mt8163_stp_set_bdaddr;
++
++	/*
++	 * Only declare the controller's address invalid once a replacement is
++	 * actually in hand. The quirk on its own makes the core bring the
++	 * device up unconfigured and unusable, so a unit whose IDME cannot be
++	 * read is better off keeping the firmware default.
++	 */
++	if (!mt8163_stp_bdaddr_from_idme(&hdev->public_addr)) {
++		hci_set_quirk(hdev, HCI_QUIRK_INVALID_BDADDR);
++		dev_info(stp->dev, "BD address %pMR from IDME\n",
++			 &hdev->public_addr);
++	} else {
++		dev_warn(stp->dev,
++			 "no IDME BD address; keeping the controller default\n");
++	}
++
+ 	ret = hci_register_dev(hdev);
+ 	if (ret) {
+ 		hci_free_dev(hdev);

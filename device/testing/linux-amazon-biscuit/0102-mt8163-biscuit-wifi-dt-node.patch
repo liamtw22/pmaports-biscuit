@@ -1,0 +1,91 @@
+Add the device tree node the WLAN host interface binds to.
+
+Wi-Fi stage 2b. The ported MT6625L driver registers its own top-level platform
+device, so it needs nothing from the device tree for that - but its AHB host
+interface is a separate platform driver that binds by compatible:
+
+	struct platform_driver MtkPltmAhbDriver = {
+		.driver = { .name = "mt-wifi",
+			    .of_match_table = apwifi_of_ids },
+		.probe = HifAhbPltmProbe,
+	};
+
+	static const struct of_device_id apwifi_of_ids[] = {
+		{.compatible = "mediatek,wifi",},
+	};
+
+and then looks the same node up again by compatible, twice, in glBusSetIrq()
+and glBusFreeIrq(), to find the interrupt to hand to request_irq(). So the node
+has to exist even though nothing references it by phandle.
+
+Note that the driver reads all three interrupt cells with
+of_property_read_u32_array() and uses the third as the flags for request_irq(),
+rather than letting irq_of_parse_and_map() carry the trigger type. The trigger
+type here is therefore load-bearing, not decorative.
+
+Values are the vendor's own, from mt8163.dtsi in the 3.18 tree. Checked against
+this tree before adding: 0x180f0000 is unclaimed, GIC_SPI 238 is unused, and
+CLK_INFRA_AP_DMA exists (infracfg ICG1 bit 18).
+
+The node also carries mediatek,consys, pointing at the same CONSYS the
+Bluetooth node uses. The WLAN power amplifier LDO is not a separate rail - the
+vendor's mtk_wcn_consys_hw_wifi_paldo_ctrl() is a one-line wrapper around its
+bt_paldo_ctrl() - so our glue reaches mt8163_consys_bt_paldo_set() through this
+phandle.
+
+*** Placement matters, and the first version of this patch got it wrong. ***
+
+It anchored on consys_mem: consys-pool, on the assumption that it sat beside
+consys@18070000. It does not: consys-pool lives inside &{/reserved-memory}, so
+the node was created at /reserved-memory/wifi@180f0000. of_platform_populate()
+does not walk reserved-memory, so no platform device was ever created and the
+AHB driver could not bind - the node was present in /proc/device-tree and
+completely inert. Confirmed on hardware before correcting it: the node appeared
+under /proc/device-tree/reserved-memory/ and nothing matching appeared in
+/sys/bus/platform/devices.
+
+It now goes inside &{/soc}, next to consys@18070000, which is where a SoC
+peripheral belongs and which does get populated.
+
+diff -urN a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts	2026-08-14 00:39:13.943668838 +0000
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts	2026-08-14 00:39:14.002655643 +0000
+@@ -748,6 +748,38 @@
+ 	 * the bus-protection handshake), the connectivity processor reset,
+ 	 * and the three PMIC rails the vendor tree brings up alongside them.
+ 	 */
++	/*
++	 * The WLAN side of the same CONSYS block. The ported MT6625L driver's
++	 * AHB host interface binds to this by compatible, and looks it up
++	 * again by compatible in glBusSetIrq() and glBusFreeIrq() to find its
++	 * interrupt, so the node must exist even though nothing references it
++	 * by phandle.
++	 *
++	 * The driver reads all three interrupt cells with
++	 * of_property_read_u32_array() and passes the third to request_irq()
++	 * as the flags, rather than letting irq_of_parse_and_map() carry the
++	 * trigger type - so the trigger here is load-bearing.
++	 *
++	 * Values are the vendor's own, from mt8163.dtsi in the 3.18 tree.
++	 * Checked against this tree: 0x180f0000 is unclaimed, GIC_SPI 238 is
++	 * unused, and CLK_INFRA_AP_DMA exists.
++	 */
++	wifi: wifi@180f0000 {
++		compatible = "mediatek,wifi";
++		reg = <0 0x180f0000 0 0x005c>;
++		interrupts = <GIC_SPI 238 IRQ_TYPE_LEVEL_LOW>;
++		clocks = <&infracfg CLK_INFRA_AP_DMA>;
++		clock-names = "wifi-dma";
++		/*
++		 * The same CONSYS the Bluetooth node points at. The WLAN power
++		 * amplifier LDO is not a separate rail - the vendor's
++		 * wifi_paldo_ctrl entry point simply calls its bt_paldo_ctrl
++		 * one - so the driver reaches mt8163_consys_bt_paldo_set()
++		 * through this phandle.
++		 */
++		mediatek,consys = <&consys>;
++	};
++
+ 	consys: consys@18070000 {
+ 		compatible = "mediatek,mt8163-consys";
+ 		reg = <0 0x18070000 0 0x200>;

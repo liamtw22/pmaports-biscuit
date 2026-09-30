@@ -1,0 +1,34 @@
+#!/sbin/openrc-run
+# Ambient-light auto-dimming for the light ring.
+#
+# Like biscuit-audio, this has to survive a reboot rather than just a flash, so
+# it is a service rather than a local.d script. It has to run at every boot for
+# a second reason too: the sensor's gain and integration time are volatile.
+# They survive runtime suspend but not a reboot, and at the driver's defaults
+# (1x, 100 ms) indoor ambient reads zero counts.
+
+name="biscuit-als"
+description="Auto-dim the light ring to match ambient light"
+
+command="/usr/bin/python3"
+command_args="/usr/bin/biscuit-als.py"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/biscuit-als.log"
+error_log="/var/log/biscuit-als.log"
+
+depend() {
+	need localmount
+	after modules
+}
+
+start_pre() {
+	if [ ! -r /usr/bin/biscuit-als.py ]; then
+		eerror "biscuit-als.py is not installed"
+		return 1
+	fi
+	if [ ! -d /sys/bus/iio/devices/iio:device1 ]; then
+		ewarn "no ALS iio device; biscuit-als will exit"
+	fi
+	return 0
+}

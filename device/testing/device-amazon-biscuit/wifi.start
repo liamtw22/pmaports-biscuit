@@ -1,0 +1,400 @@
+#!/bin/sh
+# Bring Wi-Fi up at boot, and do not stop until there is actually an address.
+#
+# Runs from /etc/local.d, because the "local" service is already in the default
+# runlevel and it runs late enough that wlan0 exists (the module autoloads via
+# its modalias as of r202).
+#
+# Deliberately not the networking + wpa_supplicant services: busybox ifupdown
+# does not wait for association before running the DHCP client, so the lease
+# request loses the race and the interface comes up with no address.
+#
+# Association is not success. A 5 GHz BSS that is too weak to carry data will
+# still reach wpa_state=COMPLETED and then fail DHCP, which leaves the device
+# associated, addressless and unreachable - observed on hardware. So each
+# attempt is only counted as success once udhcpc returns an address, and a
+# failed attempt blacklists that BSS and tries again.
+#
+# This is what keeps the device reachable when it is not plugged into the
+# development host, so it retries rather than giving up.
+
+CONF=/etc/wpa_supplicant/wpa_supplicant.conf
+IFACE=wlan0
+LOG=/var/log/wifi-start.log
+ATTEMPTS=4
+
+log() { echo "$(date '+%H:%M:%S') $*" >> "$LOG"; }
+
+# biscuit-ring.py plays the ring animations; this is its documented FIFO.
+# Silent no-op when the ring service is not up, so Wi-Fi never depends on it.
+RING_FIFO=/run/biscuit-ring/control
+ring() { [ -p "$RING_FIFO" ] && echo "$1" > "$RING_FIFO" 2>/dev/null; return 0; }
+earcon() { /usr/bin/biscuit-earcon "$1" >/dev/null 2>&1 || true; }
+# The sound that goes with the animation, resolved from the same
+# activity->sound table. Silent no-op and always true, so audio can
+# never be the thing that fails a boot, a Wi-Fi bring-up or a setup.
+
+# Ring animations are user-customisable from the settings page. biscuit-settings
+# writes /opt/persist/led-anim.env with one LED_<activity> per activity, already
+# resolved to a concrete animation name. Sourced rather than parsed so no Python
+# lands on the boot path, and every use falls back to OUR act_ animation so a
+# missing or partial file can never leave the ring dark. The fallbacks used to
+# name stock animations; those are no longer shipped, so a fallback to one
+# would have left the ring dark in exactly the case it exists to cover.
+#
+# The `if` form is deliberate: `[ -r f ] && . f` evaluates false when the file is
+# absent, which aborts any caller running under `set -e`.
+if [ -r /opt/persist/led-anim.env ]; then
+	. /opt/persist/led-anim.env
+fi
+WIFI_ANIM=${LED_wifi_connecting:-act_wifi_connecting}
+WIFI_ERR_ANIM=${LED_wifi_error:-act_wifi_error}
+have_ip() { ip -o -4 addr show "$IFACE" 2>/dev/null | grep -q "inet "; }
+
+# Hand over to first-boot setup mode.
+#
+# One entry point, so a button handler or Home Assistant can do exactly what
+# this does. The service is backgrounded, so this returns immediately and does
+# not hold up the rest of local.d.
+enter_setup() {
+	if [ ! -x /usr/bin/biscuit-setup.sh ]; then
+		log "setup mode requested but biscuit-setup.sh is not installed"
+		return 1
+	fi
+	log "entering setup mode: $1"
+	# Detached, and that is not optional.
+	#
+	# This runs from /etc/local.d, i.e. during the "local" service's own start.
+	# A synchronous rc-service call here deadlocks: openrc will not start
+	# biscuit-setup until local finishes, and local cannot finish until this
+	# returns. The first r219 boot hung exactly there, with both services stuck
+	# in "starting", no setup AP, and zz-boot-done never reached.
+	#
+	# The matching half of the fix is that biscuit-setup's depend() must not say
+	# "after local". biscuit-setup.sh takes its own lock, so a duplicate start
+	# from a later trigger in the same boot is harmless.
+	# "restart", not "start". The task exits when it is done but openrc keeps the
+	# service marked started, so a second "start" is refused with "has already
+	# been started" and setup never comes up. That silently broke the
+	# credentials-failed path below, which is the whole point of having it.
+	setsid rc-service biscuit-setup restart >/dev/null 2>&1 </dev/null &
+}
+
+# Load the driver here rather than letting it autoload.
+#
+# The module carries a MODULE_DEVICE_TABLE, so udev used to load it at
+# t~9-16 s, and wlanProbe then failed on most boots with "Waiting for Ready
+# bit: Timeout" - roughly 1 boot in 4 came up. BT/WMT enables the WMT Wi-Fi
+# function at t~1.7 s and both radios share one CONSYS; loading this early
+# evidently catches the chip in the wrong state. Every documented successful
+# bring-up was a manual insmod well after boot.
+#
+# Deferring the load to here took it to 9 boots in 11. The suppression is
+# 'install wlan_mt6625l /bin/true' in /etc/modprobe.d/wlan-defer.conf, which
+# is why this uses insmod with a full path: 'blacklist' does NOT stop udev
+# loading it, and modprobe would now be a no-op.
+#
+# Retries are insurance rather than a proven fix - across 11 boots the first
+# attempt never failed here, so the retry path has never actually run. Note
+# that after a failed *autoload* probe a reload does not recover (it fails
+# worse, at "Ram code download fail"), so if these retries turn out not to
+# help either, a power cycle is the only remedy and that is worth knowing.
+KO=/lib/modules/$(uname -r)/kernel/drivers/net/wireless/mediatek/mt6625l/wlan_mt6625l.ko
+
+load_driver() {
+	tries=1
+	while [ $tries -le 3 ]; do
+		if lsmod 2>/dev/null | grep -q '^wlan_mt6625l'; then
+			rmmod wlan_mt6625l 2>/dev/null
+			sleep 2
+		fi
+		# Trigger CONSYS bring-up immediately before loading the driver.
+		#
+		# Only does anything when the kernel was booted with
+		# hci_mt8163_stp.bringup_deferred=1, where probe deliberately touches no
+		# hardware. In the default early mode bring-up already ran at t~1.8 s and
+		# this write returns success without doing anything - the state machine is
+		# idempotent, so triggering unconditionally is safe.
+		#
+		# This is the state-age A/B: on this port the whole BT bootstrap (CONSYS
+		# acquire, patch download, DLM power-on, RF calibration) runs tens of
+		# seconds before the Wi-Fi image is downloaded, which stock never does.
+		# The write blocks until the chip is READY.
+		BRINGUP=/sys/module/hci_mt8163_stp/parameters/bringup_now
+		if [ -e "$BRINGUP" ]; then
+			if echo 1 > "$BRINGUP" 2>/dev/null; then
+				log "CONSYS bring-up triggered before load attempt $tries"
+			else
+				log "CONSYS bring-up trigger FAILED before attempt $tries"
+			fi
+		fi
+
+		if [ -f "$KO" ]; then
+			insmod "$KO" 2>/dev/null
+		else
+			# A no-op while wlan-defer.conf is installed; this only
+			# does anything if that suppression is ever removed.
+			modprobe wlan_mt6625l 2>/dev/null
+		fi
+
+		i=0
+		while [ ! -d /sys/class/net/$IFACE ] && [ $i -lt 15 ]; do
+			sleep 1
+			i=$((i + 1))
+		done
+		if [ -d /sys/class/net/$IFACE ]; then
+			log "$IFACE up after load attempt $tries"
+			return 0
+		fi
+		log "load attempt $tries did not produce $IFACE"
+		tries=$((tries + 1))
+	done
+	return 1
+}
+
+load_driver || {
+	log "$IFACE never appeared; power cycle required"
+	ring "play $WIFI_ERR_ANIM 4"
+	earcon wifi_error
+	exit 1
+}
+
+# Match stock's regulatory domain and power-save posture.
+#
+# Stock reports "Country: US" from /proc/net/wlan/country and carries
+# persist.sys.wifi.country_code=US. We were leaving the driver on its built-in
+# default, which constrains the usable channels and transmit power. It is the
+# same driver and the same writable proc entry on both sides, so this is
+# parity rather than a guess.
+#
+# Power save: Biscuit is mains-powered and stock runs DTIM Skip Count 0, so
+# there is nothing to win by letting the station doze between beacons, and
+# dozing is a routine cause of intermittent reachability.
+#
+# Neither setting has been measured as a fix for anything here - they are cheap
+# parity with stock, not a diagnosis. Both are non-fatal if unsupported.
+set_radio_defaults() {
+	if [ -w /proc/net/wlan/country ]; then
+		if echo US > /proc/net/wlan/country 2>/dev/null; then
+			log "regulatory domain set to US"
+		fi
+	fi
+	if command -v iw >/dev/null 2>&1; then
+		if iw dev $IFACE set power_save off 2>/dev/null; then
+			log "power save disabled"
+		fi
+	fi
+}
+set_radio_defaults
+
+# Bring Bluetooth up now that the Wi-Fi driver is loaded.
+#
+# The WMT Bluetooth function-on during CONSYS bring-up is what breaks Wi-Fi
+# firmware start. Measured: 28 boots with it withheld produced 0 failures,
+# against 2 failures in 3 with it enabled on the same kernel binary. Stopping
+# bluetoothd did NOT help, so it is the function-on itself and not the host
+# stack.
+#
+# The kernel therefore withholds BT during bring-up
+# (hci_mt8163_stp.defer_bt=1) and we enable it here, once wlan0 exists.
+# Idempotent, and harmless if Bluetooth is already up or the kernel was booted
+# without defer_bt.
+#
+# Stock is comparable from the user's point of view: it is not in Bluetooth
+# pairing mode at boot and needs a voice command to open the pairing window,
+# so Bluetooth arriving ~40 s in is not a visible regression.
+BT_NOW=/sys/module/hci_mt8163_stp/parameters/bt_now
+if [ -e "$BT_NOW" ]; then
+	if echo 1 > "$BT_NOW" 2>/dev/null; then
+		log "Bluetooth enabled after Wi-Fi"
+	else
+		log "Bluetooth enable FAILED (bt_now write rejected)"
+	fi
+fi
+
+# Association needs a configured network; loading the driver does not, and is
+# deliberately done first. wifi.start used to return here before touching the
+# module, so a freshly flashed device did not load the driver until the user
+# configured Wi-Fi - at t=420 s in one measured case, which failed. Loading
+# unconditionally puts every boot, including the first after a flash, in the
+# same t~33-58 s window that measured 9 successes in 11.
+# Repair a config that shipped without its control-interface line.
+#
+# Seen on four consecutive flashes. wpa_supplicant then starts with no control
+# socket, wpa_cli returns an empty state, and the association loop below treats
+# that as a failure and reloads the driver until wlan0 disappears - which looks
+# exactly like a driver fault. Repaired in place so an existing network block is
+# preserved; a config with no network block is left for the checks that follow.
+if [ -f "$CONF" ] && ! grep -q '^ctrl_interface=' "$CONF"; then
+	# This staged the rewrite at /tmp/wpa-repair.$$ - a predictable name in a
+	# world-writable directory, created under root's 0022 umask, so 0644 - and
+	# $CONF holds the PSK in the clear. The copy was world-readable for the
+	# length of the repair. /run is root-owned, and the subshell umask makes the
+	# file 0600 from the moment it exists rather than after the fact.
+	_tmp=/run/wpa-repair.$$
+	( umask 077
+	  { echo "ctrl_interface=/var/run/wpa_supplicant"
+	    echo "update_config=1"
+	    cat "$CONF"; } > "$_tmp" 2>/dev/null )
+	if [ -s "$_tmp" ]; then
+		cat "$_tmp" > "$CONF"
+		chmod 600 "$CONF"
+		log "repaired $CONF: added missing ctrl_interface"
+	fi
+	rm -f "$_tmp"
+fi
+
+# Self-heal the mode, every boot, whether or not the repair above ran.
+#
+# wpa_supplicant writes this file itself on SAVE_CONFIG - which the settings
+# page issues on every join and every forget - and it creates it under its own
+# 0022 umask. So 0644, discarding the 0600 that biscuit-setup.sh sets when it
+# first writes the file, and leaving the PSK readable by any local account.
+# Device 1 was found in exactly that state: 644 root:root, readable by the
+# unprivileged user, and /etc/wpa_supplicant is the persist bind mount, so it
+# had survived reflashing.
+#
+# biscuit-netcfg re-asserts 0600 after each SAVE_CONFIG now, but that only helps
+# devices that join again. This line repairs the ones already in that state.
+if [ -f "$CONF" ]; then
+	chmod 600 "$CONF" 2>/dev/null || true
+fi
+
+# An unprovisioned device needs setup even when its Wi-Fi works.
+#
+# Setup used to be requested only when a join failed. That is exactly wrong
+# after a flash: the persist partition hands back working credentials while the
+# rootfs - and every account on it - is brand new. The device came up online,
+# with no owner account, and the shipped default password still live on a box
+# that is always on and reachable. Observed on hardware: the marker named
+# an account name, the only account was the default, and the wizard was
+# never offered.
+#
+# The marker counts only when the account it names exists - the same rule as
+# create_account() in biscuit-setup.sh and needs_account() in the portal.
+#
+# Deliberately NO exit here: setup is detached, so the normal join below still
+# runs. An owner who ignores the wizard keeps a device that is online, rather
+# than one that took itself off the network waiting to be configured.
+_owner=$(cat /opt/persist/provisioned 2>/dev/null)
+if [ -z "$_owner" ] || ! id "$_owner" >/dev/null 2>&1; then
+	log "no owner account (marker names '${_owner:-none}'); requesting setup"
+	enter_setup "device has no owner account"
+fi
+
+if [ ! -f "$CONF" ]; then
+	log "no $CONF; driver loaded"
+	enter_setup "no wpa_supplicant.conf"
+	exit 0
+fi
+if ! grep -q '^network=' "$CONF"; then
+	log "no network configured; driver loaded"
+	enter_setup "no network configured"
+	exit 0
+fi
+
+ip link set $IFACE up
+
+# Stock shows wifi-config while a network is being joined (the default here).
+# Stopped on both
+# the success and give-up paths below - never left looping.
+ring "play $WIFI_ANIM"
+
+attempt=1
+while [ $attempt -le $ATTEMPTS ]; do
+	pgrep wpa_supplicant >/dev/null 2>&1 || \
+		wpa_supplicant -B -i $IFACE -c "$CONF" -D nl80211 >/dev/null 2>&1
+
+	# Wait for association.
+	state=""
+	i=0
+	while [ $i -lt 30 ]; do
+		state=$(wpa_cli -i $IFACE status 2>/dev/null | sed -n 's/^wpa_state=//p')
+		[ "$state" = "COMPLETED" ] && break
+		sleep 2
+		i=$((i + 1))
+	done
+
+	if [ "$state" = "COMPLETED" ]; then
+		bssid=$(wpa_cli -i $IFACE status 2>/dev/null | sed -n 's/^bssid=//p')
+		freq=$(wpa_cli -i $IFACE status 2>/dev/null | sed -n 's/^freq=//p')
+		udhcpc -i $IFACE -b -q -t 4 -T 3 >/dev/null 2>&1
+
+		if have_ip; then
+			log "up: $(ip -o -4 addr show $IFACE | awk '{print $4}') bssid=$bssid freq=$freq attempt=$attempt"
+			ring "stop $WIFI_ANIM"
+			exit 0
+		fi
+
+		# Associated but no address: this BSS is not usable. Blacklist it so
+		# the next attempt picks a different one, rather than looping onto
+		# the same dead AP.
+		log "attempt $attempt: associated to $bssid ($freq MHz) but no DHCP - blacklisting"
+		[ -n "$bssid" ] && wpa_cli -i $IFACE blacklist "$bssid" >/dev/null 2>&1
+		wpa_cli -i $IFACE reassociate >/dev/null 2>&1
+	else
+		# Recovery, cheapest first, and never leaving the radio unloaded.
+		#
+		# THE OLD CODE COULD NOT WORK. It removed the driver with
+		# `modprobe -r` and put it back with `modprobe wlan_mt6625l` - but
+		# /etc/modprobe.d/wlan-defer.conf sets `install wlan_mt6625l /bin/true`
+		# precisely so udev cannot autoload it, which makes that modprobe a
+		# no-op. load_driver() above exists because of exactly that, and is the
+		# only path that knows to insmod the .ko by full path.
+		#
+		# So every trip through here DELETED wlan0 and nothing put it back. That
+		# is strictly worse than staying up and disconnected: with no interface
+		# the settings page can only say "Wi-Fi is not running" instead of
+		# offering the saved networks, setup mode has no radio to raise its AP
+		# on, and the documented remedy becomes a power cycle.
+		#
+		# A wedged supplicant nearly always clears by restarting the supplicant
+		# alone, which keeps the interface up, so that is tried first and the
+		# driver reload is held back for the last attempt.
+		pkill wpa_supplicant
+		sleep 2
+		if [ $attempt -lt $ATTEMPTS ]; then
+			log "attempt $attempt: association failed (state=$state) - restarting supplicant"
+		else
+			log "attempt $attempt: association failed (state=$state) - reloading driver"
+			load_driver || log "driver reload failed; $IFACE is gone"
+		fi
+		[ -d /sys/class/net/$IFACE ] && ip link set $IFACE up 2>/dev/null
+	fi
+
+	attempt=$((attempt + 1))
+done
+
+# The saved credentials do not work any more - a changed router password, a new
+# house, a replaced access point. Without this the only remedy is a USB cable or
+# a reflash, so fall back into setup mode and let them be re-entered from a
+# phone. The USB network at 172.16.42.1 is a fallback beneath that only when a
+# network USB mode was chosen; the default since r272 is charging only.
+log "giving up after $ATTEMPTS attempts; falling back to setup mode"
+ring "stop $WIFI_ANIM"
+ring "play $WIFI_ERR_ANIM 4"
+
+# Hand over a WORKING radio, not an absent one.
+#
+# Giving up on the saved credentials is not the same as giving up on Wi-Fi.
+# Whatever happens next needs the interface: setup mode raises its access point
+# on it, and the settings page at :8080 reads saved networks and scan results
+# through wpa_supplicant's control socket - so with no supplicant it can only
+# report "Wi-Fi is not running", which is the least useful thing to tell someone
+# whose Wi-Fi has just failed.
+#
+# Leaving a supplicant running is what makes "scan, pick a network, type the
+# password" work from the settings page, which is the ordinary way out of this
+# state and needs no phone, no AP and no cable.
+if [ ! -d /sys/class/net/$IFACE ]; then
+	log "$IFACE missing at give-up; reloading so it can still be configured"
+	load_driver || log "$IFACE could not be restored; a power cycle is needed"
+fi
+if [ -d /sys/class/net/$IFACE ]; then
+	ip link set $IFACE up 2>/dev/null
+	pgrep wpa_supplicant >/dev/null 2>&1 || \
+		wpa_supplicant -B -i $IFACE -c "$CONF" -D nl80211 >/dev/null 2>&1
+fi
+
+enter_setup "saved credentials failed after $ATTEMPTS attempts"
+

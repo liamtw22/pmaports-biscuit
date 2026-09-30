@@ -1,0 +1,3 @@
+#!/bin/sh
+# The stock LK must scan the raw DTB after Image.gz. boot-deploy handles that.
+exit 0

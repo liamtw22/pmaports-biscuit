@@ -1,0 +1,123 @@
+#!/sbin/openrc-run
+
+name="biscuit-pipewire"
+description="System-wide PipeWire, WirePlumber and PulseAudio compatibility"
+
+# WHY SYSTEM-WIDE AND NOT PER-USER:
+#
+#   PipeWire is normally a user session service. Every service on this device
+#   runs as root under OpenRC, and a per-user PipeWire socket in
+#   /run/user/1000 is unreachable by them. Running it as a login user cost an
+#   afternoon: sendspin reported "PulseAudio/PipeWire not reachable", then
+#   failed with "No output device matching 'default'" because PortAudio could
+#   not enumerate a single node.
+#
+#   Fixed runtime dir at /run/pipewire so every root service can find it.
+#
+# WHY PIPEWIRE AT ALL, GIVEN dmix WORKED:
+#
+#   soundcard (a linux-voice-assistant dependency) connects to a PulseAudio
+#   server AT IMPORT TIME and asserts PA_CONTEXT_READY. It is not optional for
+#   the voice assistant. PipeWire also gives per-stream volume, which is what
+#   playback ducking needs and dmix cannot do.
+#
+#   PulseAudio is NOT the alternative: Alpine's package depends on X11 and
+#   pulls mesa, gstreamer, pango and wayland, measuring +252.7 MiB against
+#   PipeWire's +22.8 MiB.
+#
+# THE CONFLICT THIS SERVICE CREATES, AND WHY /etc/asound.conf CHANGED:
+#
+#   PipeWire opens hw:Loopback,0,0 EXCLUSIVELY. dmix needs the same device, so
+#   the two cannot coexist - every dmix client dies with PortAudio -9985
+#   "Device unavailable". /etc/asound.conf therefore routes `default` to
+#   PipeWire, not to dmix. The dmix definition is kept in that file and still
+#   works if this service is stopped and the default is pointed back at it.
+#
+# WirePlumber's ALSA monitor is DISABLED (see
+# /etc/wireplumber/wireplumber.conf.d/10-biscuit-no-alsa-monitor.conf). It would
+# claim hw:0,0 directly and fight biscuit-dsp, which owns the codec. The only
+# nodes are the two static ones in pipewire.conf.d, riding the snd-aloop cables.
+
+RUNDIR=/run/pipewire
+export XDG_RUNTIME_DIR="$RUNDIR"
+export PULSE_RUNTIME_PATH="$RUNDIR/pulse"
+
+depend() {
+	# biscuit-dsp drains hw:Loopback,1,0 and writes the codec. Without it the
+	# sink accepts audio and it goes nowhere, silently.
+	need biscuit-dsp
+	before biscuit-sendspin
+}
+
+# Each daemon is started through env(1) rather than relying on the exports
+# above: OpenRC does not reliably pass an exported environment through to a
+# supervised process.
+LOG=/var/log/biscuit-pipewire.log
+
+_spawn() {
+	bin="$1"; pid="/run/biscuit-pw-$2.pid"
+	# --background with no redirection discarded every word these three wrote,
+	# which is why the failure path below used to point at /tmp/pw.log: a file
+	# nothing has ever created. Capture it for real instead.
+	#
+	# Cleared once per start(), because the thing worth reading when PipeWire
+	# does not come up is this boot's output, not last month's - AND capped
+	# while it runs (r275). A session alone was no bound: with USB audio
+	# enabled and the host idle, the gadget's resync warnings grew the file
+	# 13.7 MB a day, and a device stays up for months. biscuit-logcap moves
+	# it to .1 past 2 MiB, so one boot holds at most about 4 MiB.
+	start-stop-daemon --start --background --make-pidfile --pidfile "$pid" \
+		--stdout-logger "/usr/bin/biscuit-logcap $LOG" \
+		--stderr-logger "/usr/bin/biscuit-logcap $LOG" \
+		--exec /usr/bin/env -- \
+		XDG_RUNTIME_DIR="$RUNDIR" PULSE_RUNTIME_PATH="$RUNDIR/pulse" "$bin"
+}
+
+start() {
+	ebegin "Starting PipeWire (system-wide)"
+	checkpath -d -m 0755 -o root:root "$RUNDIR"
+	# One boot's worth, and no more. See _spawn.
+	: > "$LOG" 2>/dev/null || true
+	rm -f "$LOG.1"
+	chmod 640 "$LOG" 2>/dev/null || true
+
+	_spawn /usr/bin/pipewire pipewire
+	# WirePlumber is the session manager: without it the static nodes exist but
+	# nothing links streams to them.
+	sleep 2
+	_spawn /usr/bin/wireplumber wireplumber
+	# pipewire-pulse is what makes soundcard/PortAudio work at all.
+	sleep 2
+	_spawn /usr/bin/pipewire-pulse pipewire-pulse
+	sleep 2
+
+	# Report the real outcome rather than start-stop-daemon's exit status: the
+	# daemons fork and a missing sink is the failure that actually matters.
+	if pgrep -x pipewire >/dev/null 2>&1; then
+		eend 0
+	else
+		eend 1 "pipewire did not stay up; see $LOG"
+	fi
+}
+
+stop() {
+	ebegin "Stopping PipeWire"
+	for n in pipewire-pulse wireplumber pipewire; do
+		start-stop-daemon --stop --quiet --pidfile "/run/biscuit-pw-$n.pid" 2>/dev/null
+		rm -f "/run/biscuit-pw-$n.pid"
+	done
+	# The daemons re-exec, so the pidfile can go stale; sweep by name.
+	pkill -x pipewire-pulse 2>/dev/null
+	pkill -x wireplumber 2>/dev/null
+	pkill -x pipewire 2>/dev/null
+	eend 0
+}
+
+status() {
+	if pgrep -x pipewire >/dev/null 2>&1; then
+		einfo "status: started"
+		return 0
+	fi
+	einfo "status: stopped"
+	return 3
+}

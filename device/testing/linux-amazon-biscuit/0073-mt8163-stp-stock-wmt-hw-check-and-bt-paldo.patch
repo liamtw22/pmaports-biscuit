@@ -1,0 +1,79 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index 70881d3..dc41ddb 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -40,6 +40,16 @@
+ #define MT8163_WMT_PATCH_FRAGMENT	1000
+ 
+ /* WMT starts raw, then uses STP task 4 after the SET_STP exchange. */
++static const u8 wmt_read_hw_code_cmd[] = {
++	0x01, 0x08, 0x10, 0x00, 0x02, 0x01, 0x00, 0x01,
++	0x08, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00,
++	0xff, 0xff, 0x00, 0x00,
++};
++static const u8 wmt_read_hw_code_evt[] = {
++	0x02, 0x08, 0x04, 0x00, 0x00, 0x00, 0x00, 0x01,
++	0x08, 0x00, 0x00, 0x80, 0x63, 0x81, 0x00, 0x00,
++};
++
+ static const u8 wmt_query_stp_cmd[] =
+ 	{ 0x01, 0x04, 0x01, 0x00, 0x04 };
+ static const u8 wmt_query_stp_default_evt[] =
+@@ -101,6 +111,7 @@ struct mt8163_stp {
+ 	u8 payload_type;
+ 	bool framed;
+ 	bool hci_registered;
++	bool bt_paldo_enabled;
+ 	u8 trace_rx;
+ 	u8 trace_xfer;
+ };
+@@ -425,6 +436,17 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 	unsigned int i;
+ 	int ret;
+ 
++	/* Stock WMT identifies the controller over raw BTIF before QUERY_STP. */
++	stp->framed = false;
++	ret = mt8163_stp_wmt_xfer(stp, false, wmt_read_hw_code_cmd,
++				  sizeof(wmt_read_hw_code_cmd), wmt_read_hw_code_evt,
++				  sizeof(wmt_read_hw_code_evt));
++	if (ret)
++		return dev_err_probe(stp->dev, ret,
++				     "raw WMT hardware-code read failed\n");
++
++	dev_info(stp->dev, "raw WMT hardware code 0x8163\n");
++
+ 	ret = mt8163_stp_wmt_xfer(stp, false, wmt_query_stp_cmd,
+ 				  sizeof(wmt_query_stp_cmd), wmt_query_stp_default_evt,
+ 				  sizeof(wmt_query_stp_default_evt));
+@@ -457,6 +479,11 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 			return dev_err_probe(stp->dev, ret, "WMT patch reset failed\n");
+ 	}
+ 
++	ret = mt8163_consys_bt_paldo_set(stp->consys_dev, true);
++	if (ret)
++		return dev_err_probe(stp->dev, ret, "failed to enable BT PALDO\n");
++	stp->bt_paldo_enabled = true;
++
+ 	ret = mt8163_stp_wmt_xfer(stp, true, wmt_bt_on_cmd,
+ 				  sizeof(wmt_bt_on_cmd), wmt_bt_on_evt,
+ 				  sizeof(wmt_bt_on_evt));
+@@ -645,6 +672,10 @@ static int mt8163_stp_probe(struct platform_device *pdev)
+ 	return 0;
+ 
+ err_client:
++	if (stp->bt_paldo_enabled) {
++		mt8163_consys_bt_paldo_set(stp->consys_dev, false);
++		stp->bt_paldo_enabled = false;
++	}
+ 	mt8163_btif_unregister_client(stp->btif, &stp->btif_client);
+ err_btif:
+ 	mt8163_btif_stop(stp->btif);
+@@ -672,6 +703,8 @@ static void mt8163_stp_remove(struct platform_device *pdev)
+ 	mt8163_btif_unregister_client(stp->btif, &stp->btif_client);
+ 	cancel_work_sync(&stp->rx_work);
+ 	kfifo_free(&stp->rx_fifo);
++	if (stp->bt_paldo_enabled)
++		mt8163_consys_bt_paldo_set(stp->consys_dev, false);
+ 	mt8163_btif_stop(stp->btif);
+ 	mt8163_consys_release(stp->consys_dev);
+ 	put_device(stp->consys_dev);

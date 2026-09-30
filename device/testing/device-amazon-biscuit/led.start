@@ -1,0 +1,8 @@
+#!/bin/sh
+
+# LED controller support is not available yet; avoid making OpenRC local fail.
+LED=/sys/bus/i2c/devices/0-003f
+[ -w "$LED/boot_animation" ] && [ -w "$LED/frame" ] || exit 0
+
+echo 0 > "$LED/boot_animation"
+echo "0000ff0000ff4f00cf4f00cfff0000ff0000af2f00af2f00ffff00ffff0000ff0000ff00" > "$LED/frame"

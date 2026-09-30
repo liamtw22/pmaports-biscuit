@@ -1,0 +1,28 @@
+#!/sbin/openrc-run
+
+description="Play this device's audio through a paired Bluetooth speaker"
+command="/usr/bin/biscuit-btcast.sh"
+command_background=true
+pidfile="/run/biscuit-btcast.pid"
+# Logged through a pipe, not straight to the file. This service runs at
+# realtime priority, and a write to the ext4 root can stall for most of a
+# second behind the journal while something else writes (3.8: the call DSP
+# did exactly that and its branch overflowed). OpenRC hands the output to a
+# cat at ordinary priority instead, which takes any such stall; the pipe
+# absorbs 64 KiB meanwhile.
+output_logger="cat >> /var/log/biscuit-btcast.log"
+error_logger="cat >> /var/log/biscuit-btcast.log"
+
+# A genuine long-running watcher, so supervising it is correct here - unlike a
+# one-shot, where supervise-daemon breaks every re-entry path.
+supervisor=supervise-daemon
+respawn_delay=5
+respawn_max=0
+
+depend() {
+	# The monitor node it taps and the FIFO it mutes through.
+	need biscuit-pipewire biscuit-dsp
+	# bluealsa registers the A2DP source endpoint this plays into; bluetoothd
+	# owns the connection it waits for.
+	after bluetooth bluealsa biscuit-audio biscuit-persist
+}

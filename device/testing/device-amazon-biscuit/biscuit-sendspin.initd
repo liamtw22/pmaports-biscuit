@@ -1,0 +1,163 @@
+#!/sbin/openrc-run
+
+name="biscuit-sendspin"
+description="Sendspin audio target - makes the Echo a Music Assistant speaker"
+
+# Since r280 the daemon connects out to the Music Assistant server it finds
+# over mDNS (SENDSPIN_SERVER_URL, below). With no server known it listens on
+# 8928 and advertises _sendspin._tcp.local. instead, so Music Assistant
+# discovers it. Either way mDNS must work, or nothing finds anything.
+#
+# AUDIO DEVICE is "default" deliberately: that is dmix -> snd-aloop ->
+# biscuit-dsp -> codec, so a stream gets the speaker correction, the per-volume
+# loudness push, the compressor and the limiter, exactly like every other
+# source. Pointing this at hw:0,0 would bypass all of it AND take exclusive
+# ownership of the codec, which would silence everything else on the device.
+#
+# Expect two warnings at start, both understood and harmless:
+#
+#   "No volume control available ... falling back to software volume control"
+#     dmix exposes no ALSA mixer, and PulseAudio is deliberately not installed
+#     (it plus its dependency tree measured 217 MB on a 535 MB rootfs and
+#     filled the disk). Volume worked in software, INSIDE sendspin's own
+#     stream - which meant the volume ring never lit and there were two
+#     attenuations in series. --hook-set-volume now routes it to
+#     biscuit-audio instead, so there is one device volume again.
+#
+#   "MPRIS not available: DBus address error"
+#     No session bus for a headless daemon. Affects metadata reporting only,
+#     not playback.
+
+# PipeWire runs SYSTEM-WIDE as root with a fixed runtime dir, because every
+# service here runs as root under OpenRC and a per-user PipeWire socket is
+# unreachable by them. Without these two variables the daemon logs
+# "PulseAudio/PipeWire not reachable" and then dies on
+# PaErrorCode -9985 "Device unavailable", because ALSA's default now routes to
+# PipeWire and PipeWire holds hw:Loopback,0,0 exclusively.
+export XDG_RUNTIME_DIR=/run/pipewire
+export PULSE_RUNTIME_PATH=/run/pipewire/pulse
+
+: ${SENDSPIN_NAME:=$(hostname)}
+: ${SENDSPIN_AUDIO_DEVICE:=default}
+# NO --interface, deliberately. The device also has usb0/usb1 (the
+# 172.16.42.1 USB network) and advertising the speaker there is untidy, but
+# binding to wlan0 BREAKS DISCOVERY here and cost a real outage.
+#
+# Two separate faults, both measured:
+#   * it takes an IP ADDRESS, not an interface name; 'wlan0' becomes a
+#     hostname lookup and kills the daemon with socket.gaierror.
+#   * given the correct IP it still restricts mDNS wrongly: python-zeroconf
+#     ended up bound to 127.0.0.1, 172.16.42.1 and 0.0.0.0 but NOT
+#     the wlan0 address, so Music Assistant could no longer find the speaker.
+#     It only seemed to work at first because the server already knew the
+#     address; once the connection dropped it could never be rediscovered.
+#
+# Advertising on the USB network is cosmetic. Being discoverable is not.
+# How it identifies itself to Music Assistant.
+: ${SENDSPIN_MANUFACTURER:=Amazon}
+: ${SENDSPIN_PRODUCT:=Echo Dot (2nd gen)}
+: ${SENDSPIN_LOG_LEVEL:=WARNING}
+# 16-bit, not the 24-bit sendspin asks for first. Everything after it is 16-bit
+# at 48 kHz - the PipeWire sink, the loopback and biscuit-dsp - so a 24-bit
+# stream is cut to 16 bits at the sink and the extra bits never reach the DAC;
+# from a 16-bit source they are padding anyway. They still cost airtime:
+# measured 1.9 Mbit/s for 24-bit FLAC, and this device's 2.4 GHz Wi-Fi shares
+# its radio with Bluetooth and a busy channel with every other client, so half
+# the bitrate is margin against the stalls that freeze the visualiser and then
+# stop the music. 48 kHz is the chain's rate, so the device never resamples.
+# Set SENDSPIN_AUDIO_FORMAT="" in /etc/conf.d/biscuit-sendspin to go back to
+# sendspin's own preference; the daemon refuses to start on a format the
+# output cannot take, and this one was validated against it on Device 1.
+: ${SENDSPIN_AUDIO_FORMAT=flac:48000:16:2}
+# CONNECT OUT to Music Assistant rather than wait for it to connect in (2.31).
+# Listening leaves recovery to Music Assistant: after a Wi-Fi stall on
+# 2026-09-27 it made no successful attempt for nearly eight hours, through six
+# watchdog restarts that each re-announced sendspin, and came back only when
+# Music Assistant itself was restarted. Connecting out puts the retry here - a
+# 150 s stall then recovered 25 s after the network returned, and Music
+# Assistant resumed the stream by itself.
+#   auto  find the server over mDNS at start and remember it on persist; if it
+#         does not answer, use the last one found; with neither, listen.
+#   ""    listen on 8928 as before.
+#   URL   connect to that server, e.g. ws://homeassistant.local:8927/sendspin
+: ${SENDSPIN_SERVER_URL=auto}
+
+# Invoked through env(1) rather than relying on the exports above: OpenRC does
+# not reliably pass an exported environment through to the supervised process,
+# and without XDG_RUNTIME_DIR the daemon fails with
+# "No output device matching 'default'" - PortAudio cannot see the PipeWire
+# nodes at all, so the device list comes back empty. Verified by hand: with
+# these two variables set, both "default" and "pipewire" open cleanly.
+command="/usr/bin/env"
+
+command_args="XDG_RUNTIME_DIR=/run/pipewire PULSE_RUNTIME_PATH=/run/pipewire/pulse /usr/lib/sendspin/bin/sendspin daemon --name ${SENDSPIN_NAME} --audio-device ${SENDSPIN_AUDIO_DEVICE} --log-level ${SENDSPIN_LOG_LEVEL}${SENDSPIN_AUDIO_FORMAT:+ --audio-format ${SENDSPIN_AUDIO_FORMAT}} --settings-dir /opt/persist/sendspin --hook-set-volume /usr/bin/biscuit-sendspin-volume --hook-start '/usr/bin/biscuit-sendspin-stream start' --hook-stop '/usr/bin/biscuit-sendspin-stream stop' --manufacturer '${SENDSPIN_MANUFACTURER}' --product-name '${SENDSPIN_PRODUCT}'"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/sendspin.log"
+error_log="/var/log/sendspin.log"
+
+depend() {
+	# biscuit-dsp drains the loopback; without it "default" goes nowhere and
+	# playback is silent with no error anywhere.
+	need net biscuit-dsp
+	# PipeWire owns hw:Loopback,0,0 and provides the PulseAudio server that
+	# PortAudio talks to. Without it: "No output device matching 'default'".
+	need biscuit-pipewire
+	# avahi carries the mDNS advertisement Music Assistant discovers.
+	# `local` is where /etc/local.d/wifi.start brings up wlan0 - starting before
+	# it logs "Could not determine local IP address, mDNS may not work properly"
+	# and the speaker can be undiscoverable until something forces a retry.
+	after avahi-daemon biscuit-persist local
+}
+
+start_pre() {
+	# Settings live on the persistent store so the speaker keeps its identity
+	# across an update flash, like Wi-Fi and the device name.
+	checkpath -d -m 0755 -o root:root /opt/persist/sendspin 2>/dev/null || true
+	checkpath -f -m 0644 -o root:root "$output_log"
+
+	# biscuit-pipewire returns as soon as pipewire is up, but pipewire-pulse
+	# takes a moment longer to accept connections. Starting into that gap gives
+	# "Failed to connect to pulseaudio server" and silently costs hardware
+	# volume control. Bounded wait - never block boot indefinitely.
+	i=0
+	while [ ! -S /run/pipewire/pulse/native ] && [ $i -lt 20 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	[ -S /run/pipewire/pulse/native ] || ewarn "pipewire-pulse socket not ready after ${i}s; continuing"
+
+	# Which server to connect to (see SENDSPIN_SERVER_URL above). The URL is
+	# published under /run for the watchdog, which counts this connection.
+	known=/opt/persist/sendspin/server-url
+	url=
+	case "$SENDSPIN_SERVER_URL" in
+	auto)
+		url=$(/usr/bin/biscuit-sendspin-server /opt/persist/sendspin 5 2>/dev/null)
+		if [ -n "$url" ]; then
+			[ "$url" = "$(cat "$known" 2>/dev/null)" ] || echo "$url" > "$known"
+		else
+			url=$(cat "$known" 2>/dev/null)
+			[ -n "$url" ] && ewarn "Music Assistant did not answer over mDNS; using the last one found"
+		fi
+		;;
+	"") ;;
+	*) url=$SENDSPIN_SERVER_URL ;;
+	esac
+	# It reaches the command line, and mDNS supplies the path: accept only a
+	# plain ws://host:port/path.
+	case "$url" in
+	ws://*[!A-Za-z0-9:/._-]*) ewarn "ignoring a malformed server URL"; url= ;;
+	ws://?*:[0-9]*/*) ;;
+	*) url= ;;
+	esac
+	checkpath -d -m 0755 -o root:root /run/biscuit-sendspin
+	if [ -n "$url" ]; then
+		command_args="$command_args --url $url"
+		echo "$url" > /run/biscuit-sendspin/server-url
+		einfo "Connecting out to $url"
+	else
+		rm -f /run/biscuit-sendspin/server-url
+		einfo "Listening on 8928 for Music Assistant to connect"
+	fi
+}

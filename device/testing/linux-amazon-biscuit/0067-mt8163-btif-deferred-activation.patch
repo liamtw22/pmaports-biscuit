@@ -1,0 +1,299 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index 3cb3439..d42cd32 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -613,11 +613,16 @@ static int mt8163_stp_probe(struct platform_device *pdev)
+ 		goto err_consys;
+ 	}
+ 
++	/* CONSYS now owns and powers BTIF/APDMA; hardware setup is safe here. */
++	ret = mt8163_btif_start(stp->btif);
++	if (ret)
++		goto err_consys;
++
+ 	stp->btif_client.receive = mt8163_stp_receive;
+ 	stp->btif_client.data = stp;
+ 	ret = mt8163_btif_register_client(stp->btif, &stp->btif_client);
+ 	if (ret)
+-		goto err_consys;
++		goto err_btif;
+ 
+ 	ret = mt8163_stp_bootstrap(stp);
+ 	if (ret)
+@@ -632,6 +637,8 @@ static int mt8163_stp_probe(struct platform_device *pdev)
+ 
+ err_client:
+ 	mt8163_btif_unregister_client(stp->btif, &stp->btif_client);
++err_btif:
++	mt8163_btif_stop(stp->btif);
+ err_consys:
+ 	mt8163_consys_release(stp->consys_dev);
+ err_consys_dev:
+@@ -656,6 +663,7 @@ static void mt8163_stp_remove(struct platform_device *pdev)
+ 	mt8163_btif_unregister_client(stp->btif, &stp->btif_client);
+ 	cancel_work_sync(&stp->rx_work);
+ 	kfifo_free(&stp->rx_fifo);
++	mt8163_btif_stop(stp->btif);
+ 	mt8163_consys_release(stp->consys_dev);
+ 	put_device(stp->consys_dev);
+ }
+diff --git a/drivers/misc/mt8163-btif.c b/drivers/misc/mt8163-btif.c
+index 243863f..50627c9 100644
+--- a/drivers/misc/mt8163-btif.c
++++ b/drivers/misc/mt8163-btif.c
+@@ -82,7 +82,11 @@ struct mt8163_btif {
+ 	struct mt8163_btif_dma rx;
+ 	struct mutex tx_lock;
+ 	struct mutex client_lock;
++	struct mutex state_lock;
+ 	const struct mt8163_btif_client *client;
++	bool active;
++	bool tx_irq_requested;
++	bool rx_irq_requested;
+ };
+ 
+ struct mt8163_btif *mt8163_btif_get(struct device *dev)
+@@ -101,6 +105,8 @@ int mt8163_btif_register_client(struct mt8163_btif *btif,
+ 
+ 	if (!btif || !client || !client->receive)
+ 		return -EINVAL;
++	if (!READ_ONCE(btif->active))
++		return -EHOSTDOWN;
+ 
+ 	mutex_lock(&btif->client_lock);
+ 	if (btif->client)
+@@ -125,7 +131,8 @@ void mt8163_btif_unregister_client(struct mt8163_btif *btif,
+ 	mutex_unlock(&btif->client_lock);
+ 
+ 	/* The RX callback runs from hard IRQ context. */
+-	synchronize_irq(btif->rx.irq);
++	if (READ_ONCE(btif->rx_irq_requested))
++		synchronize_irq(btif->rx.irq);
+ }
+ EXPORT_SYMBOL_GPL(mt8163_btif_unregister_client);
+ 
+@@ -138,6 +145,8 @@ int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len)
+ 
+ 	if (!btif || !buf || !len)
+ 		return -EINVAL;
++	if (!READ_ONCE(btif->active))
++		return -EHOSTDOWN;
+ 	if (len > MT8163_BTIF_MAX_FRAME)
+ 		return -EMSGSIZE;
+ 
+@@ -294,11 +303,124 @@ static irqreturn_t mt8163_btif_dma_irq(int irq, void *data)
+ 	return IRQ_HANDLED;
+ }
+ 
++static void mt8163_btif_hw_disable(struct mt8163_btif *btif)
++{
++	writel(0, btif->tx.base + DMA_INT_EN);
++	writel(0, btif->rx.base + DMA_INT_EN);
++	writel(0, btif->tx.base + DMA_EN);
++	writel(0, btif->rx.base + DMA_EN);
++	writel(0, btif->base + BTIF_DMA_EN);
++}
++
++int mt8163_btif_start(struct mt8163_btif *btif)
++{
++	u32 value;
++	int ret;
++
++	if (!btif)
++		return -EINVAL;
++
++	mutex_lock(&btif->state_lock);
++	if (btif->active) {
++		ret = 0;
++		goto out_unlock;
++	}
++
++	ret = clk_prepare_enable(btif->btif_clk);
++	if (ret)
++		goto out_unlock;
++
++	ret = clk_prepare_enable(btif->apdma_clk);
++	if (ret)
++		goto err_btif_clock;
++
++	ret = request_irq(btif->tx.irq, mt8163_btif_dma_irq, IRQF_NO_THREAD,
++			  "mt8163-btif-tx", &btif->tx);
++	if (ret)
++		goto err_apdma_clock;
++	btif->tx_irq_requested = true;
++
++	ret = request_irq(btif->rx.irq, mt8163_btif_dma_irq, IRQF_NO_THREAD,
++			  "mt8163-btif-rx", &btif->rx);
++	if (ret)
++		goto err_tx_irq;
++	btif->rx_irq_requested = true;
++
++	/* The vendor programs the controller before enabling either DMA engine. */
++	writel(0, btif->base + BTIF_FAKELCR);
++	value = readl(btif->base + BTIF_HANDSHAKE);
++	writel(value | BTIF_HANDSHAKE_ENABLE, btif->base + BTIF_HANDSHAKE);
++	writel(BTIF_TRI_LVL_TX(BTIF_TX_FIFO_THRESHOLD) |
++		BTIF_TRI_LVL_RX(BTIF_RX_FIFO_THRESHOLD),
++		btif->base + BTIF_TRI_LVL);
++	writel(BTIF_DMA_EN_AUTORST, btif->base + BTIF_DMA_EN);
++	writel(0, btif->base + BTIF_IER);
++
++	ret = mt8163_btif_dma_setup(btif, &btif->tx);
++	if (ret)
++		goto err_hw;
++
++	ret = mt8163_btif_dma_setup(btif, &btif->rx);
++	if (ret)
++		goto err_hw;
++
++	WRITE_ONCE(btif->active, true);
++	dev_info(btif->dev, "BTIF DMA transport active after CONSYS acquire\n");
++	ret = 0;
++	goto out_unlock;
++
++err_hw:
++	mt8163_btif_hw_disable(btif);
++	free_irq(btif->rx.irq, &btif->rx);
++	btif->rx_irq_requested = false;
++err_tx_irq:
++	free_irq(btif->tx.irq, &btif->tx);
++	btif->tx_irq_requested = false;
++err_apdma_clock:
++	clk_disable_unprepare(btif->apdma_clk);
++err_btif_clock:
++	clk_disable_unprepare(btif->btif_clk);
++out_unlock:
++	mutex_unlock(&btif->state_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt8163_btif_start);
++
++void mt8163_btif_stop(struct mt8163_btif *btif)
++{
++	if (!btif)
++		return;
++
++	mutex_lock(&btif->state_lock);
++	if (!btif->active)
++		goto out_unlock;
++
++	WRITE_ONCE(btif->active, false);
++	mt8163_btif_hw_disable(btif);
++	if (btif->rx_irq_requested) {
++		free_irq(btif->rx.irq, &btif->rx);
++		btif->rx_irq_requested = false;
++	}
++	if (btif->tx_irq_requested) {
++		free_irq(btif->tx.irq, &btif->tx);
++		btif->tx_irq_requested = false;
++	}
++	clk_disable_unprepare(btif->apdma_clk);
++	clk_disable_unprepare(btif->btif_clk);
++
++out_unlock:
++	mutex_unlock(&btif->state_lock);
++}
++EXPORT_SYMBOL_GPL(mt8163_btif_stop);
++
+ static ssize_t dma_state_show(struct device *dev,
+ 			      struct device_attribute *attr, char *buf)
+ {
+ 	struct mt8163_btif *btif = dev_get_drvdata(dev);
+ 
++	if (!READ_ONCE(btif->active))
++		return sysfs_emit(buf, "BTIF DMA transport dormant\n");
++
+ 	return sysfs_emit(buf,
+ 		"tx en=0x%08x valid=%u left=%u\n"
+ 		"rx en=0x%08x valid=%u left=%u\n"
+@@ -324,7 +446,6 @@ static int mt8163_btif_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct mt8163_btif *btif;
+-	u32 value;
+ 	int ret;
+ 
+ 	btif = devm_kzalloc(dev, sizeof(*btif), GFP_KERNEL);
+@@ -334,6 +455,7 @@ static int mt8163_btif_probe(struct platform_device *pdev)
+ 	btif->dev = dev;
+ 	mutex_init(&btif->tx_lock);
+ 	mutex_init(&btif->client_lock);
++	mutex_init(&btif->state_lock);
+ 	platform_set_drvdata(pdev, btif);
+ 
+ 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
+@@ -352,15 +474,15 @@ static int mt8163_btif_probe(struct platform_device *pdev)
+ 	if (IS_ERR(btif->rx.base))
+ 		return PTR_ERR(btif->rx.base);
+ 
+-	btif->btif_clk = devm_clk_get_enabled(dev, "btifc");
++	btif->btif_clk = devm_clk_get(dev, "btifc");
+ 	if (IS_ERR(btif->btif_clk))
+ 		return dev_err_probe(dev, PTR_ERR(btif->btif_clk),
+-				     "failed to enable BTIF clock\n");
++				     "failed to get BTIF clock\n");
+ 
+-	btif->apdma_clk = devm_clk_get_enabled(dev, "apdmac");
++	btif->apdma_clk = devm_clk_get(dev, "apdmac");
+ 	if (IS_ERR(btif->apdma_clk))
+ 		return dev_err_probe(dev, PTR_ERR(btif->apdma_clk),
+-				     "failed to enable APDMA clock\n");
++				     "failed to get APDMA clock\n");
+ 
+ 	btif->tx.name = "TX";
+ 	btif->tx.btif = btif;
+@@ -387,35 +509,12 @@ static int mt8163_btif_probe(struct platform_device *pdev)
+ 	if (!btif->rx.fifo)
+ 		return -ENOMEM;
+ 
+-	ret = devm_request_irq(dev, btif->tx.irq, mt8163_btif_dma_irq,
+-			       IRQF_NO_THREAD, "mt8163-btif-tx", &btif->tx);
+-	if (ret)
+-		return dev_err_probe(dev, ret, "failed to request TX DMA IRQ\n");
+-
+-	ret = devm_request_irq(dev, btif->rx.irq, mt8163_btif_dma_irq,
+-			       IRQF_NO_THREAD, "mt8163-btif-rx", &btif->rx);
+-	if (ret)
+-		return dev_err_probe(dev, ret, "failed to request RX DMA IRQ\n");
+-
+-	/* Vendor controller setup before the DMA engines are enabled. */
+-	writel(0, btif->base + BTIF_FAKELCR);
+-	value = readl(btif->base + BTIF_HANDSHAKE);
+-	writel(value | BTIF_HANDSHAKE_ENABLE, btif->base + BTIF_HANDSHAKE);
+-	writel(BTIF_TRI_LVL_TX(BTIF_TX_FIFO_THRESHOLD) |
+-		BTIF_TRI_LVL_RX(BTIF_RX_FIFO_THRESHOLD),
+-		btif->base + BTIF_TRI_LVL);
+-	writel(BTIF_DMA_EN_AUTORST, btif->base + BTIF_DMA_EN);
+-	writel(0, btif->base + BTIF_IER);
+-
+-	ret = mt8163_btif_dma_setup(btif, &btif->tx);
+-	if (ret)
+-		return ret;
+-
+-	ret = mt8163_btif_dma_setup(btif, &btif->rx);
+-	if (ret)
+-		return ret;
+-
+-	dev_info(dev, "BTIF DMA transport ready; waiting for STP/WMT client\n");
++	/*
++	 * CONSYS powers and owns these registers.  Do not enable clocks, attach
++	 * IRQs, or access BTIF/APDMA here: the STP client acquires CONSYS first
++	 * and then calls mt8163_btif_start().
++	 */
++	dev_info(dev, "BTIF DMA core registered dormant; waiting for STP/WMT\n");
+ 	return 0;
+ }
+ 
+diff --git a/include/linux/mt8163-btif.h b/include/linux/mt8163-btif.h
+index 8be1e9f..6f4758b 100644
+--- a/include/linux/mt8163-btif.h
++++ b/include/linux/mt8163-btif.h
+@@ -23,6 +23,8 @@ struct mt8163_btif_client {
+ };
+ 
+ struct mt8163_btif *mt8163_btif_get(struct device *dev);
++int mt8163_btif_start(struct mt8163_btif *btif);
++void mt8163_btif_stop(struct mt8163_btif *btif);
+ int mt8163_btif_register_client(struct mt8163_btif *btif,
+ 				const struct mt8163_btif_client *client);
+ void mt8163_btif_unregister_client(struct mt8163_btif *btif,

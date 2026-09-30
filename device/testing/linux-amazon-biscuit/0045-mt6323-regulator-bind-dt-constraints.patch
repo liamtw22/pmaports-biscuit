@@ -1,0 +1,30 @@
+--- a/drivers/regulator/mt6323-regulator.c
++++ b/drivers/regulator/mt6323-regulator.c
+@@ -389,13 +389,27 @@
+ 		config.dev = &pdev->dev;
+ 		config.driver_data = &mt6323_regulators[i];
+ 		config.regmap = mt6323->regmap;
++		config.of_node = mt6323_regulators[i].desc.of_match ?
++			of_get_child_by_name(pdev->dev.of_node,
++				mt6323_regulators[i].desc.of_match) : NULL;
++		if (!config.of_node)
++			dev_warn(&pdev->dev, "no DT node for %s (match %s)\n",
++				 mt6323_regulators[i].desc.name,
++				 mt6323_regulators[i].desc.of_match ?: "(none)");
++
+ 		rdev = devm_regulator_register(&pdev->dev,
+ 				&mt6323_regulators[i].desc, &config);
+ 		if (IS_ERR(rdev)) {
++			of_node_put(config.of_node);
+ 			dev_err(&pdev->dev, "failed to register %s\n",
+ 				mt6323_regulators[i].desc.name);
+ 			return PTR_ERR(rdev);
+ 		}
++
++		dev_info(&pdev->dev, "BISCUIT: regulator %s DT=%s\n",
++			 mt6323_regulators[i].desc.name,
++			 config.of_node ? "bound" : "absent");
++		of_node_put(config.of_node);
+ 	}
+ 	return 0;
+ }

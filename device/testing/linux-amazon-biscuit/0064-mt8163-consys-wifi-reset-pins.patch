@@ -1,0 +1,101 @@
+Put the wireless band-gap pins where the block expects them
+
+With 1.8 V present the vendor drives four pins to their dedicated wireless
+functions and nothing else until it has: reset, clock, data and enable, all
+inputs with pull-ups. It is the state the block is built to find, not
+something driven at it, and this port never had it. Neither half survived:
+no pin state in the tree, no selection in the driver.
+
+The state is deliberately not called "default". The pinctrl core applies
+that one before probe, which is earlier than the supplies, and the vendor is
+specific about the order: 1.8 V, then these pins, then it waits.
+
+A board that does not describe the state is not an error, so a missing one
+is reported and the pins left alone.
+
+diff --git a/drivers/misc/mt8163-consys.c b/drivers/misc/mt8163-consys.c
+index 9aafb1e..53fdf3a 100644
+--- a/drivers/misc/mt8163-consys.c
++++ b/drivers/misc/mt8163-consys.c
+@@ -38,6 +38,7 @@
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_reserved_mem.h>
++#include <linux/pinctrl/consumer.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/regmap.h>
+@@ -122,6 +123,8 @@ struct mt8163_consys {
+ 	struct reset_control *cpu_reset;
+ 	struct regmap *infracfg;
+ 	struct regmap *emi;
++	struct pinctrl *pinctrl;
++	struct pinctrl_state *pins_wifi_reset;
+ 	spinlock_t mpu_lock;
+ 	struct regulator_bulk_data supplies[ARRAY_SIZE(consys_supply_names)];
+ 	phys_addr_t emi_base;
+@@ -281,6 +284,22 @@ static int mt8163_consys_power_up(struct mt8163_consys *priv)
+ 		return ret;
+ 	}
+ 
++	/*
++	 * With 1.8 V present the vendor immediately drives the four wireless
++	 * band-gap pins to their dedicated functions, before anything else in
++	 * the sequence. They are inputs with pull-ups, so this is the state the
++	 * block expects to find rather than anything being driven at it. The
++	 * state is deliberately not called "default": the pinctrl core would
++	 * apply that before probe, which is earlier than the supplies.
++	 */
++	if (priv->pins_wifi_reset) {
++		ret = pinctrl_select_state(priv->pinctrl, priv->pins_wifi_reset);
++		if (ret) {
++			dev_err(dev, "failed to select wifi-reset pins: %d\n", ret);
++			goto err_supplies;
++		}
++	}
++
+ 	/* Hold the connectivity processor before its power arrives. */
+ 	ret = reset_control_assert(priv->cpu_reset);
+ 	if (ret) {
+@@ -487,6 +506,17 @@ static int mt8163_consys_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	priv->pinctrl = devm_pinctrl_get(dev);
++	if (IS_ERR(priv->pinctrl))
++		return dev_err_probe(dev, PTR_ERR(priv->pinctrl),
++				     "failed to get pinctrl\n");
++
++	priv->pins_wifi_reset = pinctrl_lookup_state(priv->pinctrl, "wifi-reset");
++	if (IS_ERR(priv->pins_wifi_reset)) {
++		dev_info(dev, "no wifi-reset pin state, leaving the band-gap pins alone\n");
++		priv->pins_wifi_reset = NULL;
++	}
++
+ 	spin_lock_init(&priv->mpu_lock);
+ 
+ 	if (set_emi_mpu) {
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -705,3 +705,21 @@
+ &consys {
+ 	mediatek,emi = <&emi>;
+ };
++
++&pio {
++	consys_wifi_reset: consys-wifi-reset {
++		pins_reset_dat {
++			pinmux = <MT8163_PIN_60_WB_RSTB__FUNC_WB_RSTB>,
++				 <MT8163_PIN_63_WB_SCLK__FUNC_WB_SCLK>,
++				 <MT8163_PIN_64_WB_SDATA__FUNC_WB_SDATA>,
++				 <MT8163_PIN_65_WB_SEN__FUNC_WB_SEN>;
++			input-enable;
++			bias-pull-up;
++		};
++	};
++};
++
++&consys {
++	pinctrl-names = "wifi-reset";
++	pinctrl-0 = <&consys_wifi_reset>;
++};

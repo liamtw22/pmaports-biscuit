@@ -1,0 +1,13 @@
+--- a/drivers/clk/mediatek/clk-mt8163-apmixedsys.c
++++ b/drivers/clk/mediatek/clk-mt8163-apmixedsys.c
+@@ -144,9 +144,9 @@
+ 	clk_data = mtk_alloc_clk_data(CLK_APMIXED_NR_CLK);
+ 	if (!clk_data)
+ 		return -ENOMEM;
+ 
+-	ret = mtk_clk_register_plls(node, plls, ARRAY_SIZE(plls), clk_data);
++	ret = mtk_clk_register_plls(dev, plls, ARRAY_SIZE(plls), clk_data);
+ 	if (ret)
+ 		goto free_clk_data;
+ 
+ 	ret = mtk_clk_register_gates(&pdev->dev, node, apmixed_clks,

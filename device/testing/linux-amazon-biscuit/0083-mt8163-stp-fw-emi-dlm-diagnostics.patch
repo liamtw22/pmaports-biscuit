@@ -1,0 +1,450 @@
+From cb6a66de23daddf7b73b95b861437513a23ff6c7 Mon Sep 17 00:00:00 2001
+From: Codex <codex@localhost>
+Date: Mon, 10 Aug 2026 09:05:07 -0400
+Subject: [PATCH] bluetooth: capture firmware assert EMI diagnostics
+
+---
+ drivers/bluetooth/hci_mt8163_stp.c | 107 +++++++++++++++--
+ drivers/misc/mt8163-consys.c       | 181 +++++++++++++++++++++++++++--
+ include/linux/mt8163-consys.h      |   1 +
+ 3 files changed, 274 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index 709cb9c..a51f2c1 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include <linux/completion.h>
++#include <linux/ctype.h>
+ #include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/firmware.h>
+@@ -21,6 +22,7 @@
+ #include <linux/skbuff.h>
+ #include <linux/slab.h>
+ #include <linux/spinlock.h>
++#include <linux/string.h>
+ #include <linux/workqueue.h>
+ 
+ #include <linux/mt8163-btif.h>
+@@ -35,7 +37,9 @@
+ #define MT8163_STP_TASK_INFO		6
+ #define MT8163_STP_HEADER_LEN		4
+ #define MT8163_STP_TRAILER_LEN		2
+-#define MT8163_STP_MAX_PAYLOAD		2014
++#define MT8163_STP_MAX_PAYLOAD		2048
++#define MT8163_STP_FW_LOG_MESSAGES	16
++#define MT8163_STP_FW_LOG_CHUNK		96
+ #define MT8163_STP_RX_FIFO_SIZE	SZ_16K
+ #define MT8163_STP_WMT_TIMEOUT		msecs_to_jiffies(1500)
+ #define MT8163_STP_FULL_RETRIES		3
+@@ -159,6 +163,7 @@ struct mt8163_stp {
+ 	spinlock_t rx_lock;
+ 	struct work_struct rx_work;
+ 	struct work_struct tx_work;
++	struct work_struct assert_diag_work;
+ 	struct sk_buff_head txq;
+ 	struct mutex tx_lock;
+ 
+@@ -193,6 +198,7 @@ struct mt8163_stp {
+ 	size_t full_tx_len;
+ 	bool hci_registered;
+ 	bool bt_paldo_enabled;
++	bool fw_assert_seen;
+ 	u8 trace_rx;
+ 	u8 trace_tx;
+ 	u8 trace_fw_msg;
+@@ -459,6 +465,89 @@ static bool mt8163_stp_is_fw_message(u8 type)
+ 	return type == MT8163_STP_TASK_STP || type == MT8163_STP_TASK_INFO;
+ }
+ 
++static bool mt8163_stp_payload_contains(const u8 *buf, size_t len,
++					 const char *needle)
++{
++	size_t needle_len = strlen(needle);
++	size_t i;
++
++	if (!needle_len || needle_len > len)
++		return false;
++	for (i = 0; i + needle_len <= len; i++)
++		if (!memcmp(buf + i, needle, needle_len))
++			return true;
++	return false;
++}
++
++static bool mt8163_stp_fw_message_is_assert(struct mt8163_stp *stp)
++{
++	return mt8163_stp_payload_contains(stp->payload, stp->payload_need,
++					   "asser_type") ||
++	       mt8163_stp_payload_contains(stp->payload, stp->payload_need,
++					   "core dump") ||
++	       mt8163_stp_payload_contains(stp->payload, stp->payload_need,
++					   "<ASSERT>");
++}
++
++static void mt8163_stp_log_fw_message(struct mt8163_stp *stp)
++{
++	char line[MT8163_STP_FW_LOG_CHUNK + 1];
++	unsigned int ordinal = ++stp->trace_fw_msg;
++	size_t offset, i, chunk;
++
++	if (ordinal > MT8163_STP_FW_LOG_MESSAGES) {
++		if (ordinal == MT8163_STP_FW_LOG_MESSAGES + 1)
++			dev_warn(stp->dev,
++				 "STP firmware-message log limit reached; suppressing later payloads\n");
++		return;
++	}
++
++	dev_warn(stp->dev, "STP firmware message[%u] type=%u len=%zu\n",
++		 ordinal, stp->payload_type, stp->payload_need);
++	for (offset = 0; offset < stp->payload_need; offset += chunk) {
++		chunk = min_t(size_t, MT8163_STP_FW_LOG_CHUNK,
++			      stp->payload_need - offset);
++		for (i = 0; i < chunk; i++)
++			line[i] = isprint(stp->payload[offset + i]) ?
++				  stp->payload[offset + i] : '.';
++		line[chunk] = '\0';
++		dev_warn(stp->dev,
++			 "STP firmware message[%u] ascii offset=0x%zx len=%zu: %s\n",
++			 ordinal, offset, chunk, line);
++	}
++}
++
++static void mt8163_stp_assert_diag_work(struct work_struct *work)
++{
++	struct mt8163_stp *stp = container_of(work, struct mt8163_stp,
++					      assert_diag_work);
++
++	mt8163_consys_capture_assert_diag(stp->consys_dev);
++}
++
++static void mt8163_stp_mark_fw_assert(struct mt8163_stp *stp)
++{
++	unsigned long flags;
++	bool wake = false;
++
++	if (!READ_ONCE(stp->fw_assert_seen)) {
++		WRITE_ONCE(stp->fw_assert_seen, true);
++		dev_warn(stp->dev,
++			 "CONSYS firmware assertion detected; scheduling read-only EMI diagnostics\n");
++		schedule_work(&stp->assert_diag_work);
++	}
++
++	spin_lock_irqsave(&stp->wmt_lock, flags);
++	if (stp->wmt_waiting) {
++		stp->wmt_result = -EIO;
++		stp->wmt_waiting = false;
++		wake = true;
++	}
++	spin_unlock_irqrestore(&stp->wmt_lock, flags);
++	if (wake)
++		complete(&stp->wmt_done);
++}
++
+ static void mt8163_stp_trace_rx_error(struct mt8163_stp *stp,
+ 				       const char *reason)
+ {
+@@ -486,13 +575,10 @@ static void mt8163_stp_finish_frame(struct mt8163_stp *stp)
+ 
+ 	if (stp->mode == MT8163_STP_MODE_FULL &&
+ 	    mt8163_stp_is_fw_message(stp->payload_type)) {
+-		if (stp->trace_fw_msg++ < 8)
+-			dev_warn(stp->dev,
+-				 "STP firmware message[%u] type=%u len=%zu data=%*ph\n",
+-				 stp->trace_fw_msg, stp->payload_type,
+-				 stp->payload_need,
+-				 (int)min_t(size_t, stp->payload_need, 64),
+-				 stp->payload);
++		mt8163_stp_log_fw_message(stp);
++		if (mt8163_stp_fw_message_is_assert(stp))
++			mt8163_stp_mark_fw_assert(stp);
++		/* Stock task/INFO frames bypass normal full-STP ACK/sequence logic. */
+ 		return;
+ 	}
+ 
+@@ -1090,6 +1176,7 @@ static int mt8163_stp_probe(struct platform_device *pdev)
+ 	init_completion(&stp->wmt_done);
+ 	INIT_WORK(&stp->rx_work, mt8163_stp_rx_work);
+ 	INIT_WORK(&stp->tx_work, mt8163_stp_tx_work);
++	INIT_WORK(&stp->assert_diag_work, mt8163_stp_assert_diag_work);
+ 	skb_queue_head_init(&stp->txq);
+ 
+ 	ret = kfifo_alloc(&stp->rx_fifo, MT8163_STP_RX_FIFO_SIZE, GFP_KERNEL);
+@@ -1138,6 +1225,8 @@ static int mt8163_stp_probe(struct platform_device *pdev)
+ 	return 0;
+ 
+ err_client:
++	/* Finish the bounded EMI/DLM snapshot before CONSYS is powered down. */
++	flush_work(&stp->assert_diag_work);
+ 	if (stp->bt_paldo_enabled) {
+ 		mt8163_consys_bt_paldo_set(stp->consys_dev, false);
+ 		stp->bt_paldo_enabled = false;
+@@ -1152,6 +1241,7 @@ err_consys_dev:
+ err_fifo:
+ 	cancel_work_sync(&stp->rx_work);
+ 	cancel_work_sync(&stp->tx_work);
++	cancel_work_sync(&stp->assert_diag_work);
+ 	kfifo_free(&stp->rx_fifo);
+ 	return ret;
+ }
+@@ -1168,6 +1258,7 @@ static void mt8163_stp_remove(struct platform_device *pdev)
+ 	skb_queue_purge(&stp->txq);
+ 	mt8163_btif_unregister_client(stp->btif, &stp->btif_client);
+ 	cancel_work_sync(&stp->rx_work);
++	cancel_work_sync(&stp->assert_diag_work);
+ 	kfifo_free(&stp->rx_fifo);
+ 	if (stp->bt_paldo_enabled)
+ 		mt8163_consys_bt_paldo_set(stp->consys_dev, false);
+diff --git a/drivers/misc/mt8163-consys.c b/drivers/misc/mt8163-consys.c
+index ac55140..d4674fd 100644
+--- a/drivers/misc/mt8163-consys.c
++++ b/drivers/misc/mt8163-consys.c
+@@ -30,6 +30,7 @@
+  */
+ 
+ #include <linux/bits.h>
++#include <linux/ctype.h>
+ #include <linux/delay.h>
+ #include <linux/io.h>
+ #include <linux/kstrtox.h>
+@@ -47,6 +48,7 @@
+ #include <linux/reset.h>
+ #include <linux/sizes.h>
+ #include <linux/spinlock.h>
++#include <linux/string.h>
+ 
+ #include <linux/mt8163-consys.h>
+ 
+@@ -89,6 +91,25 @@ static const u32 consys_known_ids[] = { 0x8163, 0x0321, 0x0335, 0x0337 };
+  */
+ #define CONSYS_EMI_SHARED_OFFSET	SZ_512K
+ #define CONSYS_EMI_SHARED_SIZE		(343 * SZ_1K)
++#define CONSYS_EMI_FW_SHARED_BASE	0xf0080000U
++#define CONSYS_EMI_DLM_OFFSET		0x000e0000U
++#define CONSYS_EMI_DLM_PROBE_SIZE	128
++
++#define CONSYS_DUMP_APMEM_STATE		0x00
++#define CONSYS_DUMP_HOST_STATE		0x04
++#define CONSYS_DUMP_HOST_SEQ		0x08
++#define CONSYS_DUMP_CHIP_STATE		0x0c
++#define CONSYS_DUMP_CHIP_SEQ		0x10
++#define CONSYS_DUMP_CHIP_ADDR		0x14
++#define CONSYS_DUMP_CHIP_LEN		0x18
++#define CONSYS_DUMP_PRINT_START		0x1c
++#define CONSYS_DUMP_PRINT_LEN		0x20
++#define CONSYS_DUMP_PRINT_IDX		0x24
++#define CONSYS_DUMP_INT_STATUS		0x28
++#define CONSYS_DUMP_PAGED_END		0x2c
++#define CONSYS_DUMP_HOST_ASSERT		0x30
++#define CONSYS_DUMP_CHIP_PUT_DONE	2
++#define CONSYS_DUMP_STATE_POLLS		10
+ 
+ /*
+  * The vendor also fences the upper half of the first megabyte of that window
+@@ -153,6 +174,7 @@ struct mt8163_consys {
+ 	bool supply_enabled[MT8163_CONSYS_NUM_SUPPLIES];
+ 	phys_addr_t emi_base;
+ 	phys_addr_t emi_size;
++	void __iomem *emi_shared;
+ 	u32 emi_mapping;
+ 	u32 chip_id;
+ 	unsigned int users;
+@@ -280,8 +302,7 @@ static int mt8163_consys_map_emi(struct mt8163_consys *priv)
+ /* Match the stock host-side initialization of the shared CONSYS window. */
+ static int mt8163_consys_clear_shared_emi(struct mt8163_consys *priv)
+ {
+-	void __iomem *shared;
+-	phys_addr_t phys;
++	phys_addr_t shared_phys;
+ 
+ 	if (!priv->emi_base)
+ 		return 0;
+@@ -290,21 +311,167 @@ static int mt8163_consys_clear_shared_emi(struct mt8163_consys *priv)
+ 		return dev_err_probe(priv->dev, -EINVAL,
+ 				     "EMI window is too small for the shared CONSYS area\n");
+ 
+-	phys = priv->emi_base + CONSYS_EMI_SHARED_OFFSET;
+-	shared = devm_ioremap(priv->dev, phys, CONSYS_EMI_SHARED_SIZE);
+-	if (!shared)
++	shared_phys = priv->emi_base + CONSYS_EMI_SHARED_OFFSET;
++	priv->emi_shared = devm_ioremap(priv->dev, shared_phys,
++					      CONSYS_EMI_SHARED_SIZE);
++	if (!priv->emi_shared)
+ 		return dev_err_probe(priv->dev, -ENOMEM,
+ 				     "failed to map the shared CONSYS EMI area\n");
+ 
+-	memset_io(shared, 0, CONSYS_EMI_SHARED_SIZE);
++	memset_io(priv->emi_shared, 0, CONSYS_EMI_SHARED_SIZE);
+ 	wmb();
+ 
+ 	dev_info(priv->dev, "cleared shared CONSYS EMI area %pa (%u KiB)\n",
+-		 &phys, CONSYS_EMI_SHARED_SIZE / SZ_1K);
++		 &shared_phys, CONSYS_EMI_SHARED_SIZE / SZ_1K);
+ 
+ 	return 0;
+ }
+ 
++static void mt8163_consys_log_ascii(struct device *dev, const char *tag,
++				     const u8 *buf, size_t len)
++{
++	char line[97];
++	size_t offset, i, chunk;
++
++	for (offset = 0; offset < len; offset += chunk) {
++		chunk = min_t(size_t, sizeof(line) - 1, len - offset);
++		for (i = 0; i < chunk; i++)
++			line[i] = isprint(buf[offset + i]) ? buf[offset + i] : '.';
++		line[chunk] = '\0';
++		dev_warn(dev, "%s ascii offset=0x%zx len=%zu: %s\n",
++			 tag, offset, chunk, line);
++	}
++}
++
++static void mt8163_consys_log_hex(struct device *dev, const char *tag,
++				   const u8 *buf, size_t len)
++{
++	size_t offset, chunk;
++
++	for (offset = 0; offset < len; offset += chunk) {
++		chunk = min_t(size_t, 32, len - offset);
++		dev_warn(dev, "%s hex offset=0x%zx len=%zu: %*ph\n",
++			 tag, offset, chunk, (int)chunk, buf + offset);
++	}
++}
++
++void mt8163_consys_capture_assert_diag(struct device *dev)
++{
++	static const u8 dlm_prefix[] = {
++		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
++		'(', 's', 'c', 'h', 'e', 'd', '_', 'i', 'n', 'f', 'o', '_',
++	};
++	struct mt8163_consys *priv = dev_get_drvdata(dev);
++	void __iomem *dlm_probe;
++	phys_addr_t dump_phys, dlm_phys;
++	u8 first_page[512], dlm[CONSYS_EMI_DLM_PROBE_SIZE];
++	u32 apmem, host_state, host_seq, chip_state, chip_seq;
++	u32 dump_addr, dump_len, print_start, print_len, print_idx;
++	u32 int_status, paged_end, host_assert, relative;
++	size_t copy_len, i;
++	int poll;
++	bool found = false;
++
++	if (!priv || !priv->emi_shared) {
++		dev_warn(dev, "CONSYS assert diagnostics unavailable: shared EMI mapping missing\n");
++		return;
++	}
++
++	for (poll = 0; poll < CONSYS_DUMP_STATE_POLLS; poll++) {
++		chip_state = ioread32(priv->emi_shared + CONSYS_DUMP_CHIP_STATE);
++		if (chip_state == CONSYS_DUMP_CHIP_PUT_DONE)
++			break;
++		msleep(5);
++	}
++	rmb();
++
++	apmem = ioread32(priv->emi_shared + CONSYS_DUMP_APMEM_STATE);
++	host_state = ioread32(priv->emi_shared + CONSYS_DUMP_HOST_STATE);
++	host_seq = ioread32(priv->emi_shared + CONSYS_DUMP_HOST_SEQ);
++	chip_state = ioread32(priv->emi_shared + CONSYS_DUMP_CHIP_STATE);
++	chip_seq = ioread32(priv->emi_shared + CONSYS_DUMP_CHIP_SEQ);
++	dump_addr = ioread32(priv->emi_shared + CONSYS_DUMP_CHIP_ADDR);
++	dump_len = ioread32(priv->emi_shared + CONSYS_DUMP_CHIP_LEN);
++	print_start = ioread32(priv->emi_shared + CONSYS_DUMP_PRINT_START);
++	print_len = ioread32(priv->emi_shared + CONSYS_DUMP_PRINT_LEN);
++	print_idx = ioread32(priv->emi_shared + CONSYS_DUMP_PRINT_IDX);
++	int_status = ioread32(priv->emi_shared + CONSYS_DUMP_INT_STATUS);
++	paged_end = ioread32(priv->emi_shared + CONSYS_DUMP_PAGED_END);
++	host_assert = ioread32(priv->emi_shared + CONSYS_DUMP_HOST_ASSERT);
++
++	dev_warn(dev,
++		 "CONSYS dump control: apmem=%08x host_state=%u host_seq=%u chip_state=%u chip_seq=%u addr=%08x len=%u\n",
++		 apmem, host_state, host_seq, chip_state, chip_seq,
++		 dump_addr, dump_len);
++	dev_warn(dev,
++		 "CONSYS dump control: print=%08x/%u idx=%u int=%08x paged_end=%08x host_assert=%08x polls=%d\n",
++		 print_start, print_len, print_idx, int_status, paged_end,
++		 host_assert, poll);
++
++	/* r176 is intentionally read-only: do not write STP_HOST_DUMP_GET yet. */
++	if (chip_state != CONSYS_DUMP_CHIP_PUT_DONE) {
++		dev_warn(dev, "CONSYS dump page not ready after bounded 50-ms poll\n");
++	} else if (dump_addr < CONSYS_EMI_FW_SHARED_BASE) {
++		dev_warn(dev, "CONSYS dump address %08x is below firmware shared base\n",
++			 dump_addr);
++	} else {
++		relative = dump_addr - CONSYS_EMI_FW_SHARED_BASE;
++		if (relative >= CONSYS_EMI_SHARED_SIZE ||
++		    dump_len > CONSYS_EMI_SHARED_SIZE - relative) {
++			dev_warn(dev,
++				 "CONSYS dump page outside 343-KiB map: relative=%08x len=%u\n",
++				 relative, dump_len);
++		} else {
++			copy_len = min_t(size_t, dump_len, sizeof(first_page));
++			memcpy_fromio(first_page, priv->emi_shared + relative,
++				      copy_len);
++			dump_phys = priv->emi_base + CONSYS_EMI_SHARED_OFFSET +
++				    relative;
++			dev_warn(dev,
++				 "CONSYS first dump page read-only snapshot phys=%pa len=%zu/%u\n",
++				 &dump_phys, copy_len, dump_len);
++			mt8163_consys_log_hex(dev, "CONSYS dump", first_page,
++					       min_t(size_t, copy_len, 128));
++			mt8163_consys_log_ascii(dev, "CONSYS dump", first_page,
++						 copy_len);
++		}
++	}
++
++	if (priv->emi_size < CONSYS_EMI_DLM_OFFSET +
++				     CONSYS_EMI_DLM_PROBE_SIZE) {
++		dev_warn(dev, "CONSYS DLM probe lies outside the reserved EMI window\n");
++		return;
++	}
++
++	/* The DLM target is beyond the 343-KiB dump map: map it independently. */
++	dlm_phys = priv->emi_base + CONSYS_EMI_DLM_OFFSET;
++	dlm_probe = ioremap(dlm_phys, CONSYS_EMI_DLM_PROBE_SIZE);
++	if (!dlm_probe) {
++		dev_warn(dev, "CONSYS DLM short-lived mapping failed at %pa\n",
++			 &dlm_phys);
++		return;
++	}
++	memcpy_fromio(dlm, dlm_probe, sizeof(dlm));
++	iounmap(dlm_probe);
++	for (i = 0; i + sizeof(dlm_prefix) <= sizeof(dlm); i++) {
++		if (!memcmp(dlm + i, dlm_prefix, sizeof(dlm_prefix))) {
++			found = true;
++			break;
++		}
++	}
++	if (found)
++		dev_warn(dev,
++			 "CONSYS DLM read-only probe phys=%pa prefix=present offset=0x%zx\n",
++			 &dlm_phys, i);
++	else
++		dev_warn(dev,
++			 "CONSYS DLM read-only probe phys=%pa prefix=absent\n",
++			 &dlm_phys);
++	mt8163_consys_log_hex(dev, "CONSYS DLM", dlm, sizeof(dlm));
++	mt8163_consys_log_ascii(dev, "CONSYS DLM", dlm, sizeof(dlm));
++}
++EXPORT_SYMBOL_GPL(mt8163_consys_capture_assert_diag);
++
+ /*
+  * Fence the shared-memory half of the window as the vendor's region 13.
+  * Readback is not decoration: this is an experiment, and a write that the
+diff --git a/include/linux/mt8163-consys.h b/include/linux/mt8163-consys.h
+index a7629f6..c3caa84 100644
+--- a/include/linux/mt8163-consys.h
++++ b/include/linux/mt8163-consys.h
+@@ -14,5 +14,6 @@ struct device;
+ int mt8163_consys_acquire(struct device *dev);
+ void mt8163_consys_release(struct device *dev);
+ int mt8163_consys_bt_paldo_set(struct device *dev, bool on);
++void mt8163_consys_capture_assert_diag(struct device *dev);
+ 
+ #endif /* _LINUX_MT8163_CONSYS_H */
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,43 @@
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -117,12 +117,38 @@
+  */
+ &i2c2 {
+         status = "okay";
+ 
+-        tlv320_codec: tlv320aic32x4@18 {
++        tlv320_codec: tlv320aic32x4@18 {        	iov-supply = <&biscuit_codec_1v8>;
++        	ldoin-supply = <&biscuit_codec_1v8>;
++
+                 compatible = "ti,tlv320aic32x4";
+                 reg = <0x18>;
+                 reset-gpios = <&pio 51 0>;
+-                clocks = <&clk26m>;
++                clocks = <&biscuit_codec_mclk>;
+                 clock-names = "mclk";
+         };
+ };
++
++/*
++ * Diagnostic representation of Biscuit's vendor-declared, always-on VIO18
++ * rail. This is a fixed logical supply: it does not program PMIC voltage.
++ */
++&{/} {
++        biscuit_codec_1v8: biscuit-codec-1v8 {
++                compatible = "regulator-fixed";
++                regulator-name = "biscuit-codec-1v8";
++                regulator-min-microvolt = <1800000>;
++                regulator-max-microvolt = <1800000>;
++                regulator-boot-on;
++                regulator-always-on;
++        };
++
++        biscuit_codec_mclk: biscuit-codec-mclk {
++                compatible = "fixed-factor-clock";
++                clocks = <&topckgen 12>;
++                #clock-cells = <0>;
++                clock-mult = <1>;
++                clock-div = <5>;
++                clock-output-names = "biscuit-codec-mclk";
++        };
++};

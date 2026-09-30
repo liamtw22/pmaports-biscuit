@@ -1,0 +1,18 @@
+diff --git a/drivers/misc/mt8163-btif.c b/drivers/misc/mt8163-btif.c
+index 50627c9..e3d3c2a 100644
+--- a/drivers/misc/mt8163-btif.c
++++ b/drivers/misc/mt8163-btif.c
+@@ -183,7 +183,11 @@ int mt8163_btif_write(struct mt8163_btif *btif, const u8 *buf, size_t len)
+ 	valid = readl(tx->base + DMA_VFF_VALID) & DMA_PTR_MASK;
+ 	if (valid && valid < BTIF_TX_FIFO_THRESHOLD)
+ 		writel(DMA_ENABLE, tx->base + DMA_FLUSH);
+ 
+-	ret = len;
++	/*
++	 * This API reports only success (0) or a negative errno.  In particular,
++	 * the STP/WMT client must wait for the controller response after enqueue.
++	 */
++	ret = 0;
+ out:
+ 	mutex_unlock(&btif->tx_lock);
+	return ret;

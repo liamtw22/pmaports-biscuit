@@ -1,0 +1,52 @@
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -636,8 +636,49 @@
+ 		power-domains = <&spm MT8163_POWER_DOMAIN_CONN>;
+ 		resets = <&watchdog MT8163_TOPRGU_CONN_MCU_RST>;
+ 		reset-names = "connsys-cpu";
++		mediatek,infracfg = <&infracfg>;
++		memory-region = <&consys_mem>;
+ 		vcn18-supply = <&mt6323_vcn18_reg>;
+ 		vcn28-supply = <&mt6323_vcn28_reg>;
+ 		vcn33-supply = <&mt6323_vcn33_bt_reg>;
+ 	};
+ };
++
++&{/reserved-memory} {
++	/*
++	 * The connectivity processor cannot reach system memory on its own;
++	 * infracfg windows a slice of DRAM into its address space. That
++	 * window is programmed in megabytes as an offset from the start of
++	 * DRAM. The vendor reserves and aligns two megabytes and uses the
++	 * upper half for shared memory and coredumps, so match that.
++	 */
++	consys_mem: consys-pool {
++		size = <0 0x200000>;
++		alignment = <0 0x200000>;
++		alloc-ranges = <0 0x40000000 0 0x1f800000>;
++		no-map;
++	};
++};
++
++&{/soc} {
++	/*
++	 * The link the connectivity firmware travels over. Despite the name
++	 * the registers are a 16550 at a two bit register shift, with
++	 * MediaTek's own sleep, DMA and handshake registers above 0x40.
++	 */
++	btif: btif@1100c000 {
++		compatible = "mediatek,mt8163-btif";
++		reg = <0 0x1100c000 0 0x1000>,
++		      <0 0x11000700 0 0x80>,
++		      <0 0x11000780 0 0x80>;
++		reg-names = "btif", "tx-dma", "rx-dma";
++		interrupts = <GIC_SPI 112 IRQ_TYPE_LEVEL_LOW>,
++		             <GIC_SPI 110 IRQ_TYPE_LEVEL_LOW>,
++		             <GIC_SPI 111 IRQ_TYPE_LEVEL_LOW>;
++		interrupt-names = "btif", "tx-dma", "rx-dma";
++		mediatek,consys = <&consys>;
++		clocks = <&infracfg CLK_INFRA_BTIF>,
++			 <&infracfg CLK_INFRA_AP_DMA>;
++		clock-names = "btifc", "apdmac";
++	};
++};

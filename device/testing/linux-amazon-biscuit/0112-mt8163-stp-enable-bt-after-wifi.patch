@@ -1,0 +1,100 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -1381,7 +1381,7 @@
+ 	 */
+ 	if (defer_bt) {
+ 		dev_warn(stp->dev,
+-			 "BISCUIT-BTHOLD withholding BT function-on\n");
++			 "BISCUIT-BTHOLD withholding BT function-on until Wi-Fi is up\n");
+ 	} else {
+ 		ret = mt8163_stp_wmt_xfer(stp, wmt_bt_on_cmd,
+ 					  sizeof(wmt_bt_on_cmd), wmt_bt_on_evt,
+@@ -1811,6 +1811,78 @@
+  * Timestamps are boot-relative so early and deferred runs can be compared
+  * directly against the WLAN driver's own WIFI_START log line.
+  */
++/*
++ * Perform the work defer_bt withheld: WMT Bluetooth function-on, then HCI
++ * registration. Called once Wi-Fi is up, so the controller is never asked to
++ * start Wi-Fi firmware while the BT function is enabled - which is what breaks
++ * it (28 boots clean withheld, 2 failures in 3 enabled, same kernel).
++ *
++ * Shares bringup_lock with the bring-up state machine so the two cannot race.
++ * Idempotent: -EAGAIN before READY, 0 if HCI is already registered.
++ */
++static int mt8163_stp_enable_bt(struct mt8163_stp *stp)
++{
++	int ret;
++
++	mutex_lock(&stp->bringup_lock);
++
++	if (stp->bringup_state != MT8163_STP_BRINGUP_READY) {
++		mutex_unlock(&stp->bringup_lock);
++		return -EAGAIN;
++	}
++	if (stp->hci_registered) {
++		mutex_unlock(&stp->bringup_lock);
++		return 0;
++	}
++
++	ret = mt8163_stp_wmt_xfer(stp, wmt_bt_on_cmd, sizeof(wmt_bt_on_cmd),
++				  wmt_bt_on_evt, sizeof(wmt_bt_on_evt));
++	if (ret) {
++		dev_err(stp->dev,
++			"BISCUIT-BTLATE Bluetooth function-on failed (%d)\n", ret);
++		goto out;
++	}
++
++	ret = mt8163_stp_hci_register(stp);
++	if (ret) {
++		dev_err(stp->dev,
++			"BISCUIT-BTLATE HCI registration failed (%d)\n", ret);
++		goto out;
++	}
++
++	dev_warn(stp->dev,
++		 "BISCUIT-BTLATE Bluetooth enabled after Wi-Fi (boot_ms=%lld)\n",
++		 ktime_to_ms(ktime_get_boottime()));
++
++out:
++	mutex_unlock(&stp->bringup_lock);
++	return ret;
++}
++
++/* Write 1 once wlan0 exists to bring Bluetooth up. No-op if already up. */
++static int bt_now_set(const char *val, const struct kernel_param *kp)
++{
++	struct mt8163_stp *stp = stp_for_param;
++	bool go;
++	int ret;
++
++	ret = kstrtobool(val, &go);
++	if (ret)
++		return ret;
++	if (!go)
++		return 0;
++	if (!stp)
++		return -ENODEV;
++	return mt8163_stp_enable_bt(stp);
++}
++
++static const struct kernel_param_ops bt_now_ops = {
++	.set = bt_now_set,
++};
++module_param_cb(bt_now, &bt_now_ops, NULL, 0200);
++MODULE_PARM_DESC(bt_now,
++		 "write 1 to enable Bluetooth now, after Wi-Fi has come up");
++
+ static int mt8163_stp_do_bringup(struct mt8163_stp *stp)
+ {
+ 	unsigned int attempt;
+@@ -1851,7 +1923,7 @@
+ 
+ 	if (defer_bt) {
+ 		dev_warn(stp->dev,
+-			 "BISCUIT-BTHOLD skipping HCI registration (Bluetooth stays down)\n");
++			 "BISCUIT-BTHOLD deferring HCI registration until bt_now\n");
+ 		ret = 0;
+ 	} else {
+ 		ret = mt8163_stp_hci_register(stp);

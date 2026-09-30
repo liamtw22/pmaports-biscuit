@@ -1,0 +1,79 @@
+#!/sbin/openrc-run
+
+name="biscuit-growroot"
+description="Grow the root filesystem to fill its partition if it has not already"
+
+# WHY THIS EXISTS
+#
+# pmOS's initramfs resizes the root PARTITION and then runs resize2fs on it. On
+# this device the second step routinely does nothing: the partition grows but
+# the filesystem does not, because the resize runs before the kernel has re-read
+# the new size of the loop partition. Observed after the r231 flash:
+#
+#     partition  /dev/loop0p2   929 MiB
+#     filesystem                558 MiB      <- 371 MiB unreachable
+#
+# and dmesg shows the initramfs believing it succeeded:
+#
+#     [pmOS-rd]: Resize root partition (/dev/loop0p2)
+#     [pmOS-rd]: Resize 'ext4' root filesystem (/dev/loop0p2)
+#     [pmOS-rd]: resize2fs 1.47.4
+#
+# The device then boots, reports "started" for everything, and silently has a
+# third less disk than it should. It cost a manual `resize2fs` to notice.
+#
+# THIS MATTERS MOST FOR THE REPARTITIONED LAYOUT. Reclaiming system_a/system_b
+# gives the pmOS partition ~2320 MiB, and without this fix the filesystem would
+# stay at whatever the image shipped with - the repartition would appear to do
+# nothing at all.
+#
+# ext4 supports ONLINE growth, so this is safe on the mounted root and needs no
+# reboot. It only ever grows, never shrinks.
+
+depend() {
+	need localmount
+	# Run before anything that might fill or measure the disk.
+	before biscuit-dsp biscuit-pipewire
+}
+
+start() {
+	ebegin "Checking whether the root filesystem fills its partition"
+
+	root_dev=$(awk '$2 == "/" {print $1; exit}' /proc/mounts)
+	if [ -z "$root_dev" ] || [ ! -b "$root_dev" ]; then
+		eend 0 "root device not found; nothing to do"
+		return 0
+	fi
+
+	# Partition size, in 512-byte sectors, as the kernel currently sees it.
+	sys_name=$(basename "$root_dev")
+	part_sectors=$(cat "/sys/class/block/$sys_name/size" 2>/dev/null)
+	[ -n "$part_sectors" ] || { eend 0 "cannot read partition size"; return 0; }
+	part_kib=$((part_sectors / 2))
+
+	# Filesystem size, from its own superblock.
+	fs_blocks=$(tune2fs -l "$root_dev" 2>/dev/null | awk -F: '/^Block count/{gsub(/ /,"",$2); print $2}')
+	block_size=$(tune2fs -l "$root_dev" 2>/dev/null | awk -F: '/^Block size/{gsub(/ /,"",$2); print $2}')
+	[ -n "$fs_blocks" ] && [ -n "$block_size" ] || { eend 0 "not ext[234]; leaving alone"; return 0; }
+	fs_kib=$((fs_blocks * block_size / 1024))
+
+	# Ignore trivial differences: ext4 never uses the final partial block, and a
+	# few hundred KiB of slack is normal rather than a failed resize.
+	slack_kib=$((part_kib - fs_kib))
+	if [ "$slack_kib" -lt 8192 ]; then
+		eend 0 "already filling its partition ($((fs_kib / 1024)) MiB)"
+		return 0
+	fi
+
+	ewarn "root filesystem is $((fs_kib / 1024)) MiB inside a $((part_kib / 1024)) MiB partition; growing it"
+	# Online resize of the mounted root. Growing is supported; failure is not
+	# fatal - the device must still boot with a smaller filesystem.
+	if resize2fs "$root_dev" 2>&1 | while read -r line; do einfo "$line"; done; then
+		new_blocks=$(tune2fs -l "$root_dev" 2>/dev/null | awk -F: '/^Block count/{gsub(/ /,"",$2); print $2}')
+		einfo "root filesystem is now $((new_blocks * block_size / 1024 / 1024)) MiB"
+		eend 0
+	else
+		eend 1 "resize2fs failed; continuing with the smaller filesystem"
+	fi
+	return 0
+}

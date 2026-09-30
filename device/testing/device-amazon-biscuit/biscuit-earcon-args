@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Emit the --*-sound flags for linux-voice-assistant.
+
+The assistant plays several earcons itself, and takes each as a FILE PATH given
+once on the command line. Rather than keep a second list of which sound goes
+with which event, this resolves them out of the single activity->sound table in
+biscuit-earcon-map.py - the same way biscuit-settings reads DEFAULT_MAP from the
+agent instead of copying it. A settings page and an assistant that disagree
+about which sound an activity uses is a bug waiting to happen.
+
+Only the entries marked owner="lva" are emitted. A flag is left out only when
+the assistant should play its OWN sound: the "Assistant defaults" set, or a
+chosen sound that is not installed. Silence is passed as a real file of
+silence, because a missing flag is not silence to the assistant - it is its
+bundled sound, which is what "Off" used to play. The rules are in
+assistant_sound() in the map module, which the settings page uses too.
+
+Because these are read once at startup, changing one requires restarting the
+assistant - the same constraint the mic chain has. The settings page does that
+itself when a change alters what this prints.
+"""
+import importlib.util
+import sys
+
+AGENT = "/usr/bin/biscuit-earcon-map.py"
+# The core table, NOT biscuit-va-leds.py. The agent ships with the voice
+# assistant; the sounds do not, because boot, Wi-Fi, setup and Bluetooth
+# all play earcons on a device with no assistant installed.
+
+
+def main():
+    try:
+        spec = importlib.util.spec_from_file_location("biscuit_earcon_map", AGENT)
+        agent = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(agent)
+        flags = agent.assistant_flags()
+    except Exception as err:  # noqa: BLE001
+        # Emitting nothing is safe: the assistant falls back to its own bundled
+        # sounds, which is exactly the behaviour before earcons existed. Failing
+        # loudly here would take the whole assistant down over a cosmetic detail.
+        sys.stderr.write("biscuit-earcon-args: %s\n" % err)
+        return 0
+
+    sys.stdout.write(" ".join("%s %s" % (flag, path) for flag, path in flags))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

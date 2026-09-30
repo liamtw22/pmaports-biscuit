@@ -1,0 +1,71 @@
+diff --git a/drivers/misc/mt8163-consys.c b/drivers/misc/mt8163-consys.c
+--- a/drivers/misc/mt8163-consys.c
++++ b/drivers/misc/mt8163-consys.c
+@@ -90,6 +90,13 @@
+  * deterministic contents while bring-up is being compared with stock.
+  */
+ #define CONSYS_EMI_SHARED_OFFSET	SZ_512K
++/*
++ * The firmware coredump is 32 KiB. The snapshot used to be a 512-byte
++ * stack buffer, which truncated the register list mid-way through R23 and
++ * lost the stack that follows it - the part that would say how the core
++ * reached the faulting address.
++ */
++#define CONSYS_ASSERT_DUMP_MAX	SZ_32K
+ #define CONSYS_EMI_SHARED_SIZE		(343 * SZ_1K)
+ #define CONSYS_EMI_FW_SHARED_BASE	0xf0080000U
+ #define CONSYS_EMI_DLM_OFFSET		0x000e0000U
+@@ -369,7 +376,7 @@
+ 	struct mt8163_consys *priv = dev_get_drvdata(dev);
+ 	void __iomem *dlm_probe;
+ 	phys_addr_t dump_phys, dlm_phys;
+-	u8 first_page[512], dlm[CONSYS_EMI_DLM_PROBE_SIZE];
++	u8 dlm[CONSYS_EMI_DLM_PROBE_SIZE];
+ 	u32 apmem, host_state, host_seq, chip_state, chip_seq;
+ 	u32 dump_addr, dump_len, print_start, print_len, print_idx;
+ 	u32 int_status, paged_end, host_assert, relative;
+@@ -427,18 +434,35 @@
+ 				 "CONSYS dump page outside 343-KiB map: relative=%08x len=%u\n",
+ 				 relative, dump_len);
+ 		} else {
+-			copy_len = min_t(size_t, dump_len, sizeof(first_page));
+-			memcpy_fromio(first_page, priv->emi_shared + relative,
+-				      copy_len);
++			u8 *page;
++			size_t used;
++
++			copy_len = min_t(size_t, dump_len, CONSYS_ASSERT_DUMP_MAX);
++			page = kmalloc(copy_len, GFP_KERNEL);
++			if (!page) {
++				dev_warn(dev,
++					 "CONSYS dump: no memory for a %zu-byte snapshot\n",
++					 copy_len);
++				goto dump_done;
++			}
++			memcpy_fromio(page, priv->emi_shared + relative, copy_len);
+ 			dump_phys = priv->emi_base + CONSYS_EMI_SHARED_OFFSET +
+ 				    relative;
++
++			/* A short dump should not emit pages of empty lines. */
++			used = copy_len;
++			while (used && !page[used - 1])
++				used--;
++
+ 			dev_warn(dev,
+-				 "CONSYS first dump page read-only snapshot phys=%pa len=%zu/%u\n",
+-				 &dump_phys, copy_len, dump_len);
+-			mt8163_consys_log_hex(dev, "CONSYS dump", first_page,
+-					       min_t(size_t, copy_len, 128));
+-			mt8163_consys_log_ascii(dev, "CONSYS dump", first_page,
+-						 copy_len);
++				 "CONSYS first dump page read-only snapshot phys=%pa len=%zu/%u used=%zu\n",
++				 &dump_phys, copy_len, dump_len, used);
++			mt8163_consys_log_hex(dev, "CONSYS dump", page,
++					       min_t(size_t, used, 128));
++			mt8163_consys_log_ascii(dev, "CONSYS dump", page, used);
++			kfree(page);
++dump_done:
++			;
+ 		}
+ 	}
+ 

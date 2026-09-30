@@ -1,0 +1,940 @@
+#!/usr/bin/env python3
+"""Light ring content driver for the Echo Dot 2 (biscuit).
+
+Plays ring animations in the same text format Fire OS uses, with a priority
+model and brightness handling that reimplement the behaviour observed on a
+stock Echo: the built-in effects biscuit-ring-fx generates, and any Fire OS
+animations the owner imported from their own device. No stock animation ships.
+
+The animation format
+--------------------
+Plain text, one frame per line:
+
+    <duration_ms>:<seg0>,<seg1>,...,<seg11>
+
+Twelve segments, matching the twelve RGB groups on the is31fl3236. A colour is
+either three hex digits (RGB444) or six (RGB888), case-insensitive, and stock
+upsamples the 4-bit form by nibble replication - AnimationResource::upsample4to8
+is literally `v | (v << 4)`, so 0xF becomes 0xFF, not 0xF0.
+
+A bare line `loop` marks the point playback returns to when it reaches the end.
+Frames before it play once as an intro; frames from there on repeat. An
+animation with no `loop` plays once and then retires itself. 227 of stock's 283
+animations loop, 57 of them from the very first line.
+
+Priority
+--------
+biscuit-ring-priorities.json defines five layers. A higher layer number wins,
+and within a layer the rank decides, lower being higher priority. So a
+volume step (layer 4) interrupts Alexa's thinking animation (layer 3), which
+interrupts a timer countdown (layer 2). Only the single highest-priority active
+animation is rendered; the rest stay active underneath and reappear when it
+retires. That is what makes the ring feel coherent rather than a race.
+
+Brightness
+----------
+Not decided here. biscuit-als owns that, publishing a 0-255 ceiling in
+/run/biscuit-als/brightness derived from stock's AmbientLightEngine curve and
+the unit's own factory calibration. This scales every channel by it, which is
+where stock applies its gain too (IssiLedDevice::setFrame ->
+IssiLedDevice::scaleDutyCycle).
+
+The two services are deliberately split the same way stock splits them: als
+decides how bright, this decides what is shown, and only this ever writes the
+LEDs. It publishes its total output to /run/biscuit-ring/output so als can
+subtract the ring's own light from the sensor reading - without that the
+control loop measures itself.
+
+State
+-----
+/run/biscuit-ring/state is a JSON snapshot of what is showing and why. Because
+only the single highest-priority animation renders, "what colour is the ring"
+does not explain itself - the useful facts are which animation won, what it is
+masking, and on what layer. Example, mid volume change while the assistant is
+thinking:
+
+    {"visible": "volume_step-05", "layer": 4, "index": 5,
+     "active_count": 2,
+     "active": [{"name": "volume_step-05", "layer": 4, "visible": true, ...},
+                {"name": "alexa_thinking", "layer": 3, "visible": false,
+                 "masked_by": "volume_step-05", ...}],
+     "brightness": 180, "output": 1530}
+
+Rewritten when the composition changes, not per frame, and renamed into place
+so a reader never sees half an object.
+
+Control
+-------
+A FIFO at /run/biscuit-ring/control, one command per line:
+
+    play <name> [seconds] [#RRGGBB ...]
+                            make an animation active, optionally for a
+                            bounded time and in given colours. One colour
+                            ramps from black; two or more are gradient
+                            stops, the first being the background every
+                            LED starts from.
+    stop <name>             deactivate it
+    clear                   deactivate everything
+    off                     same as clear
+
+    echo "play volume_step-05 2" > /run/biscuit-ring/control
+
+The optional lifetime matters for anything transient. Stock's volume steps show
+for two seconds and then loop on a *blank* frame rather than ending, so without
+a lifetime they stay active forever showing black. Since layer 4 orders
+volume_step-01 highest, one stale dark step then outranks every newer one and
+the ring stops responding entirely - which is exactly what happened the first
+time the volume keys were wired up.
+"""
+import errno
+import glob
+import json
+import math
+import biscuit_ring_config as ring_config
+import os
+import re
+import select
+import signal
+import sys
+import time
+
+RESOURCE_DIR = "/usr/share/biscuit-ring/led-resources"
+# Amazon's own animations, imported by the owner from their backup on the
+# settings page (Storage > Files from stock). Never shipped.
+STOCK_LED_DIR = "/opt/persist/biscuit/led"
+PRIORITY_TABLE = "biscuit-ring-priorities.json"
+
+RING_GLOB = "/sys/class/leds/biscuit:ring:segment-*:*"
+SEGMENTS = 12
+COLOURS = ("red", "green", "blue")
+CHANNEL_MAX = 255
+
+RUN_DIR = "/run/biscuit-ring"
+CONTROL_FIFO = os.path.join(RUN_DIR, "control")
+OUTPUT_FILE = os.path.join(RUN_DIR, "output")
+STATE_FILE = os.path.join(RUN_DIR, "state")
+# Home Assistant effects are generated by biscuit-va-leds at runtime. They are
+# not part of the stock resource archive, so resolve them when played rather
+# than only during the one-time startup scan.
+FX_DIR = os.path.join(RUN_DIR, "fx")
+
+# Written by biscuit-va-leds when Ring Auto Dim is off. Its presence wins over
+# the calibrated ambient ceiling; deleting it hands ownership back to biscuit-als.
+BRIGHTNESS_OVERRIDE = os.path.join(RUN_DIR, "brightness")
+ALS_BRIGHTNESS = "/run/biscuit-als/brightness"
+ALS_POLL_S = 1.0
+DIRECTION_POLL_S = 0.05
+
+# Stock's shortest frame is 16 ms. Nothing is gained by ticking faster.
+#
+# Mainline's is31fl32xx exposes one LED class device per channel rather than
+# stock's whole-frame attribute, so a frame is up to 36 sysfs writes. The I2C
+# itself is not what that costs: the LED core queues the transfer to a worker
+# and keeps only the latest value, so a write returns at once. What cost 12.7 ms
+# a frame was opening and closing 36 sysfs files. Measured on Device 1
+# (qual-captures/ring-0926/): 79 frames/s that way, 2,681 frames/s rewriting
+# held-open files - so Ring keeps them open.
+MIN_TICK_S = 0.016
+
+# Live frames, for the Music Assistant visualiser.
+#
+# A writer drops 12 RGB triples (36 raw bytes) here and the renderer picks
+# them up on its next frame. A FILE rather than a control verb because the
+# data arrives at up to 30 Hz: parsing a line per frame through the FIFO
+# would put a text protocol on the hot path, and a stale "live on" could
+# leave the ring stuck. Freshness is the mtime, so the mode ends by itself
+# when the writer stops - there is no state to get wrong.
+LIVE_FILE = os.path.join(RUN_DIR, "live")
+LIVE_STALE_S = 0.5
+# A gap in the frame stream used to fall straight through to the music
+# activity's own animation, which is a different colour entirely - seen as
+# an occasional blue flash mid-track. Holding the last frame for a few
+# seconds makes a short gap invisible, while a visualiser that has really
+# stopped still gives the ring back to the normal animation.
+LIVE_HOLD_S = 3.0
+# It competes at the music activity's priority, so voice, mute and errors
+# still overlay it rather than being hidden by a running visualiser.
+LIVE_PRIORITY_OF = "act_music"
+LIVE_TICK_S = 1.0 / 30.0
+# The visualiser draws its two colours meeting abruptly between its last
+# and first segment. Where that edge physically lands is a property of
+# this board's LED wiring, not of the visualiser, so the rotation that
+# puts it on the volume-down button belongs here with the rest of the
+# ring's geometry. Positive values move the pattern towards higher
+# segment numbers.
+LIVE_ROTATE = -1
+
+_running = True
+
+
+def log(msg):
+    sys.stdout.write("%s\n" % msg)
+    sys.stdout.flush()
+
+
+def tint_stops(tint):
+    """Gradient stops for a tint selection.
+
+    ONE colour ramps from black, so an unlit LED stays unlit and the primitive
+    keeps its own shape - a comet still reads as a comet. TWO OR MORE are the
+    whole gradient: the first is the background every LED starts from and the
+    last is the colour at full intensity, which is how the visualiser's own
+    two-colour scheme already reads on the settings page.
+    """
+    stops = list(tint)
+    return [(0, 0, 0)] + stops if len(stops) == 1 else stops
+
+
+def apply_tint(pixel, tint):
+    """Re-colour one pixel, using its brightest channel as the position."""
+    stops = tint_stops(tint)
+    pos = (max(pixel) / 255.0) * (len(stops) - 1)
+    index = int(pos)
+    if index >= len(stops) - 1:
+        return tuple(stops[-1])
+    fraction = pos - index
+    lo, hi = stops[index], stops[index + 1]
+    return tuple(round(a + (b - a) * fraction) for a, b in zip(lo, hi))
+
+
+def parse_colour(token):
+    """RGB444 or RGB888 -> (r, g, b) as 8-bit."""
+    t = token.strip()
+    if len(t) == 3:
+        v = int(t, 16)
+        # upsample4to8: v | (v << 4), so 0xF -> 0xFF.
+        return tuple(((v >> s) & 0xF) | (((v >> s) & 0xF) << 4)
+                     for s in (8, 4, 0))
+    if len(t) == 6:
+        v = int(t, 16)
+        return ((v >> 16) & 0xFF, (v >> 8) & 0xFF, v & 0xFF)
+    raise ValueError("bad colour %r" % token)
+
+
+class Animation(object):
+    """One .animation file: a frame list, and where to loop back to."""
+
+    def __init__(self, name, frames, loop_index):
+        self.direction = None
+        self.orientation = None
+        self.name = name
+        self.frames = frames            # [(duration_s, [(r,g,b)] * 12)]
+        self.loop_index = loop_index    # None if it plays once
+        self.blank_loop = self._loops_on_nothing()
+
+    def _loops_on_nothing(self):
+        """True if every frame in the loop section is entirely dark.
+
+        Many of stock's animations end by looping on a blank frame rather than
+        stopping - btconnect fades up, holds blue for 150 ms, then loops a full
+        second of black forever. Treated literally that animation never ends,
+        so it keeps its layer and masks everything below it while showing
+        nothing at all. Stock distinguishes these: libled_hal exports
+        AnimationResource::isCurrentFrameBlank alongside isAnimationPersistent.
+
+        So an animation that loops on nothing but darkness has ended, and is
+        retired when it reaches the loop point. Ones that loop on real content
+        - mics-off_on holds a dim red - stay persistent, which is what the mute
+        ring needs.
+        """
+        if self.loop_index is None:
+            return False
+        return all(not any(any(c) for c in colours)
+                   for _, colours in self.frames[self.loop_index:])
+
+    @property
+    def colour_slots(self):
+        """How many colours the settings page should offer for this animation.
+
+        Distinct CHROMATICITIES, not distinct values: comet's 555/AAA/FFF is one
+        colour at three brightnesses and must not ask for three. Never fewer
+        than two, so every animation can be given a background as well as a main
+        colour, and never more than four, which is past the point of being a
+        choice rather than a chore.
+        """
+        hues = set()
+        for _, colours in self.frames:
+            for colour in colours:
+                peak = max(colour)
+                if peak:
+                    hues.add(tuple(round(v * 255.0 / peak) for v in colour))
+        return max(2, min(4, len(hues)))
+
+    @property
+    def persistent(self):
+        return self.loop_index is not None and not self.blank_loop
+
+    @classmethod
+    def load(cls, path):
+        name = os.path.basename(path).rsplit(".", 1)[0]
+        frames = []
+        direction = None
+        orientation = None
+        loop_index = None
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line:
+                    continue
+                if line.startswith('# orientation '):
+                    try:
+                        value=json.loads(line[len('# orientation '):])
+                        anchor=value.get('anchor')
+                        if (value.get('kind') in ('speaker','noise') and
+                                not isinstance(anchor,bool) and isinstance(anchor,(int,float)) and
+                                0 <= anchor < SEGMENTS):
+                            gain=value.get('background_gain',1)
+                            halo=value.get('halo',0)
+                            if (not isinstance(gain,bool) and isinstance(gain,(int,float)) and 0<=gain<=1 and
+                                    not isinstance(halo,bool) and isinstance(halo,(int,float)) and 0<=halo<=1):
+                                orientation={'kind':value['kind'],'anchor':anchor,
+                                             'background_gain':gain,'halo':halo}
+                    except (ValueError,TypeError,AttributeError): pass
+                    continue
+                if line.startswith('# direction '):
+                    try:
+                        value=json.loads(line[len('# direction '):])
+                        if value.get('kind') in ('speaker','noise') and len(value.get('colours',[]))==2 and all(len(c)==3 and all(isinstance(v,(int,float)) and 0<=v<=255 for v in c) for c in value['colours']):
+                            direction=value
+                    except (ValueError,TypeError,AttributeError): pass
+                    continue
+                if line == "loop":
+                    # Marks where playback returns to, i.e. the frame that is
+                    # about to be appended.
+                    loop_index = len(frames)
+                    continue
+                if ":" not in line:
+                    continue
+                ms, _, rest = line.partition(":")
+                # Several of stock's own files end each line with a trailing
+                # comma, and nightday.animation carries a 13th segment. Both
+                # are tolerated rather than dropping the file: strip empties,
+                # then take the first twelve.
+                tokens = [t for t in (t.strip() for t in rest.split(",")) if t]
+                try:
+                    duration = int(ms) / 1000.0
+                    colours = [parse_colour(c) for c in tokens[:SEGMENTS]]
+                except ValueError:
+                    continue
+                if len(colours) != SEGMENTS:
+                    continue
+                frames.append((duration, colours))
+        if not frames:
+            return None
+        if loop_index is not None and loop_index >= len(frames):
+            loop_index = 0
+        result=cls(name, frames, loop_index)
+        # Retain saved legacy choices while giving them actual direction.
+        if name in ('alexa_point-at-user','alexa_point-at-noise'):
+            direction={'kind':'speaker' if name.endswith('user') else 'noise', 'colours':[[0,255,255],[0,0,255]]}
+        result.direction=direction
+        result.orientation=orientation
+        return result
+
+
+class DirectionDisplay(object):
+    """Display-only motion limit and brief dropout hold, shared across voice states."""
+    def __init__(self):
+        self.angle = None
+        self.last = None
+        self.seen = None
+
+    def update(self, target, now, muted=False):
+        gap = now-self.last if self.last is not None else 0
+        dt = max(0,min(.1,gap))
+        self.last = now
+        if muted or gap > 1.5:
+            self.angle = None
+            self.seen = None
+        if muted:
+            return None,0
+        if target is not None:
+            self.seen = now
+            if self.angle is None:
+                self.angle = target
+            else:
+                delta = (target-self.angle+6)%12-6
+                # Ten-degree deadband; 450ms response; at most 120deg/sec.
+                if abs(delta) > 1/3:
+                    step = delta*(1-math.exp(-dt/.45))
+                    self.angle = (self.angle+max(-4*dt,min(4*dt,step)))%12
+        if self.angle is None or self.seen is None:
+            return None,0
+        age = now-self.seen
+        opacity = max(0,min(1,1-(age-.7)/.4))
+        if opacity == 0:
+            self.angle = None
+        return self.angle,opacity
+
+
+_direction_displays = {kind:DirectionDisplay() for kind in ('speaker','noise')}
+
+
+def direction_render_timeout(timeout, visible):
+    # A held stock frame can last a second; direction must redraw independently.
+    if visible and (visible.anim.direction or visible.anim.orientation):
+        return min(timeout,DIRECTION_POLL_S)
+    return timeout
+
+
+class Playback(object):
+    """An active animation and where it has got to."""
+
+    def __init__(self, anim, layer, index, expires_in=None, tint=None):
+        self.anim = anim
+        self.tint = tint
+        self.layer = layer
+        self.index = index          # position in its layer, lower wins
+        self.frame = 0
+        self.finished = False
+        # Transient animations need an explicit lifetime. Stock's volume steps
+        # show for two seconds and then *loop on a blank frame* rather than
+        # ending, so without this they stay active forever showing black - and
+        # because layer 4 orders volume_step-01 highest, one stale dark step
+        # outranks every newer one and the ring goes permanently dark.
+        self.expires_at = (None if expires_in is None
+                           else time.monotonic() + expires_in)
+        # Frame 0 is due when *its own* duration has elapsed. Seeding this
+        # with the bare current time instead skips frame 0 entirely, which is
+        # how the first version rendered volume_step-05 as dark: its whole
+        # visible content is frame 0.
+        self.next_due = time.monotonic() + self._duration(0)
+        self.started_at = time.monotonic()
+
+    @property
+    def priority(self):
+        # Higher layer first, then lower index.
+        return (-self.layer, self.index)
+
+    def current(self):
+        pixels = self._current_untinted()
+        if not self.tint:
+            return pixels
+        # Most primitives in the core bundle carry no colour of their own -
+        # comet is 555/AAA/FFF, the volume steps are a white ramp - so an
+        # activity chooses a SHAPE here and supplies the colours separately.
+        # Position is the brightest channel rather than a luma weighting, so an
+        # already-saturated source lands on the last stop instead of part way
+        # along the gradient.
+        return [apply_tint(p, self.tint) for p in pixels]
+
+    def _current_untinted(self):
+        if self.anim.direction:
+            info=self.anim.direction
+            segment=ring_config.direction_segment(info['kind'])
+            fore,back=info['colours']
+            pixels=[]
+            for i in range(SEGMENTS):
+                distance=min((i-segment)%SEGMENTS,(segment-i)%SEGMENTS) if segment is not None else 99
+                strength=max(0,min(1,1.5-distance))
+                pixels.append(tuple(round(b+(f-b)*strength) for f,b in zip(fore,back)))
+            return pixels
+        pixels=self.anim.frames[self.frame][1]
+        if self.anim.orientation:
+            info=self.anim.orientation
+            target=ring_config.direction_segment(info['kind'])
+            muted=ring_config._read('/run/biscuit-audio/muted','1')!='0'
+            segment,opacity=_direction_displays[info['kind']].update(target,time.monotonic(),muted)
+            background=max(pixels,key=pixels.count)
+            base=tuple(round(v*info.get('background_gain',1)) for v in background)
+            if segment is None:
+                return [base]*SEGMENTS
+            shift=(segment-info['anchor'])%SEGMENTS
+            whole=int(shift); fraction=shift-whole
+            # Rotate the original frame, including its envelope and accents.
+            # Fractional positions blend adjacent LEDs, avoiding 30-degree jumps.
+            rotated=[tuple(a*(1-fraction)+b*fraction
+                           for a,b in zip(pixels[(i-whole)%SEGMENTS],
+                                          pixels[(i-whole-1)%SEGMENTS]))
+                     for i in range(SEGMENTS)]
+            background=max(pixels,key=pixels.count)
+            # A one-LED cyan spot otherwise becomes two half-bright spots
+            # halfway between LEDs. Preserve its peak contrast against the
+            # background, without increasing the global brightness setting.
+            peak=max(abs(c-b) for pixel in pixels for c,b in zip(pixel,background))
+            blended=max(abs(c-b) for pixel in rotated for c,b in zip(pixel,background))
+            scale=peak/blended if blended else 1
+            rotated=[tuple(max(0,min(255,round(b+(c-b)*scale)))
+                           for c,b in zip(pixel,background)) for pixel in rotated]
+            halo=info.get('halo',0)
+            styled=[]
+            for i,pixel in enumerate(rotated):
+                # A small adjacent halo gives the cyan marker readable width.
+                delta=[]
+                for ch,(c,b) in enumerate(zip(pixel,background)):
+                    extra=max(0,rotated[(i-1)%SEGMENTS][ch]-b,
+                              rotated[(i+1)%SEGMENTS][ch]-b)*halo
+                    delta.append(max(c-b,extra) if extra>0 else c-b)
+                strength=min(1,max(abs(v) for v in delta)/peak) if peak else 0
+                # Dim only the background; retain the full original foreground.
+                styled.append(tuple(max(0,min(255,round(low+(b-low)*strength+d)))
+                                    for low,b,d in zip(base,background,delta)))
+            return [tuple(round(b+(c-b)*opacity) for c,b in zip(pixel,base))
+                    for pixel in styled]
+        return pixels
+
+    def _duration(self, frame):
+        return max(self.anim.frames[frame][0], MIN_TICK_S)
+
+    def advance(self, now):
+        """Step forward for every frame whose time has expired.
+
+        A loop rather than a single step so a late wake-up catches up instead
+        of stretching the animation. Deadlines accumulate rather than being
+        rebased on `now`, so timing does not drift.
+        """
+        if self.expires_at is not None and now >= self.expires_at:
+            self.finished = True
+            return
+        while not self.finished and now >= self.next_due:
+            self.frame += 1
+            if self.frame >= len(self.anim.frames):
+                if self.anim.loop_index is None:
+                    self.finished = True
+                    self.frame = len(self.anim.frames) - 1
+                    return
+                self.frame = self.anim.loop_index
+            # Reaching a loop section that is nothing but darkness is the end
+            # of the animation, not the start of an invisible eternity.
+            if self.anim.blank_loop and self.frame >= self.anim.loop_index:
+                self.finished = True
+                return
+            self.next_due += self._duration(self.frame)
+
+    def due_in(self, now):
+        if self.finished:
+            return None
+        due = self.next_due
+        if self.expires_at is not None:
+            due = min(due, self.expires_at)
+        return max(0.0, due - now)
+
+
+class Ring(object):
+    """The 36 LED class devices, written only where something changed."""
+
+    def __init__(self):
+        self.fds = {}
+        self.paths = {}
+        for path in glob.glob(RING_GLOB):
+            m = re.search(r"segment-(\d+):(red|green|blue)$",
+                          os.path.basename(path))
+            if m:
+                self.paths[(int(m.group(1)), m.group(2))] = os.path.join(
+                    path, "brightness")
+        self.present = len(self.paths) > 0
+        self._written = {}
+
+    def show(self, colours, brightness):
+        """Scale by the ALS ceiling and push. Returns total output written."""
+        total = 0
+        for seg in range(SEGMENTS):
+            rgb = colours[seg] if seg < len(colours) else (0, 0, 0)
+            for ci, colour in enumerate(COLOURS):
+                value = (rgb[ci] * brightness) // CHANNEL_MAX
+                total += value
+                key = (seg, colour)
+                if self._written.get(key) == value:
+                    continue
+                fd = self.fds.get(key)
+                if fd is None:
+                    path = self.paths.get(key)
+                    if path is None:
+                        continue
+                    try:
+                        fd = self.fds[key] = os.open(path, os.O_WRONLY)
+                    except OSError:
+                        continue
+                try:
+                    os.pwrite(fd, str(value).encode(), 0)
+                    self._written[key] = value
+                except OSError:
+                    # The device may have gone away; reopen on the next frame.
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+                    self.fds.pop(key, None)
+        return total
+
+    def off(self):
+        self.show([(0, 0, 0)] * SEGMENTS, 0)
+
+
+def load_animations(resource_dir):
+    """Every .animation file, plus the layer/priority map."""
+    anims = {}
+    for path in glob.glob(os.path.join(resource_dir, "*.animation")):
+        a = Animation.load(path)
+        if a:
+            anims[a.name] = a
+
+    # One flat table of our own, replacing the two-file arrangement this used to
+    # read. That was stock's layer_config_common.json plus an alias map pointing
+    # into it, which meant shipping Amazon's file verbatim - their prose, and
+    # about 150 activity names this device has never had (OTA_step_1..12, sms_*,
+    # call_*, sixty timer_led_countdown_sec entries). The five-layer model is
+    # behaviour and is kept exactly; the file is not ours to redistribute.
+    #
+    # The replacement was generated from the old pair and proved equivalent:
+    # every one of the 3,655 name pairs orders the same way, including against
+    # names absent from both. Ranks were renumbered densely in the process, so
+    # they are positions, not stock's array indices.
+    priority = {}
+    cfg_path = os.path.join(resource_dir, PRIORITY_TABLE)
+    try:
+        with open(cfg_path) as f:
+            table = json.load(f).get("priorities", {})
+        for name, pair in table.items():
+            priority[name] = (int(pair[0]), int(pair[1]))
+    except (OSError, ValueError, TypeError, IndexError) as e:
+        log("biscuit-ring: no usable %s (%s); everything gets layer 0"
+            % (cfg_path, e))
+    return anims, priority
+
+
+_live_held = [None, 0.0]
+
+
+def read_live():
+    """The current live frame, the last one during a short gap, or None."""
+    now = time.time()
+    frame = None
+    try:
+        if now - os.path.getmtime(LIVE_FILE) <= LIVE_STALE_S:
+            with open(LIVE_FILE, "rb") as handle:
+                raw = handle.read(SEGMENTS * 3)
+            if len(raw) == SEGMENTS * 3:
+                frame = [(raw[i * 3], raw[i * 3 + 1], raw[i * 3 + 2])
+                         for i in range(SEGMENTS)]
+    except OSError:
+        frame = None
+    if frame is not None:
+        _live_held[0] = frame
+        _live_held[1] = now
+        return frame
+    if _live_held[0] is not None and now - _live_held[1] <= LIVE_HOLD_S:
+        return _live_held[0]
+    _live_held[0] = None
+    return None
+
+
+def read_brightness():
+    # The renderer owns application of the policy, even without the optional
+    # peripheral agent. A stale runtime override cannot defeat auto dim.
+    return ring_config.effective_brightness()
+
+
+def publish_output(total):
+    try:
+        with open(OUTPUT_FILE, "w") as f:
+            f.write(str(total))
+    except OSError:
+        pass
+
+
+def publish_state(visible, active, brightness, total):
+    """Answer "what is the ring showing, and why" in one file.
+
+    The ring has always known this and never said it. Only the single
+    highest-priority animation renders, so when the ring looks wrong the useful
+    question is not what colour it is - that is already in OUTPUT_FILE - but
+    which animation won and what it is masking. Without that the only way to
+    find out was to add logging and reproduce.
+
+    Written on a change of COMPOSITION - the visible animation, the active set,
+    or the brightness - and not per frame. A running animation rewrites its
+    colours every few tens of milliseconds; none of that changes the answer to
+    "why", and a file rewritten at frame rate is a poor thing to poll.
+
+    Atomic, unlike publish_output: this one has a reader that parses it, and a
+    half-written JSON object is a crash in the reader rather than a wrong
+    number.
+    """
+    entries = []
+    now = time.monotonic()
+    for name, pb in sorted(active.items(),
+                           key=lambda kv: (kv[1].priority[0], kv[1].priority[1])):
+        entries.append({
+            "name": name,
+            "layer": pb.layer,
+            "index": pb.index,
+            "visible": pb is visible,
+            # Why this one is NOT showing, in the same terms the priority model
+            # uses: a larger layer wins, and within a layer a smaller index.
+            "masked_by": (None if pb is visible
+                          else (visible.anim.name if visible else None)),
+            "persistent": pb.anim.persistent,
+            "age_s": round(now - pb.started_at, 2),
+            "expires_in_s": (None if pb.expires_at is None
+                             else round(max(0.0, pb.expires_at - now), 2)),
+        })
+    doc = {
+        "visible": visible.anim.name if visible else None,
+        "layer": visible.layer if visible else None,
+        "index": visible.index if visible else None,
+        "persistent": visible.anim.persistent if visible else None,
+        "active_count": len(active),
+        "active": entries,
+        "brightness": brightness,
+        "output": total,
+    }
+    tmp = STATE_FILE + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(doc, f)
+        os.rename(tmp, STATE_FILE)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def stop(signum, frame):
+    global _running
+    _running = False
+
+
+def main():
+    import argparse
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--resources", default=RESOURCE_DIR)
+    ap.add_argument("--play", action="append", default=[],
+                    help="animation to start with; repeatable")
+    args = ap.parse_args()
+
+    anims, priority = load_animations(args.resources)
+    # An empty resource directory is NORMAL and must not be fatal. The shipped
+    # defaults are biscuit-ring-fx effects, rendered per activity into
+    # /opt/persist/led-fx/act_<activity>.animation and loaded on demand by
+    # start(); the only files here are the layer tables and the volume ramp.
+    # Exiting when this set is empty is what would leave a device with no stock
+    # assets - which is every device but the one they were extracted from -
+    # with no ring at all.
+    if not anims:
+        log("biscuit-ring: no static animations under %s; "
+            "generated effects only" % args.resources)
+    log("biscuit-ring: %d animations, %d with a configured layer"
+        % (len(anims), len(priority)))
+
+    ring = Ring()
+    if not ring.present:
+        log("biscuit-ring: no ring LEDs found")
+        return 1
+
+    os.makedirs(RUN_DIR, exist_ok=True)
+    if not os.path.exists(CONTROL_FIFO):
+        os.mkfifo(CONTROL_FIFO, 0o622)
+    # mkfifo's mode is masked by umask, which leaves it root-only and means
+    # every trigger needs sudo. Set it explicitly.
+    try:
+        os.chmod(CONTROL_FIFO, 0o622)
+    except OSError:
+        pass
+    # O_RDWR so the FIFO never reports EOF when a writer closes, which would
+    # otherwise spin select() at 100% the moment anyone used echo.
+    fifo = os.open(CONTROL_FIFO, os.O_RDWR | os.O_NONBLOCK)
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+
+    active = {}
+    pending = ""
+    brightness = read_brightness()
+    last_direction = 0.0
+    last_als = 0.0
+    last_shown = None
+    last_composition = object()   # never equal to a real composition tuple
+    last_total = 0
+
+    def start(name, expires_in=None, tint=None):
+        # Generated HA effects share a stable name (for example fx_solid) but
+        # are atomically rewritten in a new colour on every command. Reload
+        # them here, otherwise the player either cannot find them at all or
+        # keeps the first colour it ever saw.
+        if name.startswith(("fx_", "act_", "volume_step-", "volume-muted")):
+            anim = None
+            directories = [FX_DIR]
+            # act_* AND the volume ramp are both written by biscuit-settings
+            # onto the persist partition, so both have to be looked for there.
+            # Only fx_* is confined to the tmpfs staging directory. Extending
+            # the prefix list above without extending this one is what made
+            # every volume_step-NN silently resolve to nothing.
+            if name.startswith(("act_", "volume_step-", "volume-muted")):
+                directories.append("/opt/persist/led-fx")
+            for directory in directories:
+                try:
+                    anim = Animation.load(os.path.join(directory, name + ".animation"))
+                except (OSError, ValueError):
+                    continue
+                if anim is not None:
+                    break
+            if anim is not None:
+                anims[name] = anim
+        else:
+            anim = anims.get(name)
+            if anim is None and "/" not in name and not name.startswith("."):
+                # An imported stock animation, read afresh on every start like
+                # the generated ones, so an import or a removal on the settings
+                # page takes effect without restarting the ring. Their layers
+                # come from the same priority table as ever.
+                try:
+                    anim = Animation.load(os.path.join(STOCK_LED_DIR, name + ".animation"))
+                except (OSError, ValueError, UnicodeDecodeError):
+                    anim = None
+        if anim is None:
+            log("biscuit-ring: no animation %r" % name)
+            return
+        # Stock's layer config says a larger layer wins and, within a layer,
+        # a smaller array index wins. Generated HA effects have the default
+        # (0, 999), so voice/volume activity correctly overlays them.
+        layer, index = priority.get(name, (0, 999))
+        active[name] = Playback(anim, layer, index, expires_in, tint)
+
+    for name in args.play:
+        start(name)
+
+    while _running:
+        now = time.monotonic()
+
+        if now - last_als >= ALS_POLL_S:
+            brightness = read_brightness()
+            last_als = now
+
+        for name, pb in list(active.items()):
+            pb.advance(now)
+            if pb.finished:
+                del active[name]
+
+        # priority is (-layer, index) - an ASCENDING sort key, highest layer
+        # first and then lowest index - so the winner is the MINIMUM.
+        #
+        # This was max() over (priority[0], -priority[1]), which maximises
+        # -layer and therefore picked the LOWEST layer: exactly backwards, and
+        # backwards in the worst direction. mics-off_on sits on layer 0 because
+        # it is the persistent baseline everything else should overlay, so the
+        # inverted comparison let it mask every transient above it - adjusting
+        # the volume while muted lit nothing at all. Generated fx_ effects take
+        # the same (0, 999) default so that voice and volume overlay them, and
+        # they masked those instead.
+        #
+        # Found 2026-09-04 by the state file added above, on its first run: the
+        # snapshot showed volume_step-01 on layer 4 "masked_by mics-off_on" on
+        # layer 0, the reverse of the example in this module's own docstring.
+        visible = min(active.values(), key=lambda p: p.priority) if active else None
+        if visible and (visible.anim.direction or visible.anim.orientation) and now-last_direction>=.5:
+            with open(os.path.join(RUN_DIR,'direction-active'),'w') as demand:
+                demand.write(str(now))
+            last_direction=now
+        colours = visible.current() if visible else [(0, 0, 0)] * SEGMENTS
+
+        # A fresh live frame replaces the composition, but only where it
+        # would have won on priority anyway - so a wake word, a mute latch
+        # or an error still interrupts the visualiser exactly as it
+        # interrupts the music animation it stands in for.
+        live = read_live()
+        if live is not None and LIVE_ROTATE:
+            r = LIVE_ROTATE % SEGMENTS
+            live = live[-r:] + live[:-r]
+        if live is not None:
+            base = priority.get(LIVE_PRIORITY_OF, (0, 999))
+            live_priority = (-base[0], base[1])
+            # <=, not <: the live frame borrows the music activity's own
+            # priority, so against the static music animation it TIES -
+            # and a strict < meant it always lost and never rendered.
+            # Anything genuinely higher priority (mute at (0,0), voice on
+            # layer 3) still compares strictly less and still wins.
+            if visible is None or live_priority <= visible.priority:
+                colours = live
+
+        state = (tuple(colours), brightness)
+        if state != last_shown:
+            last_total = ring.show(colours, brightness)
+            publish_output(last_total)
+            last_shown = state
+
+        # Composition, not colour: see publish_state.
+        composition = (visible.anim.name if visible else None,
+                       tuple(sorted(active)), brightness)
+        if composition != last_composition:
+            publish_state(visible, active, brightness, last_total)
+            last_composition = composition
+
+        # Sleep until the next frame is due, or the next ALS poll.
+        waits = [p.due_in(now) for p in active.values()]
+        waits = [w for w in waits if w is not None]
+        timeout = min(waits) if waits else ALS_POLL_S
+        timeout = max(MIN_TICK_S, min(timeout, ALS_POLL_S))
+        timeout = direction_render_timeout(timeout,visible)
+        # While a live frame is fresh the next redraw is not driven by any
+        # animation's frame list, so the animation-derived timeout above
+        # would sleep straight past it.
+        # read_live() returns the held frame during a gap too, so this
+        # covers the hold window as well as a live stream.
+        #
+        # The tick is measured from the top of this pass, not from now: sleeping
+        # a whole LIVE_TICK_S after drawing made the period draw-time + tick.
+        # With the file handles above, measured on Device 1 against a 30 Hz
+        # stream: 21.6 frames/s drawn at 23% of a core before, 29.7 at 8% after.
+        if live is not None:
+            timeout = min(timeout, max(0.0, now + LIVE_TICK_S - time.monotonic()))
+
+        r, _, _ = select.select([fifo], [], [], timeout)
+        if not r:
+            continue
+        try:
+            chunk = os.read(fifo, 4096).decode("utf-8", "replace")
+        except OSError as e:
+            if e.errno != errno.EAGAIN:
+                raise
+            continue
+        pending += chunk
+        while "\n" in pending:
+            line, _, pending = pending.partition("\n")
+            parts = line.split()
+            if not parts:
+                continue
+            cmd, rest = parts[0], parts[1:]
+            if cmd == "play" and rest:
+                expires_in = None
+                tint = []
+                # Lifetime and colours are optional and order-independent, and
+                # colours accumulate in the order given. '#' always means a
+                # colour; otherwise seconds are tried FIRST, because a bare
+                # "100" is three hex digits AND a valid float and would
+                # silently become a colour if colours were tried first.
+                for token in rest[1:]:
+                    if token.startswith("#"):
+                        try:
+                            tint.append(parse_colour(token[1:]))
+                        except ValueError:
+                            log("biscuit-ring: bad colour %r" % token)
+                        continue
+                    try:
+                        expires_in = float(token)
+                        continue
+                    except ValueError:
+                        pass
+                    try:
+                        tint.append(parse_colour(token))
+                    except ValueError:
+                        log("biscuit-ring: ignoring %r in %r" % (token, line))
+                start(rest[0], expires_in, tint)
+            elif cmd == "stop" and rest:
+                active.pop(rest[0], None)
+            elif cmd in ("clear", "off"):
+                active.clear()
+            else:
+                log("biscuit-ring: unknown command %r" % line)
+
+    ring.off()
+    publish_output(0)
+    publish_state(None, {}, brightness, 0)
+    os.close(fifo)
+    log("biscuit-ring: stopped")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

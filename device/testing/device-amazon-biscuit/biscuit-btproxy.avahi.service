@@ -1,0 +1,24 @@
+<?xml version="1.0" standalone='no'?><!--*-nxml-*-->
+<!DOCTYPE service-group SYSTEM "avahi-service.dtd">
+<!--
+  Advertise the Bluetooth proxy as an ESPHome device so Home Assistant offers
+  it for discovery instead of having to be given an IP.
+
+  A static file rather than avahi-publish-service: this image ships no avahi
+  CLI tools (only the daemon), and a file avoids a supervised subprocess whose
+  only job is to sit there. avahi picks up changes in this directory without a
+  restart.
+
+  This is published unconditionally, even when the proxy is disabled. That is
+  deliberate and it is the lesser of two evils: Home Assistant showing a
+  discovered device that refuses connections is a clearer failure than a device
+  that silently never appears, and rewriting this file on every toggle would
+  mean the settings page needs write access to /etc/avahi.
+-->
+<service-group>
+  <name replace-wildcards="yes">%h Bluetooth Proxy</name>
+  <service>
+    <type>_esphomelib._tcp</type>
+    <port>6054</port>
+  </service>
+</service-group>

@@ -1,0 +1,22 @@
+#!/sbin/openrc-run
+name="biscuit-mic-pump"
+description="Publish the processed call microphone through the shared audio source"
+# Keep audio off CPU 0, which handles USB/SPI interrupt bursts.
+# Apply before exec so supervised replacements and pump children inherit it.
+command="/usr/bin/taskset"
+command_args="-c 1-3 /usr/bin/chrt -f 47 /usr/bin/python3 /usr/bin/biscuit-call-pump.py"
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+# Logged through a pipe, not straight to the file. This service runs at
+# realtime priority, and a write to the ext4 root can stall for most of a
+# second behind the journal while something else writes (3.8: the call DSP
+# did exactly that and its branch overflowed). OpenRC hands the output to a
+# cat at ordinary priority instead, which takes any such stall; the pipe
+# absorbs 64 KiB meanwhile.
+output_logger="cat >> /var/log/biscuit-mic-pump.log"
+error_logger="cat >> /var/log/biscuit-mic-pump.log"
+depend() {
+    need biscuit-mic-hub
+    after biscuit-pipewire
+}

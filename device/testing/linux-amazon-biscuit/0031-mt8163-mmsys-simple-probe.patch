@@ -1,0 +1,13 @@
+--- a/drivers/clk/mediatek/clk-mt8163-mmsys.c
++++ b/drivers/clk/mediatek/clk-mt8163-mmsys.c
+@@ -95,8 +95,8 @@
+ MODULE_DEVICE_TABLE(platform, clk_mt8163_mm_id_table);
+ 
+ static struct platform_driver clk_mt8163_mm_drv = {
+-	.probe = mtk_clk_pdev_probe,
+-	.remove = mtk_clk_pdev_remove,
++	.probe = mtk_clk_simple_probe,
++	.remove = mtk_clk_simple_remove,
+ 	.driver = {
+ 		.name = "clk-mt8163-mmsys",
+ 	},

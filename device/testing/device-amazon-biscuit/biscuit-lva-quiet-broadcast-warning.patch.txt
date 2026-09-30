@@ -1,0 +1,41 @@
+Stop MediaPlayerEntity warning about messages that were never for it.
+
+satellite.py dispatches ListEntitiesRequest, SwitchCommandRequest,
+NumberCommandRequest, SelectCommandRequest and LightCommandRequest by
+BROADCASTING them to every entity and letting each one match on its own key:
+
+    elif isinstance(msg, (ListEntitiesRequest, ..., LightCommandRequest)):
+        for entity in self.state.entities:
+            yield from entity.handle_message(msg)
+
+That is the designed dispatch, so every entity legitimately sees messages
+addressed to other entities. MediaPlayerEntity was the only one that treated
+that as an anomaly, and it logged a WARNING for each:
+
+    WARNING:MediaPlayerEntity[0]:Unknown message type received:
+        <class 'api_pb2.SwitchCommandRequest'>
+    WARNING:MediaPlayerEntity[0]:Unknown message type received:
+        <class 'api_pb2.LightCommandRequest'>
+
+So every Auto Dim toggle, every BT Pairing switch and every ring colour change
+from Home Assistant produced a warning on a device where nothing was wrong,
+which is exactly the sort of noise that hides a real fault.
+
+The command still reaches the entity that owns it; only the log line changes.
+debug rather than deleted, because an entity receiving a type no entity handles
+is still worth being able to see with -v.
+
+--- a/linux_voice_assistant/entity.py
++++ b/linux_voice_assistant/entity.py
+@@ -222,7 +222,10 @@
+             self._log.debug("SubscribeHomeAssistantStatesRequest received")
+             yield self._get_state_message()
+         else:
+-            self._log.warning("Unknown message type received: %s", type(msg))
++            # Not an error: satellite.py broadcasts entity commands to every
++            # entity and each matches on its own key, so seeing another
++            # entity's message is the normal case rather than a fault.
++            self._log.debug("Message for another entity ignored: %s", type(msg))
+ 
+     def _update_state(self, new_state: MediaPlayerState) -> MediaPlayerStateResponse:
+         self._log.debug("SET NEW STATE: %s => %s", self.state, new_state)

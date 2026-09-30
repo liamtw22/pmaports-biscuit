@@ -1,0 +1,18 @@
+# Hand backups and caches
+*.pre-led
+*.r287
+__pycache__/
+*.pyc
+
+# Build outputs: the zips, their payloads and output folders
+*.zip
+*.img
+*.img.xz
+/out*/
+/payload*/
+/zip/out*/
+/biscuit-tool.out
+
+# Nothing over 5 MB is tracked (git cannot express a size rule: check
+# with  find . -size +5M -not -path "./.git/*"  before adding). The one
+# exception is zip/bin/, the static binaries the zips carry.

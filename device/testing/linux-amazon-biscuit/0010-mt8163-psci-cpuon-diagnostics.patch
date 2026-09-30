@@ -1,0 +1,14 @@
+--- a/arch/arm64/kernel/psci.c
++++ b/arch/arm64/kernel/psci.c
+@@ -39,8 +39,11 @@
+ static int cpu_psci_cpu_boot(unsigned int cpu)
+ {
+ 	phys_addr_t pa_secondary_entry = __pa_symbol(secondary_entry);
+ 	int err = psci_ops.cpu_on(cpu_logical_map(cpu), pa_secondary_entry);
++	pr_info("MT8163-DIAG: PSCI CPU_ON cpu=%u mpidr=%llx entry=%pa ret=%d\n",
++	        cpu, (unsigned long long)cpu_logical_map(cpu),
++	        &pa_secondary_entry, err);
+ 	if (err && err != -EPERM)
+ 		pr_err("failed to boot CPU%d (%d)\n", cpu, err);
+ 
+ 	return err;

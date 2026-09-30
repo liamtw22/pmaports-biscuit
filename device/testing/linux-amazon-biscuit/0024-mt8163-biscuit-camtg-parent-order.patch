@@ -1,0 +1,36 @@
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -116,17 +116,17 @@
+     dev_info(priv->dev, "CMMCLK: img-sen-tg enable ret=%d\n", ret);
+     if (ret)
+         goto err_put_pm;
+ 
++    ret = clk_set_parent(priv->camtg_sel, priv->univ_48m);
++    dev_info(priv->dev, "CMMCLK: camtg parent ret=%d\n", ret);
++    if (ret)
++        goto err_disable_img;
++
+     ret = clk_prepare_enable(priv->camtg_sel);
+     dev_info(priv->dev, "CMMCLK: camtg selector enable ret=%d\n", ret);
+     if (ret)
+         goto err_disable_img;
+-
+-    ret = clk_set_parent(priv->camtg_sel, priv->univ_48m);
+-    dev_info(priv->dev, "CMMCLK: camtg parent ret=%d\n", ret);
+-    if (ret)
+-        goto err_disable_camtg;
+ 
+     /*
+      * Vendor Biscuit setup: use the 48 MHz camera timing source and
+      * divide it by five to make the TLV320's required 9.6 MHz CMMCLK.
+@@ -149,10 +149,8 @@
+     priv->mclk_enabled = true;
+     dev_info(priv->dev, "CMMCLK: sensor timing programmed\n");
+     return 0;
+ 
+-err_disable_camtg:
+-    clk_disable_unprepare(priv->camtg_sel);
+ err_disable_img:
+     clk_disable_unprepare(priv->img_sen_tg);
+ err_put_pm:
+     pm_runtime_put(priv->dev);

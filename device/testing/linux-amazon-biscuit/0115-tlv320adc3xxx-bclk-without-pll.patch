@@ -1,0 +1,57 @@
+tlv320adc3xxx: take the bit clock directly when it is the clock source
+
+A device fed from the bit clock on a shared TDM bus does not need its PLL:
+the bit clock already divides down to the sample rate, so the PLL divides by
+one and contributes only jitter. Only the device generating the clock needs
+one. The driver always routed CODEC_CLKIN through the PLL, so consumers paid
+for jitter they had no use for.
+
+Point CODEC_CLKIN at the bit clock instead when that is the source.
+
+Measured on an Echo Dot 2nd gen microphone array, four TLV320ADC3101 on one
+bus. Switching the three consumers part-way through a SINGLE capture, so the
+room cannot account for it, dropped their 3-7 kHz noise floor by 14 to
+19.5 dB while the producer, which keeps its PLL, moved 0.2 dB. The vendor
+firmware clocks its consumers the same way (CLKGEN_MUX 0x01).
+
+The PLL is deliberately left configured and powered rather than shut down.
+Taking the driver's existing no-PLL path - a pll_p = 0 divider entry plus
+ADC3XXX_NO_PLL - was tried and corrupts the SECOND ADC channel of every
+device on the bus, left channels reading -65 dBFS while right channels read
+-17 dBFS with full-scale spikes, even though every analogue register matched
+the vendor byte for byte. Only the mux value is changed here.
+
+--- a/sound/soc/codecs/tlv320adc3xxx.c
++++ b/sound/soc/codecs/tlv320adc3xxx.c
+@@ -282,6 +282,8 @@
+ 			 (ADC3XXX_CODEC_CLKIN_MCLK << ADC3XXX_CODEC_CLKIN_SHIFT))
+ #define ADC3XXX_USE_PLL_BCLK	((ADC3XXX_PLL_CLKIN_BCLK << ADC3XXX_PLL_CLKIN_SHIFT) | \
+ 				 (ADC3XXX_CODEC_CLKIN_PLL_CLK << ADC3XXX_CODEC_CLKIN_SHIFT))
++#define ADC3XXX_NO_PLL_BCLK	((ADC3XXX_PLL_CLKIN_MCLK << ADC3XXX_PLL_CLKIN_SHIFT) | \
++				 (ADC3XXX_CODEC_CLKIN_BCLK << ADC3XXX_CODEC_CLKIN_SHIFT))
+ 
+ /*  Analog PGA control bits */
+ #define ADC3XXX_LPGA_MUTE		0x80
+@@ -1300,8 +1302,21 @@
+ 	if (adc3xxx_divs[i].pll_p) { /* If PLL used for this mode */
+ 		adc3xxx_setup_pll(component, i);
+ 		snd_soc_component_write(component, ADC3XXX_CLKGEN_MUX,
++					/*
++					 * A device fed from the bit clock takes it DIRECTLY. Its
++					 * PLL would divide by one and contribute only jitter:
++					 * measured on a four device array, routing the three
++					 * consumers through the PLL costs 14 to 19.5 dB of
++					 * 3-7 kHz noise floor, while the producer, which needs
++					 * its PLL to make the clock, is unaffected.
++					 *
++					 * The PLL is left configured and powered rather than
++					 * shut down. Taking the driver's full no-PLL path here
++					 * corrupts the second ADC channel of every device, and
++					 * this is the arrangement that was verified working.
++					 */
+ 					adc3xxx->pll_clkin == ADC3XXX_PLL_CLKIN_BCLK ?
+-					ADC3XXX_USE_PLL_BCLK : ADC3XXX_USE_PLL);
++					ADC3XXX_NO_PLL_BCLK : ADC3XXX_USE_PLL);
+ 		if (!adc3xxx->use_pll) {
+ 			snd_soc_dapm_add_routes(dapm, adc3xxx_pll_intercon,
+ 						ARRAY_SIZE(adc3xxx_pll_intercon));

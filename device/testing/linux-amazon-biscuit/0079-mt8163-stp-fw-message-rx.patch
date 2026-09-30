@@ -1,0 +1,156 @@
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index d87a182..b328687 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -31,6 +31,8 @@
+ 
+ #define MT8163_STP_TASK_BT		0
+ #define MT8163_STP_TASK_WMT		4
++#define MT8163_STP_TASK_STP		5
++#define MT8163_STP_TASK_INFO		6
+ #define MT8163_STP_HEADER_LEN		4
+ #define MT8163_STP_TRAILER_LEN		2
+ #define MT8163_STP_MAX_PAYLOAD		2014
+@@ -154,7 +156,11 @@ struct mt8163_stp {
+ 	bool bt_paldo_enabled;
+ 	u8 trace_rx;
+ 	u8 trace_tx;
++	u8 trace_fw_msg;
+ 	u8 trace_xfer;
++	u8 rx_history[16];
++	u8 rx_history_pos;
++	u8 rx_history_count;
+ };
+ 
+ static int mt8163_stp_btif_write(struct mt8163_stp *stp, const u8 *buf,
+@@ -409,11 +415,48 @@ static void mt8163_stp_deliver_payload(struct mt8163_stp *stp)
+ 	}
+ }
+ 
++static bool mt8163_stp_is_fw_message(u8 type)
++{
++	return type == MT8163_STP_TASK_STP || type == MT8163_STP_TASK_INFO;
++}
++
++static void mt8163_stp_trace_rx_error(struct mt8163_stp *stp,
++				       const char *reason)
++{
++	u8 recent[ARRAY_SIZE(stp->rx_history)];
++	unsigned int count = stp->rx_history_count;
++	unsigned int start;
++	unsigned int i;
++
++	start = (stp->rx_history_pos + ARRAY_SIZE(stp->rx_history) - count) %
++		ARRAY_SIZE(stp->rx_history);
++	for (i = 0; i < count; i++)
++		recent[i] = stp->rx_history[(start + i) %
++					     ARRAY_SIZE(stp->rx_history)];
++
++	dev_warn_ratelimited(stp->dev,
++		"STP RX parser %s: state=%u header=%*ph recent=%*ph\n",
++		reason, stp->rx_state, (int)stp->header_len, stp->header,
++		(int)count, recent);
++}
++
+ static void mt8163_stp_finish_frame(struct mt8163_stp *stp)
+ {
+ 	u16 expected_crc, received_crc;
+ 	u8 previous_seq;
+ 
++	if (stp->mode == MT8163_STP_MODE_FULL &&
++	    mt8163_stp_is_fw_message(stp->payload_type)) {
++		if (stp->trace_fw_msg++ < 8)
++			dev_warn(stp->dev,
++				 "STP firmware message[%u] type=%u len=%zu data=%*ph\n",
++				 stp->trace_fw_msg, stp->payload_type,
++				 stp->payload_need,
++				 (int)min_t(size_t, stp->payload_need, 64),
++				 stp->payload);
++		return;
++	}
++
+ 	if (stp->mode == MT8163_STP_MODE_MANDATORY) {
+ 		if (stp->payload[stp->payload_need] ||
+ 		    stp->payload[stp->payload_need + 1]) {
+@@ -432,6 +475,7 @@ static void mt8163_stp_finish_frame(struct mt8163_stp *stp)
+ 		dev_warn_ratelimited(stp->dev,
+ 				 "full STP CRC mismatch: got 0x%04x expected 0x%04x\n",
+ 				 received_crc, expected_crc);
++		mt8163_stp_trace_rx_error(stp, "CRC mismatch");
+ 		mt8163_stp_send_ack(stp);
+ 		return;
+ 	}
+@@ -457,12 +501,20 @@ static void mt8163_stp_finish_frame(struct mt8163_stp *stp)
+ 
+ static void mt8163_stp_rx_byte(struct mt8163_stp *stp, u8 byte)
+ {
++	stp->rx_history[stp->rx_history_pos] = byte;
++	stp->rx_history_pos = (stp->rx_history_pos + 1) %
++				ARRAY_SIZE(stp->rx_history);
++	if (stp->rx_history_count < ARRAY_SIZE(stp->rx_history))
++		stp->rx_history_count++;
++
+ 	switch (stp->rx_state) {
+ 	case MT8163_STP_RX_SYNC:
+-		if (!(byte & 0x80))
+-			return;
+-		if (stp->mode == MT8163_STP_MODE_MANDATORY && byte != 0x80)
++		if (stp->mode == MT8163_STP_MODE_MANDATORY) {
++			if (byte != 0x80)
++				return;
++		} else if ((byte & 0xc0) != 0x80) {
+ 			return;
++		}
+ 		stp->header[0] = byte;
+ 		stp->header_len = 1;
+ 		stp->rx_state = MT8163_STP_RX_HEADER;
+@@ -471,6 +523,11 @@ static void mt8163_stp_rx_byte(struct mt8163_stp *stp, u8 byte)
+ 		stp->header[stp->header_len++] = byte;
+ 		if (stp->header_len != MT8163_STP_HEADER_LEN)
+ 			break;
++		stp->payload_type = (stp->header[1] >> 4) & 0x7;
++		stp->payload_seq = (stp->header[0] >> 3) & 0x7;
++		stp->payload_ack = stp->header[0] & 0x7;
++		stp->payload_need = ((stp->header[1] & 0x0f) << 8) |
++					stp->header[2];
+ 		if (stp->mode == MT8163_STP_MODE_MANDATORY) {
+ 			if (stp->header[3]) {
+ 				dev_warn_ratelimited(stp->dev,
+@@ -478,26 +535,28 @@ static void mt8163_stp_rx_byte(struct mt8163_stp *stp, u8 byte)
+ 				stp->rx_state = MT8163_STP_RX_SYNC;
+ 				break;
+ 			}
+-		} else if (stp->header[3] !=
++		} else if (!mt8163_stp_is_fw_message(stp->payload_type) &&
++			   stp->header[3] !=
+ 			   (u8)(stp->header[0] + stp->header[1] +
+ 				stp->header[2])) {
+ 			dev_warn_ratelimited(stp->dev,
+-					 "full STP header checksum mismatch\n");
++					 "full STP header checksum mismatch: %4ph expected=0x%02x\n",
++					 stp->header,
++					 (u8)(stp->header[0] + stp->header[1] +
++					      stp->header[2]));
++			mt8163_stp_trace_rx_error(stp, "header checksum mismatch");
+ 			stp->rx_state = MT8163_STP_RX_SYNC;
+ 			break;
+ 		}
+-		stp->payload_type = (stp->header[1] >> 4) & 0x7;
+-		stp->payload_seq = (stp->header[0] >> 3) & 0x7;
+-		stp->payload_ack = stp->header[0] & 0x7;
+-		stp->payload_need = ((stp->header[1] & 0x0f) << 8) |
+-					stp->header[2];
+ 		if (stp->payload_need > MT8163_STP_MAX_PAYLOAD) {
+ 			dev_warn_ratelimited(stp->dev, "oversize STP payload %zu\n",
+-						stp->payload_need);
++					stp->payload_need);
++			mt8163_stp_trace_rx_error(stp, "oversize payload");
+ 			stp->rx_state = MT8163_STP_RX_SYNC;
+ 			break;
+ 		}
+-		if (!stp->payload_need && stp->mode == MT8163_STP_MODE_FULL) {
++		if (!stp->payload_need && stp->mode == MT8163_STP_MODE_FULL &&
++		    !mt8163_stp_is_fw_message(stp->payload_type)) {
+ 			mt8163_stp_process_ack(stp, stp->payload_ack);
+ 			stp->rx_state = MT8163_STP_RX_SYNC;
+ 			break;

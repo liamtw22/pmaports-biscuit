@@ -1,0 +1,118 @@
+Hold the codec output stage powered for the same grace window as the amplifier.
+
+r185 stopped the amplifier transitioning per stream, and Device #1 confirmed it:
+gpio-122 stayed high unbroken across three tracks and dropped only when the idle
+grace expired. Two symptoms remained, and both come from the codec rather than
+the amplifier.
+
+Measured on Device #1 on 2026-08-11, with the amplifier held high throughout:
+
+  reg 0x3f (DAC power)   idle 96  ->  streaming d6  ->  stopped 96
+  reg 0x40 (DAC mute)    idle 0c  ->  streaming 00  ->  stopped 0c
+
+  - Toggling the DAC mute alone four times mid-stream is COMPLETELY SILENT, so
+    the mute is not a pop source. This also rules out needing the vendor's
+    GAIN_APPLIED settle poll from aic32x4_apply_mute.
+  - The pop at the start and end of every track is therefore the DAC POWER
+    transition, which DAPM performs on each stream open and close.
+  - During the idle grace period the amplifier is up while the DAC is powered
+    down, so it amplifies an undriven input. That is audible as a whine, and it
+    is the same mechanism as the whine on the jack that 0091 describes.
+
+Both are fixed by holding the codec output stage up for as long as the
+amplifier is up. snd_soc_dapm_force_enable_pin() on HPL and HPR keeps the
+Left/Right DAC -> HP Output Mixer -> HP Power -> HPL/HPR chain powered across
+stream boundaries, so the per-track power transitions disappear and the
+amplifier always has a driven, quiet input.
+
+Ordering follows the vendor: the codec comes up before the amplifier on start,
+and the amplifier goes down before the codec is released, so a DAC transient is
+never amplified.
+
+The codec DAPM context is captured on the first stream, where the runtime is
+available. dac_held makes the transition idempotent, like amp_on.
+
+diff -urN '--exclude=.git' r185new/sound/soc/mediatek/mt8163/mt8163-biscuit.c r186new/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -49,6 +49,8 @@
+ 	enum mt8163_biscuit_output output;
+ 	unsigned int streams;
+ 	bool amp_on;
++	struct snd_soc_dapm_context *codec_dapm;
++	bool dac_held;
+ 	struct snd_soc_card card;
+ 	struct snd_soc_dai_link links[3];
+ 	struct snd_soc_dai_link_component cpus[3];
+@@ -99,6 +101,35 @@
+ 	priv->amp_on = on;
+ }
+ 
++/*
++ * Hold the codec output stage powered for as long as the amplifier is up.
++ *
++ * DAPM otherwise powers the DAC down the moment a stream closes (reg 0x3f
++ * d6 -> 96) and brings it back for the next one. Measured on Device #1, that
++ * transition is the per-track pop: toggling the DAC mute alone (reg 0x40) four
++ * times mid-stream is completely silent, so it is the power change and not the
++ * mute. Holding the DAC up also stops the amplifier amplifying an undriven
++ * input during the idle grace period, which is audible as a whine.
++ *
++ * Caller must hold priv->lock.
++ */
++static void mt8163_biscuit_dac_hold(struct mt8163_biscuit_priv *priv, bool on)
++{
++	if (!priv->codec_dapm || priv->dac_held == on)
++		return;
++
++	if (on) {
++		snd_soc_dapm_force_enable_pin(priv->codec_dapm, "HPL");
++		snd_soc_dapm_force_enable_pin(priv->codec_dapm, "HPR");
++	} else {
++		snd_soc_dapm_disable_pin(priv->codec_dapm, "HPL");
++		snd_soc_dapm_disable_pin(priv->codec_dapm, "HPR");
++	}
++
++	snd_soc_dapm_sync(priv->codec_dapm);
++	priv->dac_held = on;
++}
++
+ static void mt8163_biscuit_amp_off_work(struct work_struct *work)
+ {
+ 	struct mt8163_biscuit_priv *priv =
+@@ -106,8 +137,14 @@
+ 			     amp_off_work);
+ 
+ 	mutex_lock(&priv->lock);
+-	if (!priv->streams)
++	if (!priv->streams) {
++		/*
++		 * Amplifier down first, then release the codec, so the DAC
++		 * power-down transient is never amplified.
++		 */
+ 		mt8163_biscuit_amp_set(priv, false);
++		mt8163_biscuit_dac_hold(priv, false);
++	}
+ 	mutex_unlock(&priv->lock);
+ }
+ 
+@@ -214,6 +251,11 @@
+ 	mutex_lock(&priv->lock);
+ 	priv->streams++;
+ 	cancel_delayed_work(&priv->amp_off_work);
++	if (!priv->codec_dapm)
++		priv->codec_dapm = snd_soc_component_to_dapm(
++			snd_soc_rtd_to_codec(rtd, 0)->component);
++	/* Codec output up before the amplifier, as the vendor does. */
++	mt8163_biscuit_dac_hold(priv, true);
+ 	if (priv->output == MT8163_BISCUIT_OUT_SPEAKER)
+ 		mt8163_biscuit_amp_set(priv, true);
+ 	mfp2 = priv->output == MT8163_BISCUIT_OUT_HEADPHONES ?
+@@ -254,6 +296,7 @@
+ 	cancel_delayed_work_sync(&priv->amp_off_work);
+ 	mutex_lock(&priv->lock);
+ 	mt8163_biscuit_amp_set(priv, false);
++	mt8163_biscuit_dac_hold(priv, false);
+ 	mutex_unlock(&priv->lock);
+ }
+ 

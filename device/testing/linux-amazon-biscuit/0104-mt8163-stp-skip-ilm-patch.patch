@@ -1,0 +1,53 @@
+From: Biscuit port <none@example.com>
+Date: Sun, 17 Aug 2026 15:00:00 +0000
+Subject: [PATCH] mt8163-stp: allow skipping the ILM patch download
+
+The WiFi firmware image writes its section 0 - 7424 bytes - to 0x0006A000,
+which is inside the range this ILM patch occupies (0x00060000-0x0007F27C),
+and INIT_CMD_ID_WIFI_START then tells the CONSYS MCU to jump to 0x0006A000.
+The MCU is running BT firmware out of that same ILM, so on some boots it
+takes an instruction-fetch abort about 1.6 ms later and both radios are
+lost until a power cycle. Roughly one boot in five.
+
+Add a writable module parameter so the patch can be left off and the cost
+to Bluetooth measured. Read at probe, so toggling it and then unbinding and
+rebinding soc:bluetooth applies it without a new kernel command line.
+
+Default is unchanged behaviour.
+---
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -1011,6 +1011,20 @@
+ 	return ret;
+ }
+ 
++/*
++ * The WiFi firmware download writes 7424 bytes to 0x0006A000, which sits inside
++ * this patch's range (0x00060000-0x0007F27C), and WIFI_START then tells the MCU
++ * to jump there. That is the CONSYS assert. Set to 1 to leave the ILM patch off
++ * and find out what BT loses without it.
++ *
++ * Writable and read at probe, so it can be toggled by unbinding and rebinding
++ * soc:bluetooth rather than by rebooting with a different command line.
++ */
++static bool skip_ilm_patch;
++module_param(skip_ilm_patch, bool, 0644);
++MODULE_PARM_DESC(skip_ilm_patch,
++		 "skip the ILM patch download, which the WiFi image overwrites");
++
+ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ {
+ 	static const struct {
+@@ -1138,6 +1152,12 @@
+ 		 "WMT patch-download MCU clock selected at 138.67 MHz\n");
+ 
+ 	for (i = 0; i < ARRAY_SIZE(patches); i++) {
++		if (skip_ilm_patch && strstr(patches[i].name, "1_0_hdr")) {
++			dev_info(stp->dev,
++				 "skipping ILM patch %s (skip_ilm_patch=1)\n",
++				 patches[i].name);
++			continue;
++		}
+ 		ret = mt8163_stp_download_patch(stp, patches[i].name,
+ 						patches[i].address);
+ 		if (ret)

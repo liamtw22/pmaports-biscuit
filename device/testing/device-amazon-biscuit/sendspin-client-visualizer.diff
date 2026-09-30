@@ -1,0 +1,23 @@
+Drive the visualiser in client-initiated mode too.
+
+sendspin-visualizer-roles.diff attaches biscuit_sendspin_viz in
+_handle_server_connection, which only runs when the server connects in. Since
+r280 the daemon connects out to Music Assistant (--url), through
+_run_client_initiated, which created its client without attaching it: music
+played and the ring stayed dark. Attach it the same way, once, before the
+client is used. The connection loop reuses this client across reconnects, so
+once is enough.
+
+Applied after sendspin-visualizer-roles.diff and sendspin-media-commands.diff,
+and generated against a tree with both applied.
+
+--- a/sendspin/daemon/daemon.py
++++ b/sendspin/daemon/daemon.py
+@@ -209,6 +209,7 @@
+         assert self._args.url is not None
+         assert self._audio_handler is not None
+         client = self._create_client()
++        biscuit_sendspin_viz.attach(client)
+         self._server_url = self._args.url
+         self._attach_client(client)
+         await self._connection_loop(self._args.url)

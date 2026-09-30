@@ -1,0 +1,57 @@
+Give the device persistent crash capture.
+
+There was none. /sys/fs/pstore mounted with no backend behind it and zero
+entries, no ramoops, and no reset-reason register exposed, so a panic, oops or
+watchdog reset left nothing at all to read afterwards. The logs that would say
+why are the ones the unclean shutdown destroys - that is the whole point of
+pstore, and it was not wired up.
+
+That cost a real investigation: the device reset once without explanation and
+the cause could not be established from the device at any price, only bounded
+by reproducing the suspected trigger and failing to make it happen again.
+
+CONFIG_PSTORE_RAM is already =m and ramoops.ko already ships, so nothing needs
+building - what was missing is the reserved region for it to write into.
+
+0x5c800000 is free system RAM: the bank runs 0x43030000-0x5f4fffff and the next
+reservation above begins at 0x5c900000, so this takes the megabyte directly
+below and stays contiguous with the existing carve-out rather than fragmenting
+the middle of the bank.
+
+The reg is FIXED rather than size/alloc-ranges as consys-pool uses, because
+ramoops must find its records at the same physical address after the reset that
+wrote them, and an allocator is free to place a dynamic region somewhere else
+when the tree changes.
+
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -884,3 +884,29 @@
+ 	/delete-property/ alignment;
+ 	/delete-property/ alloc-ranges;
+ };
++
++/*
++ * Crash records that survive a reset.
++ *
++ * This device had no persistent crash capture at all: /sys/fs/pstore mounted
++ * empty with no backend, so a panic, oops or watchdog reset left nothing to
++ * read afterwards - the logs that would say why are exactly the ones lost to
++ * the unclean shutdown that the reset causes. One unexplained reboot was
++ * investigated and closed as "cause unknown" purely for want of this.
++ *
++ * 0x5c800000 is free system RAM. The bank runs 0x43030000-0x5f4fffff and the
++ * next reservation above starts at 0x5c900000, so this takes the megabyte
++ * directly below it and stays contiguous with what is already carved out.
++ *
++ * A FIXED reg, not size/alloc-ranges as consys-pool uses: ramoops has to find
++ * its records at the same physical address after the reset that wrote them,
++ * and an allocator is free to choose differently when the tree changes.
++ */
++&{/reserved-memory} {
++	ramoops@5c800000 {
++		compatible = "ramoops";
++		reg = <0x0 0x5c800000 0x0 0x00100000>;
++		record-size = <0x00020000>;
++		ecc-size = <16>;
++	};
++};

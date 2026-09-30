@@ -1,0 +1,72 @@
+--- a/arch/arm64/kernel/psci.c
++++ b/arch/arm64/kernel/psci.c
+@@ -8,8 +8,11 @@
+ 
+ #define pr_fmt(fmt) "psci: " fmt
+ 
+ #include <linux/init.h>
++#include <linux/arm-smccc.h>
++#include <linux/bitops.h>
++#include <linux/io.h>
+ #include <linux/of.h>
+ #include <linux/smp.h>
+ #include <linux/delay.h>
+ #include <linux/psci.h>
+@@ -20,8 +23,46 @@
+ #include <asm/cpu_ops.h>
+ #include <asm/errno.h>
+ #include <asm/smp_plat.h>
+ 
++/*
++ * Amazon's MT8163 kernel clears ACINACTM through the secure monitor before
++ * bringing up secondary Cortex-A53 CPUs. Keep PSCI as the boot method; this
++ * only restores that required coherency preparation.
++ */
++#define MT8163_MCUCFG_BASE          0x10200000
++#define MT8163_MP0_AXI_CONFIG       0x2c
++#define MT8163_SIP_MCUSYS_WRITE     0x82000201
++
++static void __init mt8163_prepare_secondary_coherency(void)
++{
++        void __iomem *mcucfg;
++        struct arm_smccc_res res;
++        u32 before, requested, after;
++        static bool done;
++
++        if (done || !of_machine_is_compatible("mediatek,mt8163"))
++                return;
++        done = true;
++
++        mcucfg = ioremap(MT8163_MCUCFG_BASE, 0x1000);
++        if (!mcucfg) {
++                pr_warn("MT8163-SMP: unable to map MCUSYS\n");
++                return;
++        }
++
++        before = readl_relaxed(mcucfg + MT8163_MP0_AXI_CONFIG);
++        requested = before & ~BIT(4);
++        arm_smccc_smc(MT8163_SIP_MCUSYS_WRITE,
++                      MT8163_MCUCFG_BASE + MT8163_MP0_AXI_CONFIG,
++                      requested, 0, 0, 0, 0, 0, &res);
++        after = readl_relaxed(mcucfg + MT8163_MP0_AXI_CONFIG);
++
++        pr_info("MT8163-SMP: ACINACTM before=%#x requested=%#x after=%#x smc_ret=%#lx\n",
++                before, requested, after, res.a0);
++        iounmap(mcucfg);
++}
++
+ static int __init cpu_psci_cpu_init(unsigned int cpu)
+ {
+ 	return 0;
+ }
+@@ -31,8 +72,10 @@
+ 	if (!psci_ops.cpu_on) {
+ 		pr_err("no cpu_on method, not booting CPU%d\n", cpu);
+ 		return -ENODEV;
+ 	}
++
++	mt8163_prepare_secondary_coherency();
+ 
+ 	return 0;
+ }
+ 

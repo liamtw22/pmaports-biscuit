@@ -1,0 +1,60 @@
+Restore the AW8736 Mode 3 pulse train on amplifier enable.
+
+The AW8736 latches its gain from the number of rising edges on its enable
+pin at power-up. r185 replaced the vendor pulse train with a single level
+change, which selects mode 1 - the lowest gain - on every enable.
+
+Measured on Device #1 against stock Device #3, same microphone, same room,
+playing the identical volume-adjust earcon: stock -27.0 dBFS, pmOS
+-40.7 dBFS, and stock sits further from the microphone so the true gap is
+larger. pmOS own level is stable to 0.41 dB over eight plays, so this is
+systematic. The EQ curve is byte-identical to stock EQ_50, every MBCL
+parameter matches including the full-band limiter, the codec registers
+match (PCM 127, HP Driver Gain 6/6), PipeWire sits at 0.00 dB and the
+stereo-to-mono sum is correct - none of them account for it.
+
+r185 justified the removal with the vendor aud_pins_extamp_gain0..3
+pinctrl states being bound by nothing, so AudDrv_GPIO_EXTAMP_Gain_Set()
+fails on every call. That is correct, but it describes MediaTek gain path
+on GPIO28/29, not the AW8736 edge counting on its own enable pin.
+
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -98,6 +98,37 @@
+ 		return;
+ 
+ 	if (on) {
++		/*
++		 * AW8736 Mode 3.
++		 *
++		 * The part latches its gain from the NUMBER OF RISING EDGES on
++		 * its enable pin during power-up, so a single clean level change
++		 * selects mode 1 - its lowest gain.
++		 *
++		 * r185 removed this pulse train, reasoning that Biscuit takes its
++		 * amplifier gain from hardware because the vendor's
++		 * aud_pins_extamp_gain0..3 pinctrl states are bound by nothing and
++		 * AudDrv_GPIO_EXTAMP_Gain_Set() therefore fails on every call.
++		 * That is true, but it is about MediaTek's own gain path on
++		 * GPIO28/29 - a different mechanism from the AW8736 counting edges
++		 * on its own enable pin, which is a property of the part. One
++		 * being dead says nothing about the other.
++		 *
++		 * Restored because the device measured ~14 dB quieter than stock
++		 * playing an identical asset, with the EQ curve, every MBCL
++		 * parameter, the codec registers, the PipeWire graph and the
++		 * stereo-to-mono sum all verified byte-identical to stock.
++		 */
++		gpiod_set_value_cansleep(priv->speaker_amp, 0);
++		usleep_range(1000, 1200);
++		gpiod_set_value_cansleep(priv->speaker_amp, 1);
++		udelay(2);
++		gpiod_set_value_cansleep(priv->speaker_amp, 0);
++		udelay(2);
++		gpiod_set_value_cansleep(priv->speaker_amp, 1);
++		udelay(2);
++		gpiod_set_value_cansleep(priv->speaker_amp, 0);
++		udelay(2);
+ 		gpiod_set_value_cansleep(priv->speaker_amp, 1);
+ 		msleep(MT8163_BISCUIT_AMP_WARMUP_MS);
+ 	} else {

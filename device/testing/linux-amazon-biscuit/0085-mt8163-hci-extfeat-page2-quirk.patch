@@ -1,0 +1,50 @@
+From 815da079eaa7861fd0616e129f2137296977cd6b Mon Sep 17 00:00:00 2001
+From: Claude <claude@localhost>
+Date: Mon, 10 Aug 2026 12:20:32 -0400
+Subject: [PATCH] bluetooth: mark local extended features page 2 broken on
+ Biscuit
+
+The MT8163 controller advertises max_page 2 in its Read Local Extended
+Features page 1 reply, then answers the page 2 read with status 0x30,
+Parameter Out Of Mandatory Range. bt_to_errno() has no mapping for 0x30,
+so it falls through to ENOSYS; hci_read_local_ext_features_all_sync()
+treats that as fatal and hci_dev_open() aborts, leaving hci0 registered
+but permanently DOWN with "Opcode 0x1004 failed: -38".
+
+Measured on Device #1 with btmon: the rest of the roughly fifty command
+init sequence completes, including Reset, Read Local Supported Features,
+extended features page 1, the buffer size and LE reads, and Set Event
+Mask. Only the page 2 read fails.
+
+Set HCI_QUIRK_BROKEN_LOCAL_EXT_FEATURES_PAGE_2 so
+hci_cc_read_local_ext_features() leaves hdev->max_page at 1 and the page
+2 read is never issued.
+
+No firmware, patch address, fragmentation, STP, BTIF, CONSYS power or
+boot packaging behaviour changed.
+---
+ drivers/bluetooth/hci_mt8163_stp.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index 80147fe..eb71779 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -1143,6 +1143,14 @@ static int mt8163_stp_hci_register(struct mt8163_stp *stp)
+ 	SET_HCIDEV_DEV(hdev, stp->dev);
+ 	hci_set_drvdata(hdev, stp);
+ 
++	/*
++	 * The controller advertises extended-features max_page 2 but answers a
++	 * page 2 read with 0x30, Parameter Out Of Mandatory Range. That status
++	 * has no bt_to_errno() mapping, so it surfaces as -ENOSYS and aborts
++	 * hci_dev_open(). Cap max_page at 1 so the page 2 read is never issued.
++	 */
++	hci_set_quirk(hdev, HCI_QUIRK_BROKEN_LOCAL_EXT_FEATURES_PAGE_2);
++
+ 	ret = hci_register_dev(hdev);
+ 	if (ret) {
+ 		hci_free_dev(hdev);
+-- 
+2.55.0.windows.3
+

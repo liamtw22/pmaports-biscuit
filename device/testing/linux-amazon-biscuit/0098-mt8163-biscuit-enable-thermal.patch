@@ -1,0 +1,66 @@
+Enable the SoC thermal sensor, so something throttles this device.
+
+Nothing does today. /sys/class/thermal is empty, because our device tree turns
+the sensor off:
+
+	&thermal {
+		status = "disabled";
+	};
+
+with no comment recording why. Everything else is already in place and unused:
+
+  - mt8163.dtsi declares the sensor at 0x1100b000 (mediatek,mt8163-thermal)
+    with its clocks, reset, auxadc and apmixedsys references;
+  - the thermal_calibration nvmem cell exists in the efuse node at 0x10206000
+    and the sensor references it;
+  - thermal-zones already declares cpu-thermal, gpu-thermal and soc-thermal
+    against that sensor, with trip points;
+  - cpufreq is up, so the cooling devices have somewhere to bind;
+  - the driver is in tree at drivers/thermal/mediatek/auxadc_thermal.c.
+
+So this is a status change plus two config symbols.
+
+MTK_THERMAL and MTK_SOC_THERMAL are both enabled explicitly rather than left to
+defconfig, because MTK_SOC_THERMAL sits inside `if MTK_THERMAL` - a depends-on
+rather than a select. scripts/config will happily set the inner symbol while
+the outer one is missing and leave a driver that never builds, which is the same
+trap that INPUT_MATRIXKMAP (r188) and LEDS_LP55XX_COMMON would have been.
+
+The likely reason it was disabled during bring-up is the nvmem-cells dependency:
+if the efuse read fails, the sensor probe fails with it. Worth knowing if this
+regresses - the symptom would be a probe failure rather than the silent nothing
+we have now.
+
+This matters more now than it did. Wi-Fi is the next item, and this is a sealed
+enclosure that already drives a speaker amplifier with no thermal feedback at
+all.
+
+diff -urN '--exclude=.git' r189new/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts r191new/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -130,8 +130,24 @@
+         regulator-always-on;
+ };
+ 
++/*
++ * Nothing was throttling this device: /sys/class/thermal was empty because this
++ * node was disabled here, with no comment saying why. Everything it needs is
++ * already in place in mt8163.dtsi - the sensor at 0x1100b000 with its clocks,
++ * reset, auxadc and apmixedsys, the thermal_calibration nvmem cell in the
++ * efuse, and thermal-zones declaring cpu, gpu and soc zones against it - and
++ * cpufreq is up, so the cooling devices can bind.
++ *
++ * The likely reason it was switched off during bring-up is the
++ * nvmem-cells = <&thermal_calibration> dependency; if the efuse read fails the
++ * sensor probe fails with it. That is worth knowing if this regresses: the
++ * symptom would be a probe failure here rather than silence.
++ *
++ * Matters more now than it did: Wi-Fi is next, and this is a sealed enclosure
++ * that already drives a speaker amplifier.
++ */
+ &thermal {
+-	status = "disabled";
++	status = "okay";
+ };
+ 
+ &u2phy0 {

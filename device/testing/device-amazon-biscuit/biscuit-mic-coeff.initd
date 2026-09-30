@@ -1,0 +1,37 @@
+#!/sbin/openrc-run
+
+name="biscuit-mic-coeff"
+description="Verify the microphone ADC filter coefficients reached the chips"
+
+# A one-shot, deliberately: it inspects the converters once and exits. There is
+# no process to supervise, so do NOT wrap this in supervise-daemon - doing that
+# to a one-shot has already cost a cycle here (biscuit-setup, r54), because the
+# successful exit reads as a crash and every later re-entry is refused.
+#
+# openrc marks it "started" once start() returns, so re-running it by hand needs
+#
+#     rc-service biscuit-mic-coeff restart
+#
+# "start" will answer "has already been started" and do nothing.
+
+depend() {
+	need localmount
+	after modules
+}
+
+start() {
+	ebegin "Verifying microphone ADC coefficients"
+	# Runs late and on an idle machine on purpose. Coefficient memory is only
+	# writable while the ADC is fully powered down, so a capture in progress
+	# means the chips cannot be checked at all, let alone corrected.
+	/usr/bin/biscuit-mic-coeff.py
+	# Report the real result: a chip that could not be verified is worth
+	# seeing in "rc-service ... status". Nothing depends on this service, so
+	# a failure here never blocks the rest of the boot.
+	eend $? "some converters could not be verified - see /var/log/biscuit-mic-coeff.log"
+}
+
+stop() {
+	# Nothing to tear down; the work is a register check, not a resource.
+	return 0
+}

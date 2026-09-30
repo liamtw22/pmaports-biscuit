@@ -1,0 +1,38 @@
+--- linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/peripheral_api.py
++++ linux-voice-assistant/lib/python3.14/site-packages/linux_voice_assistant/peripheral_api.py
+@@ -757,10 +757,15 @@
+ 
+     async def emit_event(
+         self,
+-        event: LVAEvent,
++        event: LVAEvent | str,
+         data: Optional[Dict[str, Any]] = None,
+     ) -> None:
+-        """Broadcast an event to all connected peripheral clients."""
++        """Broadcast an event to all connected peripheral clients.
++
++        Built-in events use LVAEvent, while peripheral-only commands (numbers
++        and switches) intentionally use their protocol name directly.
++        """
++        event_name = event.value if isinstance(event, LVAEvent) else str(event)
+         # Cache the last conversation text so newly-connecting clients get it in the snapshot
+         if event == LVAEvent.STT_TEXT and data:
+             self._last_stt_text = data.get("text")
+@@ -801,7 +806,7 @@
+         if not self._clients:
+             return
+ 
+-        payload: Dict[str, Any] = {"event": event.value}
++        payload: Dict[str, Any] = {"event": event_name}
+         if data:
+             payload["data"] = data
+ 
+@@ -817,7 +822,7 @@
+         self._clients -= dead
+         _LOGGER.debug(
+             "Peripheral event %-25s → %d client(s)",
+-            event.value,
++            event_name,
+             len(self._clients),
+         )
+ 

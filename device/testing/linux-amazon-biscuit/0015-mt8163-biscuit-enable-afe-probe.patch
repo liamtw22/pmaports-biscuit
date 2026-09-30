@@ -1,0 +1,19 @@
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -97,4 +97,16 @@
+ 
+ &cpu3 {
+         enable-method = "mediatek,mt8163-smp";
+ };
++
++/*
++ * First audio bring-up step: enable the upstream MT8163 AFE block.
++ * This exposes CPU DAIs only; codec and machine-card support follow later.
++ */
++&audiosys {
++        status = "okay";
++};
++
++&afe {
++        status = "okay";
++};

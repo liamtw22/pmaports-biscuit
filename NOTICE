@@ -1,0 +1,185 @@
+# NOTICE
+
+What is in this repository, who wrote it, where the parts that are not ours
+come from, and what is deliberately absent.
+
+Copyright (c) 2025-2026 liamtw22 and contributors, except where a part below
+names another author. This project is not affiliated with or endorsed by
+Amazon, MediaTek or Home Assistant.
+
+## Licences by part
+
+The full licence texts are in `LICENSES/`.
+
+| Part | Licence | Origin |
+|---|---|---|
+| Everything not listed below: `device/testing/device-amazon-biscuit/` scripts, services, DSP, web UI, `tools/`, the APKBUILDs, `installer/` except its two binaries | MIT (`LICENSE`) | this project |
+| `base-pmaports/*.patch` | pmaports' own licence, GPL-3.0 (`LICENSES/GPL-3.0.txt`), for the aport files; see below for the software they touch | patches against postmarketOS pmaports at `1ab5c4ed7`, by this project |
+| `device/testing/device-amazon-biscuit/pulse-daemon-biscuit.conf`, `pulse-default-biscuit.pa` | MIT | copied unchanged from pmaports' `device/archived/device-amazon-biscuit` (postmarketOS contributors) |
+| `device/testing/device-amazon-biscuit/deviceinfo`, `ucm2/HiFi.conf`, `ucm2/mt8163_biscuit.conf`, and the APKBUILD's skeleton | MIT | started from the same archived pmaports package (postmarketOS contributors) and extended by this project |
+| `installer/zip/bin/busybox` | GPL-2.0-only | Alpine Linux's `busybox-static` 1.38.0-r7, unmodified; `installer/NOTICE` gives its source |
+| `installer/zip/bin/biscuit-tool` | MIT, with zlib, musl and libgcc linked in | built from `installer/zip/biscuit-tool.c`; `installer/NOTICE` lists the linked code |
+| `device/testing/linux-amazon-biscuit/*.patch` (the 109 patches the kernel APKBUILD applies) | GPL-2.0-only | this project's patches against the kernel below |
+| The kernel they apply to | GPL-2.0-only | `bengris32/linux-mtk`, branch `mt8163/7.0`, commit `20951722df6ae1f6fecbfcea0a7d585118a06f3f` (a 7.0-rc6 kernel), downloaded at build time |
+| `device/testing/linux-amazon-biscuit/mt6625l-wlan-20260823.tar.gz` | GPL-2.0 | MediaTek's MT6625L WLAN driver from Amazon's GPL kernel source release for the MT8163 (3.18 kernel), **modified** - see below |
+| `device/testing/device-amazon-biscuit/lva-src/*.py`, `biscuit-lva-*.patch.txt`, `biscuit-peripheral-*.patch.txt` | Apache-2.0 | OHF-Voice/linux-voice-assistant at `b0c53c41c11e`, **modified**; two files are new - see below |
+| `device/testing/device-amazon-biscuit/sendspin-*.diff` | Apache-2.0 | patches against Sendspin/sendspin-cli (`22b9ff308afe`) and aiosendspin 6.0.5 |
+| `device/testing/device-amazon-biscuit/btproxy/api_pb2.py`, `api_options_pb2.py` | MIT, Copyright (c) 2018 Otto Winter | copied unmodified from aioesphomeapi 45.3.1; full notice in `btproxy/__init__.py` |
+| `device/testing/device-amazon-biscuit/nacl-fast.min.js` | public domain (Unlicense) | TweetNaCl-js 1.0.3 (dchest/tweetnacl-js), unmodified |
+| The three bundle tarballs (`biscuit-voice-venv`, `biscuit-sendspin-venv`, `tflite-aarch64-musl`) | each component its own | see `PROVENANCE.md`, which lists every one |
+
+**The modified MT6625L driver.** 159 C sources and headers plus a Kconfig and
+Makefile. Compared with the driver in Amazon's release
+(`kernel/mediatek/mt8163/3.18_hl/drivers/misc/mediatek/connectivity/conn_soc/drv_wlan/mt_wifi/wlan`),
+133 files are unchanged, 24 were changed by this project to build and run on a
+Linux 7.0 kernel, and two are new (`mtk_compat.h`, `os/linux/consys_glue.c`).
+The Kconfig and Makefile were written for this port. It is distributed under
+the GPL like the original, and the patches, the tarball and the kernel source
+together are the corresponding source of the published kernel package. In the
+published kernel tree, branch `biscuit-r243` of `liamtw22/linux-mtk`, the
+driver arrives in two commits: first MediaTek's driver exactly as Amazon's
+release has it, then this port's changes to it as a separate commit, so the
+changes can be read as one diff. The release also carries the kernel's
+complete source as `linux-amazon-biscuit-r243-source.tar.gz`.
+
+**The modified linux-voice-assistant files.** The voice package's
+`linux_voice_assistant` is a modified copy of OHF-Voice/linux-voice-assistant
+at `b0c53c41c11e`, under its Apache-2.0 licence, which ships with it. Every
+changed or new file carries a notice at the top saying so and what changed:
+
+- **Modified:** `__main__.py`, `entity.py`, `satellite.py`, `peripheral_api.py`,
+  `mpv_player.py` and `player/libmpv.py`, installed from `lva-src/` as
+  whole-file copies (upstream moves, and a fuzzy patch is worse than an
+  explicit fork of one file); and `models.py`, which is already changed in
+  the voice bundle's copy, is changed further by two `biscuit-lva-*.patch.txt`
+  patches, and gets its notice at build time.
+- **New:** `peripheral_transport.py` and `qualification_v1.py`.
+- **Unchanged:** every other file, byte-identical to upstream at that commit.
+
+## What is NOT here
+
+This device runs Amazon's Fire OS before it runs this. Several things this port
+can use are Amazon's or MediaTek's, and **none of them is redistributed**, not in
+this repository, not in any package built from it and not in the install zips.
+Each owner exports them from their own device before converting it (the backup
+zip, or `tools/export_stock_assets.py`) and imports them with
+`biscuit-import-assets`, which verifies every file against the hashes in
+`biscuit-profile-assets.json`. The repository carries those hashes, never the
+content.
+
+- **Firmware.** MediaTek's WLAN firmware (`WIFI_RAM_CODE`), the two Bluetooth
+  ROM patches (`ROMv2_lm_patch_1_0_hdr.bin`, `ROMv2_lm_patch_1_1_hdr.bin`) and
+  the microphone FPGA bitstream (`i2s_to_spi_v34.bin`) are the `firmware`
+  profile. The kernel compiles no firmware in: `CONFIG_EXTRA_FIRMWARE` is empty.
+  The Bluetooth and FPGA drivers are built in and ask for their files before
+  the root filesystem is mounted, so the `-nonfree-firmware` subpackage ships
+  only a list (`30-biscuit-firmware.files`) that tells mkinitfs to put the
+  owner's imported copies in the initramfs. Without an import the device boots
+  with no audio (the FPGA carries the I2S path), no Bluetooth and no Wi-Fi,
+  which is the intended, visible failure.
+- **The speaker correction curve.** Fire OS's `EQ_50.cfg` (1024 FIR
+  coefficients) is the `speaker` profile. Up to r293 this package shipped the
+  same curve as `speaker.fir`; r294 removed it. Without an import the Stock
+  equaliser plays flat.
+- **Fire OS 5 and Fire OS 6 microphone-chain coefficients** (`AFE.cfg`, the
+  beamformer and filterbank sets, `vad_lite.tflite`): the `fireos5` and
+  `fireos6` profiles. Without them the device runs this project's own
+  microphone chain, which is the default and what the project is measured on.
+- **Earcons.** No stock sound is shipped. `biscuit-earcon-map.earcon_dirs()`
+  looks in `/opt/persist/earcon` (what the owner extracted), then an installed
+  pack, then the voice assistant's own upstream sounds. With none present the
+  device is silent by design rather than broken.
+- **LED animations.** Every animation this package ships is generated by
+  `biscuit-ring-fx.py` from effect definitions of our own (46 effects in r294),
+  and no stock frame data is embedded. The owner can import their own device's
+  stock animations and choose them in the settings page.
+  `biscuit-ring-priorities.json` replaces stock's `layer_config_common.json`
+  and was written from scratch.
+- **Per-unit factory calibration** (the `idme` microphone, ambient-light and
+  Bluetooth address values). It is read from the unit it belongs to at run
+  time and would be wrong on any other; no unit's values are recorded here.
+
+`.gitignore` refuses the owner-imported files by name, so a careless
+`git add -A` cannot introduce one.
+
+## Parameters measured from stock
+
+The project reimplements some of Fire OS's observable behaviour so the device
+behaves as its owner expects. Where that needed numbers, a handful of numeric
+parameters were measured from, or read out of, the stock software on the
+owner's own device, and are kept in our own code and formats. They are not
+copies of Amazon files and no stock code is included. `PROVENANCE.md` lists
+each one: the 30 volume steps (`STOCK_AVL_DB`), the playback dynamics in
+`mbcl.conf`, the ambient-light response and brightness ladder, a few scalar
+constants of the optional stock-profile beamformer paths, the voice high-pass
+coefficients the call path checks an imported AFE.cfg against, and the colours
+and timings of the ambient and activity ring effects.
+
+## Bundled third-party code
+
+Two virtualenv tarballs and a TensorFlow Lite build carry third-party code.
+**`PROVENANCE.md` enumerates every one** - name, version, licence, and whether
+its licence text and source are actually shipped - and its tables are
+generated from the tarballs by `tools/provenance.py`, so a rebuild that changes
+a dependency cannot silently invalidate them. All three bundles are in the
+public package feed.
+
+Copyleft dependencies are redistributed unmodified, each with its own licence
+text: in the voice bundle `zeroconf` (LGPL-2.1+; its Cython-compiled modules
+ship their `.py` and `.pxd` sources beside them) and `python-mpv` (GPL-2.0+ or
+LGPL-2.1+) as Python source, `autocommand` (LGPL-3.0) as Python source inside
+setuptools' own vendored copy, the GCC runtime library bundled by two wheels
+(GPL-3.0+ with the GCC Runtime Library Exception), and Eigen (MPL-2.0,
+header-only) inside the TensorFlow Lite build; in the Sendspin bundle
+`textual-image` (LGPL-3.0+) and `Unidecode` (GPL-2.0+) as Python source, and
+`orjson` (partly MPL-2.0). For a pure-Python distribution the shipped `.py`
+files are the corresponding source; `PROVENANCE.md` gives the source of each
+binary one.
+
+PyAV's extensions reference `libavcodec.so.62` and its siblings **dynamically**
+and contain no FFmpeg code, so FFmpeg is Alpine's `ffmpeg-libs` at runtime and
+is not redistributed here. That is the specific thing that went wrong before,
+so it is checked rather than assumed.
+
+## base-pmaports/
+
+The three patches in `base-pmaports/` change upstream postmarketOS pmaports at
+commit `1ab5c4ed7`. They are pmaports material, under pmaports' own licence:
+the repository's `LICENSE` is the GPL version 3, whose text is in
+`LICENSES/GPL-3.0.txt`. The software the patches touch keeps its own licence
+and authors:
+
+- `0001` only deletes upstream's archived `device-amazon-biscuit` (MIT) and
+  `linux-amazon-biscuit` (GPL-2.0-only) packages. The deleted files appear in
+  the patch as removed lines and keep their original licences and authors,
+  postmarketOS's contributors and, in the kernel patches among them, the
+  kernel's.
+- `0002` changes `boot-deploy`, which is GPL-2.0-or-later. Its
+  `fix-append-dtb-mtk-header.patch` is a change to boot-deploy under that
+  licence, and `0002` is the corresponding source of the `boot-deploy`
+  0.24.0-r1 in the image.
+- `0003` changes `postmarketos-zram`, which is GPL-3.0-or-later.
+
+## Source of the image's other packages
+
+The install zip's disk image also holds Alpine Linux and postmarketOS
+packages, each under its own licence. `/lib/apk/db/installed` on the device
+lists every package with its exact version, and for Alpine's packages the
+aports commit it was built from; that commit's APKBUILD in Alpine's aports, or
+the one for that version in postmarketOS's pmaports, and the sources it names
+are each package's source. This repository at the release's tag is the source
+of this project's packages, and of the patched `boot-deploy` through
+`base-pmaports/`. The release carries the complete source of the kernel and of
+the BusyBox inside the zips. `installer/NOTICE` says the same for the zips.
+
+## Git history
+
+The history of the published repository starts with a single commit at v1.0.
+The development history before it is not published: earlier revisions carried
+Amazon firmware, the stock speaker curve and personal data, and rewriting it
+could not make every earlier commit publishable.
+
+## Upstream
+
+This is an **overlay**, not a complete pmaports tree. It needs upstream pmaports
+underneath it to build. See BUILDING.md for the base and the recipe.

@@ -1,0 +1,401 @@
+#!/bin/sh
+# Compose the USB gadget: what this device pretends to be when you plug it in.
+#
+# The board has always been a USB network adapter - that is what usb0 is, and
+# it is how the device is reached with no Wi-Fi. This makes that one option
+# among several, so it can also be a microphone, a speaker, both, or nothing
+# at all beyond taking power.
+#
+# WHY A MICROPHONE IS WORTH THE TROUBLE
+#
+# The mic array on this device is good - it beats the stock firmware on wake
+# word detection - and Bluetooth is a poor way to reach it. HFP caps out at
+# 8 kHz CVSD or 16 kHz mSBC, it forces the device out of A2DP for as long as
+# the mic is live, and whether a SCO link comes up at all turned out to depend
+# on host-specific behaviour that took a whole session to characterise against
+# Windows alone. USB Audio Class has none of those problems: 48 kHz, no
+# pairing, no codec negotiation, and every OS takes it without a driver.
+#
+# SAFETY: NETWORK IS THE WAY BACK IN
+#
+# Dropping the network function removes SSH-over-USB, which away from Wi-Fi is
+# the only way to reach this device. So:
+#
+#   * network is included in every mode except "power" and the audio-only ones
+#   * "apply" refuses to leave the gadget unbound - if composing the requested
+#     mode fails at any point it falls back to network-only and says so
+#   * the mode lives on the persist partition, so a bad choice survives a
+#     reboot; `biscuit-usbmode set network` from any other route fixes it
+#
+# THE DEFAULT IS CHARGING ONLY (r272, the owner's decision). With no saved
+# choice the computer sees no device at all; every other mode is chosen on the
+# settings page's USB panel, which is what writes the persist file. Deleting
+# the file therefore returns to charging only, not to network. Without the
+# cable the way back in is Wi-Fi, and a device that cannot join its network
+# opens the setup hotspot at start-up, so a power cycle always reaches it.
+#
+# Usage:
+#   biscuit-usbmode get              print the features that are on, or "power"
+#   biscuit-usbmode wants <feature>  exit 0 if net, mic or spk is on
+#   biscuit-usbmode modes            list the features, marking those on and
+#                                    those this kernel cannot provide
+#   biscuit-usbmode set <feature>... persist and apply: any of net mic spk,
+#                                    or power for none
+#   biscuit-usbmode apply            compose the persisted mode (boot path)
+
+set -u
+
+G=/sys/kernel/config/usb_gadget/biscuit-rndis
+CFG="$G/configs/c.1"
+PERSIST=/opt/persist/usb-mode
+DEFAULT_MODE=power
+
+RNDIS_DEV_ADDR=02:16:42:00:00:01
+RNDIS_HOST_ADDR=02:16:42:00:00:02
+USB_ADDR=172.16.42.1/24
+
+# chmask is a channel bitmask: 1 = mono, 3 = stereo. Samples are 16-bit.
+#
+# f_uac2 EPIN_EN uses p_chmask: gadget ALSA playback sends to the host's
+# microphone input. EPOUT_EN uses c_chmask: gadget ALSA capture receives the
+# host's speaker output. Terminal-type defaults do not establish direction.
+# Both directions are stereo 48 kHz 16-bit, which is the plain, symmetric
+# configuration every host supports.
+#
+# It is deliberately NOT tailored to what this device produces. An earlier
+# version advertised the microphone as mono 16 kHz - the rate the beamformed
+# array actually runs at - and Windows refused the endpoint outright:
+# GetMixFormat returned AUDCLNT_E_UNSUPPORTED_FORMAT and no audio was possible
+# in either direction. With the symmetric config the microphone endpoint opens
+# and negotiates 48 kHz cleanly. PipeWire resamples the 16 kHz array on the way
+# through, which costs nothing here and is what it does for every other client.
+UAC_MIC_CHMASK=3
+UAC_SPK_CHMASK=3
+UAC_MIC_SRATE=48000
+UAC_SPK_SRATE=48000
+UAC_SSIZE=2
+
+# What the host calls this device. Without it the endpoints show up as
+# "Source/Sink", which is f_uac2's default and means nothing to anyone.
+UAC_FUNCTION_NAME="Echo Dot 2 Audio"
+
+log() { echo "biscuit-usbmode: $*" >&2; }
+
+uac_available() {
+	[ -d /sys/class/udc ] || return 1
+	# The function type only appears once the module is loadable. Before the
+	# kernel carries CONFIG_USB_CONFIGFS_F_UAC2 this is simply absent, and
+	# the caller should say so rather than failing obscurely.
+	modprobe usb_f_uac2 2>/dev/null
+	[ -d /sys/module/usb_f_uac2 ] && return 0
+	# Built in rather than modular: try creating and removing the function.
+	mkdir "$G/functions/uac2.probe" 2>/dev/null || return 1
+	rmdir "$G/functions/uac2.probe" 2>/dev/null
+	return 0
+}
+
+# A mode is the set of features that are on: any of net (a USB network
+# adapter), mic (a USB microphone) and spk (a USB speaker), written in that
+# order, or "power" for none - charging only.
+#
+# These used to be six fixed modes, two of them identical ("audio" and "all")
+# and three carrying the network whether it was wanted or not. The settings
+# page now has a switch for each feature, and the choice is saved as
+# "features=mic spk". The old names are still read as what they always meant,
+# so a saved choice survives the change - which is why the new form needs its
+# prefix: a bare "mic" is the OLD mode, microphone AND network.
+features() {            # features <word>...; prints "net mic spk" or "power"
+	_n=0; _m=0; _s=0
+	for _w in "$@"; do
+		case "$_w" in
+		net) _n=1 ;;
+		mic) _m=1 ;;
+		spk) _s=1 ;;
+		power|none) ;;
+		*) return 1 ;;
+		esac
+	done
+	_out=""
+	[ $_n = 1 ] && _out="net"
+	[ $_m = 1 ] && _out="${_out:+$_out }mic"
+	[ $_s = 1 ] && _out="${_out:+$_out }spk"
+	echo "${_out:-power}"
+}
+
+parse_mode() {          # parse_mode <saved text>; the features it means
+	case "$1" in
+	features=*)  # shellcheck disable=SC2086
+	             features ${1#features=} ;;
+	power)       echo power ;;
+	network)     echo net ;;
+	mic)         echo "net mic" ;;
+	speaker)     echo "net spk" ;;
+	audio|all)   echo "net mic spk" ;;
+	*)           return 1 ;;
+	esac
+}
+
+mode_wants() {          # mode_wants <mode> <net|mic|spk>
+	case " $1 " in
+	*" $2 "*) return 0 ;;
+	*) return 1 ;;
+	esac
+}
+
+current_mode() {
+	if [ -r "$PERSIST" ]; then
+		if m=$(parse_mode "$(head -n1 "$PERSIST" 2>/dev/null)"); then
+			echo "$m"
+			return
+		fi
+	fi
+	echo "$DEFAULT_MODE"
+}
+
+unbind() {
+	[ -e "$G/UDC" ] || return 0
+	# Nothing to release when unbound, the state charging only leaves. The
+	# kernel rejects a release write then (rc 1), and treating that as a
+	# failure made every switch OUT of charging only fall back to network.
+	[ -n "$(cat "$G/UDC" 2>/dev/null)" ] || return 0
+	# A zero-byte write never calls configfs's store method. Send a newline
+	# so the kernel actually releases the controller before reconfiguration.
+	printf '\n' > "$G/UDC" || return 1
+	# configfs needs the UDC released before functions can be unlinked.
+	sleep 1
+}
+
+strip_functions() {
+	for l in "$CFG"/*.*; do
+		[ -L "$l" ] && rm -f "$l"
+	done
+	for f in "$G"/functions/*.*; do
+		[ -d "$f" ] || continue
+		# rndis is kept: recreating it re-randomises nothing, but removing
+		# and adding it repeatedly has been seen to leave the host with a
+		# stale interface until replug.
+		case "$f" in *rndis.usb0) continue ;; esac
+		rmdir "$f" 2>/dev/null || true
+	done
+}
+
+add_rndis() {
+	mkdir -p "$G/functions/rndis.usb0" || return 1
+	printf '%s' "$RNDIS_DEV_ADDR"  > "$G/functions/rndis.usb0/dev_addr"  2>/dev/null
+	printf '%s' "$RNDIS_HOST_ADDR" > "$G/functions/rndis.usb0/host_addr" 2>/dev/null
+	[ -L "$CFG/rndis.usb0" ] || ( cd "$G" && ln -s functions/rndis.usb0 configs/c.1 ) || return 1
+	return 0
+}
+
+add_uac2() {            # add_uac2 <mic:0|1> <spk:0|1>
+	# r237: Inventra isochronous IN DMA stalls on this controller. Use the
+	# verified PIO path before enabling audio endpoints; bulk networking
+	# retains DMA. Reapply on boot and USB mode changes, not during a stream.
+	if [ -e /sys/module/musb_hdrc/parameters/use_iso_in_dma ]; then
+		printf 'N\n' > /sys/module/musb_hdrc/parameters/use_iso_in_dma || return 1
+	fi
+	# configfs freezes a function's attributes once it is linked into a
+	# config: writes then succeed silently and change nothing, which looks
+	# exactly like a kernel that ignores you. strip_functions() removes the
+	# link and the directory first, so this always builds a fresh one.
+	mkdir -p "$G/functions/uac2.0" || return 1
+	printf '%s' "$([ "$1" = 1 ] && echo $UAC_MIC_CHMASK || echo 0)" \
+		> "$G/functions/uac2.0/p_chmask" || return 1
+	printf '%s' "$([ "$2" = 1 ] && echo $UAC_SPK_CHMASK || echo 0)" \
+		> "$G/functions/uac2.0/c_chmask" || return 1
+	printf '%s' "$UAC_MIC_SRATE" > "$G/functions/uac2.0/p_srate" || return 1
+	printf '%s' "$UAC_SPK_SRATE" > "$G/functions/uac2.0/c_srate" || return 1
+	printf '%s' "$UAC_FUNCTION_NAME" \
+		> "$G/functions/uac2.0/function_name" || return 1
+	for a in c_ssize p_ssize; do
+		printf '%s' "$UAC_SSIZE" > "$G/functions/uac2.0/$a" || return 1
+	done
+	[ -L "$CFG/uac2.0" ] || ( cd "$G" && ln -s functions/uac2.0 configs/c.1 ) || return 1
+	return 0
+}
+
+bind() {
+	set -- /sys/class/udc/*
+	[ -e "$1" ] || { log "no UDC present"; return 1; }
+	udc="${1##*/}"
+	printf '%s' "$udc" > "$G/UDC" 2>/dev/null || return 1
+	[ "$(cat "$G/UDC" 2>/dev/null)" = "$udc" ] || return 1
+	return 0
+}
+
+# Which interface did the gadget actually create?
+#
+# NOT necessarily usb0, and assuming so cost a long evening. The pmOS
+# initramfs brings up its own g1 gadget and names its interface usb0; when
+# usb-rndis later releases that and binds this gadget, the kernel commonly
+# allocates usb1 and leaves the dead usb0 behind. Both then carry
+# 172.16.42.1/24, so every check looks plausible while pointing at the wrong
+# one: `ip link show usb0` reports NO-CARRIER on the corpse, a DHCP server
+# bound to it serves nobody, and meanwhile the live link is carrying SSH.
+#
+# The live one is the one with carrier - LOWER_UP - so ask for that rather
+# than guessing from the name.
+live_usb_iface() {
+	ip -o link show 2>/dev/null |
+		sed -n 's/^[0-9]*: \(usb[0-9]*\):.*LOWER_UP.*/\1/p' | head -1
+}
+
+bring_up_net() {
+	# The interface only appears once the gadget is bound, and carrier only
+	# comes up once the host has configured it, so both are worth waiting for.
+	i=0
+	while [ "$i" -lt 15 ]; do
+		iface=$(live_usb_iface)
+		if [ -n "$iface" ]; then
+			# Strip the address from any stale sibling: two interfaces
+			# holding the same /24 makes routing a coin toss.
+			for other in /sys/class/net/usb*; do
+				[ -e "$other" ] || continue
+				o="${other##*/}"
+				[ "$o" = "$iface" ] && continue
+				ip addr del "$USB_ADDR" dev "$o" 2>/dev/null
+			done
+			ip link set "$iface" up 2>/dev/null
+			ip addr replace "$USB_ADDR" dev "$iface" 2>/dev/null
+			log "network on $iface"
+			return 0
+		fi
+		i=$((i + 1)); sleep 1
+	done
+	# No carrier yet is normal when nothing is plugged in, so fall back to
+	# configuring whatever USB interface exists rather than reporting failure
+	# and triggering the caller's fallback path.
+	set -- /sys/class/net/usb*
+	if [ -e "$1" ]; then
+		iface="${1##*/}"
+		ip link set "$iface" up 2>/dev/null
+		ip addr replace "$USB_ADDR" dev "$iface" 2>/dev/null
+		log "no carrier yet; configured $iface anyway"
+		return 0
+	fi
+	log "no USB network interface appeared"
+	return 1
+}
+
+compose() {             # compose <mode>; 0 on success
+	mode="$1"
+	want_net=0; want_mic=0; want_spk=0
+	mode_wants "$mode" net && want_net=1
+	mode_wants "$mode" mic && want_mic=1
+	mode_wants "$mode" spk && want_spk=1
+
+	if [ "$want_mic" = 1 ] || [ "$want_spk" = 1 ]; then
+		if ! uac_available; then
+			log "USB audio is not available on this kernel"
+			return 2
+		fi
+	fi
+
+	unbind || return 1
+	strip_functions
+
+	if [ "$want_net" = 1 ]; then
+		add_rndis || { log "rndis setup failed"; return 1; }
+	fi
+	if [ "$want_mic" = 1 ] || [ "$want_spk" = 1 ]; then
+		add_uac2 "$want_mic" "$want_spk" || { log "uac2 setup failed"; return 1; }
+	fi
+
+	# "power" deliberately binds nothing: the cable still charges and the
+	# host sees no device at all.
+	if [ "$mode" = power ]; then
+		log "mode power: gadget left unbound"
+		return 0
+	fi
+
+	bind || { log "could not bind UDC"; return 1; }
+	[ "$want_net" = 1 ] && bring_up_net
+	return 0
+}
+
+fallback() {
+	log "falling back to network-only so the device stays reachable"
+	unbind
+	strip_functions
+	add_rndis && bind && bring_up_net
+}
+
+case "${1:-apply}" in
+get)
+	current_mode
+	;;
+wants)
+	mode_wants "$(current_mode)" "${2:-}"
+	;;
+modes)
+	avail=no
+	uac_available && avail=yes
+	cur=$(current_mode)
+	for f in net mic spk; do
+		note=""
+		case "$f" in
+		mic|spk) [ "$avail" = yes ] || note=" (needs a kernel with USB audio)" ;;
+		esac
+		mark=" "
+		mode_wants "$cur" "$f" && mark="*"
+		echo "$mark $f$note"
+	done
+	;;
+set)
+	shift
+	# One old mode name (set network, as a rescue shell would type it), or
+	# features: "set features=mic spk", or "set mic spk".
+	if [ $# -eq 1 ] && m=$(parse_mode "$1" 2>/dev/null); then
+		:
+	else
+		m=$(features "$@") || { log "unknown feature in: $*"; exit 2; }
+	fi
+	if { mode_wants "$m" mic || mode_wants "$m" spk; } && ! uac_available; then
+		log "USB audio is not available on this kernel; not applied"
+		exit 2
+	fi
+	mkdir -p "$(dirname "$PERSIST")" 2>/dev/null
+	if [ "$m" = power ]; then _saved="features="; else _saved="features=$m"; fi
+	printf '%s\n' "$_saved" > "$PERSIST" || { log "cannot persist mode"; exit 1; }
+	if [ -x /sbin/rc-service ] && [ -e /run/openrc/softlevel ]; then
+		# Re-run the boot path rather than composing here. usb-rndis builds
+		# the gadget, binds the network function, applies this mode, strips
+		# the address from pmOS's leftover initramfs netdev and starts the
+		# USB DHCP server on whichever netdev the kernel allocated. Composing
+		# directly did none of the last three: out of charging only, it
+		# addressed the dead g1 netdev and the host got no carrier and no
+		# lease.
+		/sbin/rc-service usb-rndis restart >/dev/null 2>&1
+		bound=$(cat "$G/UDC" 2>/dev/null)
+		if [ "$m" = power ]; then
+			[ -z "$bound" ] || { log "gadget still bound after charging only"; exit 1; }
+		else
+			[ -n "$bound" ] || { log "gadget not bound; mode $m not applied"; exit 1; }
+			if mode_wants "$m" mic || mode_wants "$m" spk; then
+				[ -L "$CFG/uac2.0" ] || { log "USB audio did not compose; left on network"; exit 1; }
+			fi
+		fi
+	else
+		# No OpenRC (a rescue shell): compose directly, as before.
+		compose "$m"
+		rc=$?
+		if [ "$rc" -ne 0 ]; then
+			[ "$rc" = 2 ] && { log "not applied"; exit 2; }
+			fallback
+			exit 1
+		fi
+	fi
+	log "mode $m applied"
+	;;
+apply)
+	m=$(current_mode)
+	if ! compose "$m"; then
+		fallback
+		exit 1
+	fi
+	;;
+*)
+	echo "usage: biscuit-usbmode [get|wants <feature>|modes|set <feature>...|apply]" >&2
+	exit 2
+	;;
+esac

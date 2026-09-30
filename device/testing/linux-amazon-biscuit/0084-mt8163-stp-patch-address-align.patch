@@ -1,0 +1,67 @@
+From 74f6659d81444d67dc18a6541cf1243d50c3bb29 Mon Sep 17 00:00:00 2001
+From: Claude <claude@localhost>
+Date: Mon, 10 Aug 2026 10:55:14 -0400
+Subject: [PATCH] bluetooth: strip patch-header metadata from the WMT download
+ address
+
+Byte 24 of each MT8163 patch header carries the patch count in its high
+nibble and the download sequence in its low nibble. The stock launcher
+reads header[24..27] as one word, extracts both fields, then zeroes that
+byte before passing the word to the kernel as the patch download address.
+
+The driver had been sending the raw word, so the DLM patch was written to
+0xf00e0021 and the ILM patch would have gone to 0x00060022: 0x21/0x22
+bytes high and, worse, misaligned. r176 confirmed this on hardware. The
+DLM body appeared at AP 0x5f6e0021 rather than 0x5f6e0000, the controller
+faulted with an ABT exception, and R1 held 0xf00e0029, exactly eight bytes
+into the misplaced body where the first structure begins.
+
+Zero the metadata byte in both entries so the patches land at 0xf00e0000
+and 0x00060000, and log the address actually programmed so a UART capture
+can prove which constants the running image carries.
+
+No firmware bytes, patch order, header skip, fragment size or flag, STP
+sequencing, BTIF DMA behaviour, CONSYS power/timing, EMI mapping, DTB or
+boot packaging changed.
+---
+ drivers/bluetooth/hci_mt8163_stp.c | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/bluetooth/hci_mt8163_stp.c b/drivers/bluetooth/hci_mt8163_stp.c
+index a51f2c1..80147fe 100644
+--- a/drivers/bluetooth/hci_mt8163_stp.c
++++ b/drivers/bluetooth/hci_mt8163_stp.c
+@@ -833,6 +833,8 @@ static int mt8163_stp_download_patch(struct mt8163_stp *stp,
+ 	if (ret)
+ 		goto out;
+ 	memcpy(partial_address_cmd + 12, address, 4);
++	dev_info(stp->dev, "WMT patch %s download address %4ph\n", name,
++		 partial_address_cmd + 12);
+ 	ret = mt8163_stp_wmt_xfer(stp, partial_address_cmd,
+ 				  sizeof(partial_address_cmd), wmt_patch_address_evt,
+ 				  sizeof(wmt_patch_address_evt));
+@@ -891,9 +893,18 @@ static int mt8163_stp_bootstrap(struct mt8163_stp *stp)
+ 		const char *name;
+ 		u8 address[4];
+ 	} patches[] = {
+-		/* Stock launcher runs download sequence 1 before sequence 2. */
+-		{ "mediatek/ROMv2_lm_patch_1_1_hdr.bin", { 0x21, 0x00, 0x0e, 0xf0 } },
+-		{ "mediatek/ROMv2_lm_patch_1_0_hdr.bin", { 0x22, 0x00, 0x06, 0x00 } },
++		/*
++		 * Byte 24 of each patch header is metadata, not address: the
++		 * stock launcher reads header[24..27] as one word, derives the
++		 * patch count from its high nibble and the download sequence
++		 * from its low nibble, then clears that byte before handing the
++		 * word to the kernel as the download address. Sending it
++		 * verbatim placed each patch body 0x21/0x22 bytes high and
++		 * misaligned, which is what the controller aborted on.
++		 * Download sequence 1 still runs before sequence 2.
++		 */
++		{ "mediatek/ROMv2_lm_patch_1_1_hdr.bin", { 0x00, 0x00, 0x0e, 0xf0 } },
++		{ "mediatek/ROMv2_lm_patch_1_0_hdr.bin", { 0x00, 0x00, 0x06, 0x00 } },
+ 	};
+ 	unsigned int i;
+ 	int ret;
+-- 
+2.55.0.windows.3
+

@@ -1,0 +1,112 @@
+diff --git a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+index 52e384af9..a0c0c12df 100644
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -316,6 +316,7 @@ biscuit_audio: biscuit-audio {
+ 		clock-names = "img-larb2-smi", "img-sen-tg", "img-sen-cam",
+ 			      "mm-smi-common", "camtg-sel", "univ-48m";
+ 		mediatek,afe = <&afe>;
++		mediatek,btcvsd = <&btcvsd>;
+ 		audio-codec = <&tlv320_codec>;
+ 		pinctrl-names = "default";
+ 		pinctrl-0 = <&biscuit_audio_i2s1_pins &biscuit_audio_mclk_pin>;
+@@ -884,3 +885,8 @@ &consys_mem {
+ 	/delete-property/ alignment;
+ 	/delete-property/ alloc-ranges;
+ };
++
++/* Bluetooth call audio: the SCO frames the BT firmware leaves in SRAM. */
++&btcvsd {
++	status = "okay";
++};
+diff --git a/arch/arm64/boot/dts/mediatek/mt8163.dtsi b/arch/arm64/boot/dts/mediatek/mt8163.dtsi
+index 9b1cf3fff..739b2be2c 100644
+--- a/arch/arm64/boot/dts/mediatek/mt8163.dtsi
++++ b/arch/arm64/boot/dts/mediatek/mt8163.dtsi
+@@ -1029,6 +1029,23 @@ larb3: larb@17001000 {
+ 			clock-names = "apb", "smi";
+ 			power-domains = <&spm MT8163_POWER_DOMAIN_VENC>;
+ 		};
++
++		/*
++		 * Bluetooth SCO call audio. The BT firmware writes CVSD/mSBC
++		 * frames into SRAM bank 2 rather than sending them over HCI, and
++		 * this block is what the AP reads and writes them through. The
++		 * offsets are INFRA_MISC, conn_bt_cvsd_mask, then the CVSD MCU
++		 * read, write and packet-indicator registers.
++		 */
++		btcvsd: btcvsd@18000000 {
++			compatible = "mediatek,mtk-btcvsd-snd";
++			reg = <0 0x18000000 0 0x1000>,
++			      <0 0x18080000 0 0x8000>;
++			interrupts = <GIC_SPI 236 IRQ_TYPE_LEVEL_LOW>;
++			mediatek,infracfg = <&infracfg>;
++			mediatek,offset = <0xf00 0x800 0xfd0 0xfd4 0xfd8>;
++			status = "disabled";
++		};
+ 	};
+ 
+ 	thermal-zones {
+diff --git a/sound/soc/mediatek/mt8163/mt8163-biscuit.c b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+index a55e4ccf0..a7581c7cd 100644
+--- a/sound/soc/mediatek/mt8163/mt8163-biscuit.c
++++ b/sound/soc/mediatek/mt8163/mt8163-biscuit.c
+@@ -59,10 +59,10 @@ struct mt8163_biscuit_priv {
+ 	unsigned int streams;
+ 	bool amp_on;
+ 	struct snd_soc_card card;
+-	struct snd_soc_dai_link links[3];
+-	struct snd_soc_dai_link_component cpus[3];
+-	struct snd_soc_dai_link_component platforms[3];
+-	struct snd_soc_dai_link_component codecs[3];
++	struct snd_soc_dai_link links[4];
++	struct snd_soc_dai_link_component cpus[4];
++	struct snd_soc_dai_link_component platforms[4];
++	struct snd_soc_dai_link_component codecs[4];
+ 	/* The four microphone ADCs are one capture device. */
+ 	struct snd_soc_dai_link_component mic_codecs[4];
+     struct device *dev;
+@@ -627,7 +627,7 @@ static int mt8163_biscuit_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct mt8163_biscuit_priv *priv;
+-	struct device_node *afe_np, *codec_np, *fpga_np;
++	struct device_node *afe_np, *codec_np, *fpga_np, *btcvsd_np;
+ 	int mic_count, i;
+ 	int ret;
+ 
+@@ -789,6 +789,34 @@ static int mt8163_biscuit_probe(struct platform_device *pdev)
+ 	priv->card.dev = dev;
+ 	priv->card.dai_link = priv->links;
+ 	priv->card.num_links = (mic_count > 0 && fpga_np) ? 3 : 2;
++
++	/*
++	 * Bluetooth SCO. Call audio does not arrive over HCI on this SoC:
++	 * the BT firmware leaves CVSD/mSBC frames in a shared SRAM bank and
++	 * the mtk-btcvsd component is what moves them. That component
++	 * registers no DAI of its own, so both ends of this link are dummies
++	 * and it exists only to give the component a PCM userspace can open.
++	 */
++	btcvsd_np = of_parse_phandle(dev->of_node, "mediatek,btcvsd", 0);
++	if (btcvsd_np) {
++		int bt = priv->card.num_links;
++
++		priv->cpus[bt].name = "snd-soc-dummy";
++		priv->cpus[bt].dai_name = "snd-soc-dummy-dai";
++		priv->platforms[bt].of_node = btcvsd_np;
++		priv->codecs[bt].name = "snd-soc-dummy";
++		priv->codecs[bt].dai_name = "snd-soc-dummy-dai";
++
++		priv->links[bt].name = "BT SCO";
++		priv->links[bt].stream_name = "BT SCO";
++		priv->links[bt].cpus = &priv->cpus[bt];
++		priv->links[bt].num_cpus = 1;
++		priv->links[bt].platforms = &priv->platforms[bt];
++		priv->links[bt].num_platforms = 1;
++		priv->links[bt].codecs = &priv->codecs[bt];
++		priv->links[bt].num_codecs = 1;
++		priv->card.num_links++;
++	}
+ 	snd_soc_card_set_drvdata(&priv->card, priv);
+ 	priv->card.dapm_routes = mt8163_biscuit_routes;
+ 	priv->card.num_dapm_routes = ARRAY_SIZE(mt8163_biscuit_routes);

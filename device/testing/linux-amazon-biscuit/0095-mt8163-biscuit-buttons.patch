@@ -1,0 +1,112 @@
+Wire the three remaining buttons: Volume Down, Action and microphone mute.
+
+Only Volume Up worked before this. The Echo Dot 2 has four buttons and the
+vendor DTS (biscuit.dtsi) shows how each is attached:
+
+  Volume Up     gpio-keys, <&pio 50 1>   active low   code 115
+  Volume Down   gpio-keys, <&pio 37 1>   active low   code 114
+  Action        MediaTek keypad, hw keycode 0         code 138
+  Mic mute      PMIC power key, mediatek,kpd-sw-pwrkey = <113>
+
+Three problems, all found by comparing our device tree against that.
+
+1. Volume Down was declared as keypad column KPCOL1 on pin 37. The vendor uses
+   the same pin as a plain active-low GPIO. Both cannot be true, and the vendor
+   is ground truth for how the board is wired, so it moves to gpio-keys. Pin 37
+   defaults to KPCOL1, so it is muxed back to GPIO37.
+
+2. The keypad node could never have worked. It declared keypad,num-rows = <1>
+   but its pinctrl listed only KPCOL0 (pin 36) and KPCOL1 (pin 37) - no row pin
+   at all. KPROW0 is pin 33 and was not muxed anywhere, so the matrix had
+   nothing to scan with. It becomes a 1x1 matrix carrying only the Action
+   button, with KPROW0 and KPCOL0 muxed.
+
+3. The mute button is on the PMIC power key, and mt6323.dtsi defaults that to
+   KEY_POWER. Enabling the PMIC key driver without remapping would make a mute
+   press look like a power button press, which userspace may act on by shutting
+   the device down. It is remapped to KEY_MUTE, as the vendor does.
+
+The drivers for both of the remaining paths already exist in mainline and simply
+were not built: mt6779-keypad matches our "mediatek,mt6779-keypad" fallback
+compatible, and mtk-pmic-keys carries a mt6323_regs table with a
+"mediatek,mt6323-keys" match, whose MFD cell mt6397-core already registers.
+KEYBOARD_MT6779 and KEYBOARD_MTK_PMIC are enabled in the APKBUILD, along with
+INPUT_MATRIXKMAP and REGMAP_MMIO, which the keypad driver selects and which
+scripts/config does not resolve on its own.
+
+No C code changes.
+
+diff -urN '--exclude=.git' r187new/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts r188new/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -30,15 +30,27 @@
+ 			gpios = <&pio 50 GPIO_ACTIVE_LOW>;
+ 			debounce-interval = <20>;
+ 		};
++
++		/*
++		 * The vendor wires Volume Down as a plain active-low GPIO
++		 * (biscuit.dtsi: gpios = <&pio 37 1>), not as a keypad column.
++		 * Pin 37's default function is KPCOL1, so it has to be muxed
++		 * back to GPIO - see gpio_keys_pins_default below.
++		 */
++		key-volume-down {
++			label = "Volume Down";
++			linux,code = <KEY_VOLUMEDOWN>;
++			gpios = <&pio 37 GPIO_ACTIVE_LOW>;
++			debounce-interval = <20>;
++		};
+ 	};
+ };
+ 
+ &keypad {
+-	linux,keymap = <MATRIX_KEY(0x00, 0x00, KEY_ASSISTANT)
+-			MATRIX_KEY(0x00, 0x01, KEY_VOLUMEDOWN)>;
++	linux,keymap = <MATRIX_KEY(0x00, 0x00, KEY_ASSISTANT)>;
+ 
+ 	keypad,num-rows = <1>;
+-	keypad,num-columns = <2>;
++	keypad,num-columns = <1>;
+ 	debounce-delay-ms = <20>;
+ 
+ 	pinctrl-names = "default";
+@@ -47,6 +59,18 @@
+ 	status = "okay";
+ };
+ 
++/*
++ * The microphone-mute button is wired to the PMIC power key. The vendor maps it
++ * to KEY_MUTE (biscuit.dtsi: mediatek,kpd-sw-pwrkey = <113>), and mt6323.dtsi
++ * defaults it to KEY_POWER - which would let a mute press look like a power
++ * button press and shut the device down.
++ */
++&mt6323keys {
++	power {
++		linux,keycodes = <KEY_MUTE>;
++	};
++};
++
+ &mt6323_vusb_reg {
+ 	regulator-always-on;
+ };
+@@ -78,7 +102,8 @@
+ &pio {
+ 	gpio_keys_pins_default: gpio-keys-pins {
+ 		pins {
+-			pinmux = <MT8163_PIN_50_EINT18__FUNC_GPIO50>;
++			pinmux = <MT8163_PIN_50_EINT18__FUNC_GPIO50>,
++				 <MT8163_PIN_37_KPCOL1__FUNC_GPIO37>;
+ 			bias-pull-up;
+ 			input-enable;
+ 		};
+@@ -86,8 +111,8 @@
+ 
+ 	keypad_pins_default: keypad-pins {
+ 		pins {
+-			pinmux = <MT8163_PIN_36_KPCOL0__FUNC_KPCOL0>,
+-				 <MT8163_PIN_37_KPCOL1__FUNC_KPCOL1>;
++			pinmux = <MT8163_PIN_33_KPROW0__FUNC_KPROW0>,
++				 <MT8163_PIN_36_KPCOL0__FUNC_KPCOL0>;
+ 			input-enable;
+ 		};
+ 	};

@@ -1,0 +1,102 @@
+Enable the AUXADC, so the sensor r191 switched on can actually read.
+
+r191 registered cpu-thermal, gpu-thermal and soc-thermal, and then every read of
+thermal_zone*/temp returned -ENODATA. The zones were there; the numbers never
+were.
+
+The MT8163 thermal controller has no ADC of its own. It drives the AUXADC across
+the AHB bus, which means it has to be programmed with the physical addresses of
+the AUXADC registers and of the sensor mux in APMIXEDSYS. All of that was
+correct. Read back from the running device, every address matched the vendor's
+mt_thermal.h exactly:
+
+	TEMPPNPMUXADDR    0x1000c604   TS_CON1_P
+	TEMPADCMUXADDR    0x1100100c   AUXADC_CON1_CLR
+	TEMPADCENADDR     0x11001008   AUXADC_CON1_SET
+	TEMPADCVALIDADDR  0x11001040   AUXADC_DAT11
+	TEMPADCEN         0x00000800   BIT(11), channel 11
+
+and the sequencer was demonstrably running. TS_CON1 read 0x1, which is the value
+the hardware itself had written there from TEMPADCPNP1, and AUXADC_CON1 read
+0x800, the channel enable it had written through TEMPADCENADDR. Both AHB write
+paths worked. Both clocks were on: infra_auxadc at 26MHz and infra_therm at
+136.5MHz, both held by 1100b000.thermal.
+
+Only AUXADC_DAT11 stayed 0. Nothing was converting.
+
+The reason is that mt8163.dtsi leaves auxadc@11001000 disabled. The converter is
+powered by MT6577_AUXADC_PDN_EN - MISC 0x94, bit 14 - and the only code in the
+tree that sets it is mt6577_auxadc's probe. With the node disabled that driver
+never probed, no platform device was ever created, and the bit stayed clear.
+Nothing in the thermal driver sets it; it assumes the AUXADC node is enabled,
+which is what mt8173.dtsi does upstream.
+
+Why a dead ADC surfaces as -ENODATA rather than as a wrong temperature is worth
+recording, because it sent this investigation down two wrong paths first. The
+driver masks the measurement to 12 bits, so a dead ADC reads raw = 0, and
+raw_to_mcelsius_v1() with MT8163_CALIBRATION converts raw 0 to roughly +443C.
+That is outside MT8173_TEMP_MIN..MT8173_TEMP_MAX, so mtk_thermal_temp_is_valid()
+rejects it and substitutes THERMAL_TEMP_INVALID, which thermal_helpers.c turns
+into -ENODATA. Stuck-low and stuck-high both land outside the window - a real
+reading is raw 2501..3951 - so the error says "no data" no matter how the ADC
+fails.
+
+Two plausible-looking explanations were eliminated on the way, and are recorded
+so they are not chased again. The apmixed sensor-buffer control that mt8365 sets
+(TS_CON0 bits 29:28) does not apply: TS_CON0 reads 0x00000000, already the state
+mt8365 programs. And the calibration is fine - the efuse cell is present and
+non-zero, and in any case the driver starts from working defaults.
+
+Verified by setting that one bit by hand on the running device before writing
+this:
+
+	AUXADC_DAT11  0x00000000 -> 0x00000dda
+	TEMP_MSR0..2  raw 0      -> raw 3540..3555
+	zones         -ENODATA   -> 33.7C / 33.6C / 33.6C
+
+CONFIG_MEDIATEK_MT6577_AUXADC was already set, but as a module. It is built in
+here instead. The thermal core is built in and registers zones long before
+userspace could load anything, and this is the only thing standing between a
+sealed enclosure driving a speaker amplifier and an unthrottled SoC; leaving it
+as a module would leave a window at every boot where the trip points exist and
+the sensor reads nothing.
+
+diff -urN '--exclude=.git' r192base/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts r193new/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+--- a/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
++++ b/arch/arm64/boot/dts/mediatek/mt8163-amazon-biscuit.dts
+@@ -131,6 +131,35 @@
+ };
+ 
+ /*
++ * The thermal controller has no ADC of its own: it drives the AUXADC over the
++ * AHB bus. The AUXADC only converts once MT6577_AUXADC_PDN_EN (MISC 0x94, bit
++ * 14) is set, and the only code that sets it is mt6577_auxadc's probe.
++ * mt8163.dtsi leaves this node disabled, so that driver never probed and the
++ * converter stayed powered down.
++ *
++ * That did not look like a failure of the AUXADC. r191 enabled the sensor and
++ * all three zones registered, but every read returned -ENODATA. The controller
++ * was in fact running: it had written TS_CON1 = 0x1 via TEMPPNPMUXADDR and set
++ * channel 11 in AUXADC_CON1 via TEMPADCENADDR, so both of its AHB write paths
++ * worked, and every address it had been programmed with matched the vendor
++ * driver exactly. Only AUXADC_DAT11 stayed 0. The driver masks that to raw = 0,
++ * which with MT8163_CALIBRATION converts to roughly +443C - far outside
++ * MT8173_TEMP_MIN..MT8173_TEMP_MAX - so mtk_thermal_temp_is_valid() substitutes
++ * THERMAL_TEMP_INVALID and the thermal core turns that into -ENODATA.
++ *
++ * Confirmed on the running device by setting that one bit by hand: AUXADC_DAT11
++ * went from 0 to 0xdda, TEMP_MSR0..2 went to raw 3540-3555, and the zones read
++ * 33.7C, 33.6C and 33.6C.
++ *
++ * Enabled here rather than in mt8163.dtsi to keep the change board-scoped, but
++ * the coupling is really a SoC one: any mt8163 board that enables &thermal
++ * needs this too. Upstream mt8173.dtsi simply leaves its auxadc enabled.
++ */
++&auxadc {
++	status = "okay";
++};
++
++/*
+  * Nothing was throttling this device: /sys/class/thermal was empty because this
+  * node was disabled here, with no comment saying why. Everything it needs is
+  * already in place in mt8163.dtsi - the sensor at 0x1100b000 with its clocks,

@@ -1,0 +1,38 @@
+--- a/drivers/usb/musb/musb_gadget.c
++++ b/drivers/usb/musb/musb_gadget.c
+@@ -21,6 +21,14 @@
+ 
+ #include "musb_core.h"
+ #include "musb_trace.h"
++
++/* Diagnostic only: takes effect when an isochronous IN endpoint is enabled.
++ * Keep bulk USB networking and all other endpoint DMA behavior unchanged.
++ */
++static bool use_iso_in_dma = true;
++module_param(use_iso_in_dma, bool, 0644);
++MODULE_PARM_DESC(use_iso_in_dma,
++                "Use Inventra DMA for gadget isochronous IN (next enable)");
+ 
+ 
+ /* ----------------------------------------------------------------------- */
+@@ -1052,13 +1060,19 @@
+ 	/* NOTE:  all the I/O code _should_ work fine without DMA, in case
+ 	 * for some reason you run out of channels here.
+ 	 */
+-	if (is_dma_capable() && musb->dma_controller) {
++	if (is_dma_capable() && musb->dma_controller &&
++	    !(musb_dma_inventra(musb) && usb_endpoint_xfer_isoc(desc) &&
++	      usb_endpoint_dir_in(desc) && !READ_ONCE(use_iso_in_dma))) {
+ 		struct dma_controller	*c = musb->dma_controller;
+ 
+ 		musb_ep->dma = c->channel_alloc(c, hw_ep,
+ 				(desc->bEndpointAddress & USB_DIR_IN));
+ 	} else
+ 		musb_ep->dma = NULL;
++
++	if (usb_endpoint_xfer_isoc(desc) && usb_endpoint_dir_in(desc))
++		dev_info(musb->controller, "isoc IN ep%u enabled using %s\n",
++			 epnum, musb_ep->dma ? "DMA" : "PIO");
+ 
+ 	musb_ep->desc = desc;
+ 	musb_ep->busy = 0;
