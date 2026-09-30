@@ -140,7 +140,8 @@ And those made in the release candidate, r294:
   and accepts only dates from 2026 to 2036.
 - **Turning the package feed off now lasts.** `off` in
   `/opt/persist/update-feed` keeps the feed out of `/etc/apk/repositories`
-  across reboots and reinstalls; a line commented out by hand is recorded the
+  across reboots and updates (a reinstall with the install zip turns it back
+  on); a line commented out by hand is recorded the
   same way. `on`, re-enabling the line by hand, or a settings reset turn it
   back on.
 - **Restore keeps what the backup lacks.** The restore zip replaces only the

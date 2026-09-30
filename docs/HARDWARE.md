@@ -110,7 +110,7 @@ for the operating system. After a zip install:
 | Partition | Size | Contents |
 |---|---|---|
 | `kb`, `dkb`, `lk_a`, `lk_b`, `tee1`, `tee2`, `expdb`, `misc` | small | Bootloaders and firmware: never touched |
-| `persist` | 16 MiB | Mounted at `/opt`: settings, the owner's imported files, SSH host keys. Survives reinstalling |
+| `persist` | 16 MiB | Mounted at `/opt`: settings, the owner's imported files, SSH host keys. Survives updates; the install zip recreates it and restores the imported files from the backup |
 | `boot_a`, `boot_b` | 16 MiB each | The boot image (kernel, device tree, initramfs with the owner's Bluetooth and FPGA firmware appended) |
 | `recovery` | 16 MiB | TWRP, from amonet |
 | `userdata` | about 3.5 GiB | Nested GPT: `pmOS_boot` (ext2, `/boot`) and `pmOS_root` (ext4, `/`), grown to fill the space on first boot |

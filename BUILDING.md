@@ -249,9 +249,13 @@ filesystems.
 traces in the root filesystem: `/var/log/apk.log` (full paths of the build
 machine's home directory), `/var/cache/apk/` (package indexes) and
 `/etc/machine-id` (the same ID on every install; with the file gone, the
-`dbus` service makes a new one on first boot). Remove them in the image
-itself, not in pmbootstrap's chroot, which is no longer connected to the image
-once `install` has finished:
+`dbus` service makes a new one on first boot), and `/etc/resolv.conf` (the
+build machine's DNS search domains; the Echo writes its own on joining Wi-Fi).
+Remove them in the image itself, not in pmbootstrap's chroot, which is no
+longer connected to the image once `install` has finished. Then zero the free
+blocks: emptying or deleting a file leaves its old contents on disk, and the
+installer copies the image byte for byte, so a `strings` of the v1.0 image
+first published still showed `apk.log`'s build paths:
 
 ```sh
 LOOP=$(sudo losetup --find --show --partscan ~/payload/pmos.img)
@@ -260,8 +264,12 @@ sudo mount "${LOOP}p2" /mnt/biscuit-img
 sudo truncate -s 0 /mnt/biscuit-img/var/log/apk.log
 sudo rm -f /mnt/biscuit-img/etc/machine-id
 sudo rm -rf /mnt/biscuit-img/var/cache/apk/*
+printf '# Written by udhcpc when the network comes up.\n' | sudo tee /mnt/biscuit-img/etc/resolv.conf >/dev/null
 sudo umount /mnt/biscuit-img
+sudo zerofree "${LOOP}p2"
+sudo zerofree "${LOOP}p1"
 sudo losetup -d "$LOOP"
+LC_ALL=C grep -a -c "/home/$USER" ~/payload/pmos.img   # expect 0
 ```
 
 This is the step the v1.0 image (build r295) was built with. Before

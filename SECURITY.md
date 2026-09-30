@@ -107,7 +107,9 @@ the core package, and `apk` refuses an index not signed with it. The feed is
 `/etc/apk/repositories` on every boot, and so is the key.
 
 The choice is kept in `/opt/persist/update-feed` on the settings partition, so
-it survives reinstalling. Case and blanks in that file are ignored.
+it survives restarts and updates. A reinstall with the install zip recreates
+that partition from the backup, which does not hold the choice, so the feed is
+on again afterwards. Case and blanks in that file are ignored.
 
 - **To turn the feed off,** run `echo off | sudo tee /opt/persist/update-feed`.
   At the next boot the active feed line is removed once; a commented-out copy
@@ -122,8 +124,9 @@ it survives reinstalling. Case and blanks in that file are ignored.
   boot takes that as turning the feed back on.
 - **A settings reset** (and an erase of everything) turns the feed back on,
   whichever way it was turned off. A network reset leaves it alone.
-- **Reinstalling** never turns it back on: `off` is applied afresh to the new
-  system.
+- **Reinstalling** with the install zip turns it back on: the zip recreates the
+  settings partition, and the choice is not part of the backup. Write `off`
+  again after setup.
 - Any other word in the file gives a warning at boot, and the feed stays on.
 
 Changes to `/etc/apk/repositories` are written to a temporary file, checked and
