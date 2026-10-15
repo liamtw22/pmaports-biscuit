@@ -27,8 +27,10 @@ start_pre() {
 		eerror "biscuit-als.py is not installed"
 		return 1
 	fi
-	if [ ! -d /sys/bus/iio/devices/iio:device1 ]; then
-		ewarn "no ALS iio device; biscuit-als will exit"
+	# No IIO device is normal on units fitted with the TSL2540, which
+	# biscuit-als drives through /dev/i2c-0 instead.
+	if [ ! -d /sys/bus/iio/devices/iio:device1 ] && [ ! -e /dev/i2c-0 ]; then
+		ewarn "no ALS iio device and no /dev/i2c-0; biscuit-als will exit"
 	fi
 	return 0
 }

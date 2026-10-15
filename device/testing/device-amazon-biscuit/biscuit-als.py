@@ -5,6 +5,10 @@ Stock dims the ring to match the room. This does the same, using stock's own
 sensor configuration and stock's own lux equation, both recovered from the
 vendor kernel (drivers/misc/tsl2583.c in the 3.18 tree).
 
+Amazon fitted two different sensors. Most units carry the TSL2584TSV this was
+written for; some carry an ams TSL2540 instead, which mainline has no driver
+for. Both are handled - see "The second-source part: TSL2540" at the end.
+
 Provenance: this is our own code. It reimplements stock's observed behaviour;
 the numeric parameters below (sensor settings, the response-curve
 coefficients and the brightness ladder) were measured from, or read out of,
@@ -119,8 +123,43 @@ which reaches the sensor (11.65). biscuit-ring publishes its total output to
 /run/biscuit-ring/output and this subtracts the corresponding counts before
 computing ambient lux. Without that the loop measures itself: in a dark room
 the ring is the only thing the sensor can see.
+
+The second-source part: TSL2540
+-------------------------------
+Some units carry an ams TSL2540 at i2c 0-0039 instead of the TSL2584TSV at
+0-0029. Amazon's board file registers both and its kernel probes both; whichever
+answers is the sensor. On those units mainline's tsl2583 fails its probe
+("failed to read the chip ID register"), there is no IIO device, and without
+this the service exits - no auto-dim and no room light reading. The part
+answers at 0x39 with ID 0xE4 and REVID 0x61.
+
+Mainline has no TSL2540 driver, so this drives it from userspace through
+/dev/i2c-0 (CONFIG_I2C_CHARDEV=y). The settings are stock's, from the tsl2540@39
+node of the Fire OS 6.5.7.4 biscuit device tree, applied the way the vendor
+driver (drivers/misc/ams_tsl2540*.c) applies them:
+
+    persist=18  als_time=123  als_gain=3 (64x)  als_gain_factor=1 (AGAINMAX)
+    az_iterations=126  d_factor=47540
+    ch0_coef0=1000  ch1_coef0=305  ch0_coef1=118  ch1_coef1=21
+
+and its lux is the vendor driver's two-segment equation:
+
+    cpl  = als_time * 2816 * 64 * 2 / d_factor * 1000
+    lux1 = 1000 * (1000 * ch0 - 305 * ch1) / cpl
+    lux2 = 1000 * (118  * ch0 -  21 * ch1) / cpl
+    lux  = clamp(max(lux1, lux2), 0, 65535)
+
+Like the 2584TSV equation this is an uncalibrated scale, and IDME alscal is
+written in it: als_calibrated_lux_show() divides by the same ams_400_0 second
+field (391 on the TSL2540 unit this was measured on), so the calibration and
+everything after it are shared.
+
+The ring does not reach this part: with the ring at full white on all 36
+channels (output 9180) ch0/ch1 read 10/14 either way, so its self-illumination
+correction is zero.
 """
 import argparse
+import fcntl
 import math
 import os
 import re
@@ -151,6 +190,43 @@ NOISE_THRESHOLD = 6
 
 # als_saturation = als_count * 922, als_count = round(650*100/270) = 241.
 ALS_SATURATION = 241 * 922
+
+# The second-source TSL2540, driven over i2c-dev. See module docstring.
+TSL2540_BUS = "/dev/i2c-0"
+TSL2540_ADDR = 0x39
+TSL2540_ID = 0xE4
+I2C_SLAVE = 0x0703        # linux/i2c-dev.h
+
+TSL2540_REG_ENABLE = 0x80
+TSL2540_REG_ATIME = 0x81
+TSL2540_REG_PERS = 0x8C
+TSL2540_REG_CFG1 = 0x90
+TSL2540_REG_REVID = 0x91
+TSL2540_REG_ID = 0x92
+TSL2540_REG_CH0DATA = 0x94    # ch0 lo, hi, ch1 lo, hi
+TSL2540_REG_CFG2 = 0x9F
+TSL2540_REG_AZ_CONFIG = 0xD6
+
+TSL2540_PON = 0x01
+TSL2540_AEN = 0x02
+TSL2540_AGAIN_64 = 0x03
+TSL2540_CFG2_AGAINL = 0x04
+TSL2540_CFG2_AGAINMAX = 0x10
+
+# Stock's settings, from the tsl2540@39 node of the Fire OS biscuit DTB.
+TSL2540_PERSIST = 18
+TSL2540_ATIME = 123
+TSL2540_AZ_ITERATIONS = 126
+TSL2540_D_FACTOR = 47540
+TSL2540_COEF = (1000, 305, 118, 21)   # ch0_coef0, ch1_coef0, ch0_coef1, ch1_coef1
+TSL2540_INTEGRATION_CYCLE = 2816      # us per ATIME step, vendor driver
+TSL2540_GAIN = 64 * 2                 # AGAIN_64 doubled by AGAINMAX
+
+# The vendor driver's counts-per-lux and saturation, from the settings above.
+TSL2540_CPL = (TSL2540_ATIME * TSL2540_INTEGRATION_CYCLE * 64 << 1) \
+    // TSL2540_D_FACTOR * 1000
+TSL2540_SATURATION = min(0xFFFF, TSL2540_ATIME << 10) * 8 // 10
+TSL2540_MAX_LUX = 0xFFFF
 
 # Ring self-illumination at full drive on all 36 channels, in raw counts, at
 # the gain and integration time above. Linear in total drive.
@@ -318,6 +394,119 @@ def stock_raw(ch0, ch1):
     return 0.0 if raw < 0 else raw
 
 
+class Tsl2540(object):
+    """The second-source TSL2540 at i2c 0-0039, driven over i2c-dev.
+
+    Register access is plain: write the register address, then read or write
+    the value. Nothing else binds 0x39, so no I2C_SLAVE_FORCE is needed.
+    """
+
+    def __init__(self, bus=TSL2540_BUS, addr=TSL2540_ADDR):
+        self.bus = bus
+        self.addr = addr
+        self.fd = None
+
+    def _open(self):
+        if self.fd is None:
+            fd = os.open(self.bus, os.O_RDWR)
+            try:
+                fcntl.ioctl(fd, I2C_SLAVE, self.addr)
+            except OSError:
+                os.close(fd)
+                raise
+            self.fd = fd
+        return self.fd
+
+    def _write(self, reg, value):
+        os.write(self._open(), bytes((reg, value & 0xFF)))
+
+    def _read(self, reg, count=1):
+        fd = self._open()
+        os.write(fd, bytes((reg,)))
+        return os.read(fd, count)
+
+    def check(self):
+        """None if a TSL2540 answers, else why not."""
+        try:
+            chip_id = self._read(TSL2540_REG_ID)[0]
+            self.revid = self._read(TSL2540_REG_REVID)[0]
+        except (OSError, IndexError) as e:
+            return "no TSL2540 at %s 0x%02x (%s)" % (self.bus, self.addr, e)
+        if chip_id != TSL2540_ID:
+            return "0x%02x reports ID 0x%02x, not a TSL2540 (0x%02x)" % (
+                self.addr, chip_id, TSL2540_ID)
+        return None
+
+    def configure(self):
+        """Stock's settings, in the order the vendor driver writes them."""
+        try:
+            self._write(TSL2540_REG_ENABLE, 0x00)
+            self._write(TSL2540_REG_PERS, TSL2540_PERSIST)
+            self._write(TSL2540_REG_ATIME, TSL2540_ATIME)
+            self._write(TSL2540_REG_CFG1, TSL2540_AGAIN_64)
+            self._write(TSL2540_REG_AZ_CONFIG, TSL2540_AZ_ITERATIONS)
+            self._write(TSL2540_REG_CFG2,
+                        TSL2540_CFG2_AGAINL | TSL2540_CFG2_AGAINMAX)
+            self._write(TSL2540_REG_ENABLE, TSL2540_PON | TSL2540_AEN)
+        except OSError as e:
+            return "failed to configure the TSL2540: %s" % e
+        # Let the first integration finish before the first read.
+        time.sleep(TSL2540_ATIME * TSL2540_INTEGRATION_CYCLE / 1e6 + 0.1)
+        return None
+
+    def read_channels(self):
+        try:
+            b = self._read(TSL2540_REG_CH0DATA, 4)
+        except OSError:
+            return None, None
+        if len(b) != 4:
+            return None, None
+        return b[0] | b[1] << 8, b[2] | b[3] << 8
+
+
+def tsl2540_raw(ch0, ch1):
+    """The vendor driver's TSL2540 equation. Uncalibrated units, like
+    stock_raw(): IDME alscal is written in this scale."""
+    if ch0 >= TSL2540_SATURATION:
+        return float(TSL2540_MAX_LUX)
+    a, b, c, d = TSL2540_COEF
+    lux1 = 1000.0 * (a * ch0 - b * ch1) / TSL2540_CPL
+    lux2 = 1000.0 * (c * ch0 - d * ch1) / TSL2540_CPL
+    return float(min(TSL2540_MAX_LUX, max(0.0, lux1, lux2)))
+
+
+class Sensor(object):
+    """What the loop needs from whichever part this unit has."""
+
+    def __init__(self, label, configure, read_channels, raw, self_ch0, self_ch1):
+        self.label = label
+        self.configure = configure
+        self.read_channels = read_channels
+        self.raw = raw
+        self.self_ch0 = self_ch0
+        self.self_ch1 = self_ch1
+
+
+def detect_sensor():
+    """The TSL2584TSV through mainline's tsl2583 if it probed, else the
+    TSL2540 at 0x39. Returns (Sensor, None) or (None, why neither)."""
+    problem = check_sensor()
+    if problem is None:
+        return Sensor("TSL2584TSV (tsl2583), gain %d, %d ms"
+                      % (STOCK_GAIN, ALS_TIME_MS),
+                      configure_sensor, read_channels, stock_raw,
+                      RING_SELF_CH0, RING_SELF_CH1), None
+    tsl2540 = Tsl2540()
+    problem2540 = tsl2540.check()
+    if problem2540 is None:
+        return Sensor("TSL2540 rev 0x%02x at 0x%02x, gain %d, %d ms"
+                      % (tsl2540.revid, TSL2540_ADDR, TSL2540_GAIN,
+                         TSL2540_ATIME * TSL2540_INTEGRATION_CYCLE // 1000),
+                      tsl2540.configure, tsl2540.read_channels, tsl2540_raw,
+                      0.0, 0.0), None
+    return None, "%s; %s" % (problem, problem2540)
+
+
 def calibrated_lux(raw, coeff):
     """taos_calibrated_lux_show(): scale by the unit's coefficient and clamp."""
     lux = ALS_MAX_LUX * raw / float(coeff)
@@ -341,14 +530,16 @@ def read_ring_output():
         return 0
 
 
-def ring_self_illumination(total):
+def ring_self_illumination(total, full_ch0=RING_SELF_CH0,
+                           full_ch1=RING_SELF_CH1):
     """Counts the ring contributes to each channel at that total output.
 
     Linear in total drive, from the measurements in 11.65: all 36 channels at
-    full give ch0=38 / ch1=6 at this gain and integration time.
+    full give ch0=38 / ch1=6 at this gain and integration time. Zero for the
+    TSL2540, which the ring does not reach.
     """
     fraction = total / float(RING_CHANNELS * RING_MAX)
-    return RING_SELF_CH0 * fraction, RING_SELF_CH1 * fraction
+    return full_ch0 * fraction, full_ch1 * fraction
 
 
 def response_curve(lux):
@@ -398,17 +589,16 @@ def main():
     ap.add_argument("--interval", type=float, default=SAMPLE_INTERVAL_S)
     args = ap.parse_args()
 
-    problem = check_sensor()
-    if problem:
+    sensor, problem = detect_sensor()
+    if sensor is None:
         log("biscuit-als: %s" % problem)
         return 1
 
-    problem = configure_sensor()
+    problem = sensor.configure()
     if problem:
         log("biscuit-als: %s" % problem)
         return 1
-    log("biscuit-als: sensor at gain %d, %d ms (stock settings)"
-        % (STOCK_GAIN, ALS_TIME_MS))
+    log("biscuit-als: %s (stock settings)" % sensor.label)
 
     # Per-unit, so it must come from this device's own IDME. Without it the
     # raw scale means nothing and any curve applied to it is invented.
@@ -429,7 +619,7 @@ def main():
     settled = 0
 
     while _running:
-        ch0, ch1 = read_channels()
+        ch0, ch1 = sensor.read_channels()
         if ch0 is None:
             log("biscuit-als: sensor read failed")
             time.sleep(args.interval)
@@ -437,11 +627,12 @@ def main():
 
         # Subtract what the ring is contributing at its current output, so the
         # loop measures the room rather than itself.
-        self_ch0, self_ch1 = ring_self_illumination(read_ring_output())
+        self_ch0, self_ch1 = ring_self_illumination(
+            read_ring_output(), sensor.self_ch0, sensor.self_ch1)
         amb0 = max(0.0, ch0 - self_ch0)
         amb1 = max(0.0, ch1 - self_ch1)
 
-        raw = stock_raw(amb0, amb1)
+        raw = sensor.raw(amb0, amb1)
         lux = calibrated_lux(raw, coeff)
         # Stock filters with a FilterEma configured for a 3 s response time at
         # 20 samples/s. We sample far more slowly, so derive alpha from the

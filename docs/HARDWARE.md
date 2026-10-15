@@ -21,7 +21,7 @@ supported. Driver names are the kernel's; patch numbers refer to
 | Light ring | ISSI IS31FL3236A, 12 RGB segments | Yes | `leds-is31fl32xx` |
 | Mute LED | GPIO | Yes | `gpio-leds` (0096) |
 | Buttons | Action, volume up, volume down, microphone mute | Yes | `gpio-keys` (0095) |
-| Ambient light sensor | 2584TSV (bound as `tsl2583`) | Yes | Read by `biscuit-als`, see below |
+| Ambient light sensor | 2584TSV (bound as `tsl2583`), or on some units an ams TSL2540 at 0x39 | Yes | Read by `biscuit-als`, see below |
 | Thermal | SoC thermal sensor | Yes | Thermal zones and CPU cooling (0098, 0100, 0101) |
 | RTC | In the MT6323 | Partial | Loses the time on power loss; implausible dates are reset to 2010-01-01 (0117) |
 | USB | Micro-USB, MUSB controller, device mode | Yes | Power plus optional gadget functions: RNDIS network, USB Audio Class 2 microphone and speaker |
@@ -90,6 +90,12 @@ devices (`biscuit:ring:segment-NN:red` and so on). The sensor's mainline driver
 applies another part's coefficients and reads 0 lux in a lit room, so
 `biscuit-als` reads the raw channels and applies the unit's factory calibration
 from IDME; the result is in `/run/biscuit-als/lux`.
+
+Some units carry a second-source part instead: an ams TSL2540 at i2c 0x39 (ID
+0xE4). Mainline has no driver for it, so on those units `tsl2583` fails its
+probe at 0x29 and `biscuit-als` drives the TSL2540 through `/dev/i2c-0` with
+stock's settings and equation from the Fire OS device tree and vendor driver.
+The same IDME calibration applies. The service log names the part it found.
 
 ### Per-unit calibration
 
