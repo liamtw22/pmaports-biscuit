@@ -173,6 +173,20 @@ load_driver || {
 #
 # Neither setting has been measured as a fix for anything here - they are cheap
 # parity with stock, not a diagnosis. Both are non-fatal if unsupported.
+#
+# 5 GHz preference, which IS a measured fix. The driver advertises firmware
+# roaming, so wpa_supplicant hands it only a BSSID hint and the driver picks the
+# access point itself, by signal. Its Amazon 5 GHz bonus (AMZN_5GHZ_PREF in
+# scan.c) defaults to +20/+15/+3 dB above -60/-67/-70 dBm and nothing below, so
+# a dual-band AP's 5 GHz radio at -76 dBm always lost to its 2.4 GHz radio at
+# -56 and the Echo never joined 5 GHz - while Bluetooth audio starves 2.4 GHz.
+# On stock this never mattered: Android's framework chooses the BSSID itself and
+# hands it to the supplicant fixed. Measured on one unit with the bias below:
+# joins 5 GHz at -75 dBm on every boot, 43/55 Mbit/s down/up, 0/1200 pings lost;
+# below -82 dBm 2.4 GHz still wins. It must be set before wpa_supplicant's first
+# connect: moving bands later needs a disconnect, and after one the driver
+# leaves cfg80211 believing it is still connected, which then refuses every
+# connect with EALREADY until a reboot.
 set_radio_defaults() {
 	if [ -w /proc/net/wlan/country ]; then
 		if echo US > /proc/net/wlan/country 2>/dev/null; then
@@ -182,6 +196,12 @@ set_radio_defaults() {
 	if command -v iw >/dev/null 2>&1; then
 		if iw dev $IFACE set power_save off 2>/dev/null; then
 			log "power save disabled"
+		fi
+	fi
+	# rangeHi,rangeMed,rangeLo (dBm), prefHi,prefMed,prefLo (dB)
+	if [ -w /proc/net/wlan/roam_param ]; then
+		if echo "roam_5g_bias -65,-75,-82,30,30,30" > /proc/net/wlan/roam_param 2>/dev/null; then
+			log "5 GHz preference set (+30 dB above -82 dBm)"
 		fi
 	fi
 }
