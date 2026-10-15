@@ -554,12 +554,7 @@ update_ours() {   # NEWER
 	# only run at boot, so the update is finished by a restart.
 	touch "$RUNDIR/reboot-required"
 	_to=$(printf '%s\n' "$1" | awk '$1 == "device-amazon-biscuit" { print $3 }')
-	record_boot
-	if boot_differs; then
-		status ok "Updated to ${_to:-the latest version}. Install the new boot image, then restart." 1
-	else
-		status ok "Updated to ${_to:-the latest version}. Restart to finish." 1
-	fi
+	finish_update "Updated to ${_to:-the latest version}"
 	log "updated: $_want"
 }
 
@@ -581,6 +576,55 @@ record_boot() {
 
 boot_differs() {
 	grep -q '"differs": true' "$RUNDIR/boot-status.json" 2>/dev/null
+}
+
+# After an update that rebuilt the start-up files, install the matching boot
+# image before anyone can restart.
+#
+# The initramfs on the boot partition and initramfs-extra in /boot are two
+# halves of one start-up and must come from the same build: the first unpacks
+# the second and hands over to its init_2nd.sh. An update regenerates /boot,
+# but nothing else writes the boot partitions, so the restart that every update
+# asks for started the OLD first half against the NEW second half - and an
+# Echo updated that way stopped right after the ring came on, until the boot
+# image was installed from TWRP (issue #1). "Install the new boot image, then
+# restart" was one button too easy to skip.
+#
+# biscuit-boot-update checks the image before writing, writes boot_a and reads
+# it back before boot_b, and restores a slot whose read-back differs, so it is
+# safe to run here. If it refuses, the old image is still in place and still
+# needs the old /boot - which is gone - so the message says not to restart.
+finish_update() {   # WHAT-WAS-DONE
+	record_boot
+	if ! boot_differs; then
+		status ok "$1. Restart to finish." 1
+		return 0
+	fi
+	/usr/bin/biscuit-boot-update apply > "$RUNDIR/boot.out" 2>&1
+	_brc=$?
+	cat "$RUNDIR/boot.out" >> "$LOG"
+	case $_brc in
+	4) touch "$RUNDIR/boot-damaged"; rm -f "$RUNDIR/boot-verified" ;;
+	0|5) rm -f "$RUNDIR/boot-damaged"; touch "$RUNDIR/boot-verified" ;;
+	esac
+	record_boot
+	_bwhy=$(grep -m1 'biscuit-boot-update: DAMAGED:' "$RUNDIR/boot.out")
+	[ -n "$_bwhy" ] || _bwhy=$(grep 'biscuit-boot-update:' "$RUNDIR/boot.out" | tail -n1)
+	_bwhy=$(printf '%s' "$_bwhy" | sed 's/^biscuit-boot-update: //; s/^DAMAGED: //' | cut -c1-200)
+	case $_brc in
+	0|5)
+		status ok "$1, and its boot image installed. Restart to finish." 1
+		log "boot image installed after the update"
+		;;
+	4)
+		status failed "$1, but a boot partition may be damaged: ${_bwhy}. Do not restart: install the boot image again, or put back the previous one. If that fails too, reinstall from TWRP." 1
+		log "boot image after the update: slot may be damaged (exit 4)"
+		;;
+	*)
+		status failed "$1, but its boot image was not installed${_bwhy:+: $_bwhy}. Do not restart until it is: the updated start-up files do not work with the old boot image." 1
+		log "boot image after the update: not written (exit $_brc)"
+		;;
+	esac
 }
 
 # Hold Python at the minor version the apps' environments were built for.
@@ -626,12 +670,7 @@ update_system() {
 	fi
 	if [ "$_n" -gt 0 ]; then
 		touch "$RUNDIR/reboot-required"
-		record_boot
-		if boot_differs; then
-			status ok "Updated $_n system package(s). Install the new boot image, then restart." 1
-		else
-			status ok "Updated $_n system package(s). Restart to finish." 1
-		fi
+		finish_update "Updated $_n system package(s)"
 	else
 		status ok "Nothing to update." 1
 	fi

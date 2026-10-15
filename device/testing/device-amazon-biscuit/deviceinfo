@@ -13,6 +13,13 @@ deviceinfo_arch="aarch64"
 deviceinfo_chassis="embedded"
 deviceinfo_no_framebuffer="true"
 deviceinfo_create_initfs_extra="true"
+# gzip, not mkinitfs's default. Since 2.12 that default is zstd, and nothing on
+# this device reads zstd start-up files: the initramfs unpacks initramfs-extra
+# with `gzip -d` and carries no zstd, and biscuit-boot-update reads the boot
+# image's initramfs as gzip. A system update on 2026-10-15 left an Echo that
+# stopped right after the ring came on (issue #1).
+deviceinfo_initfs_compression="gzip"
+deviceinfo_initfs_extra_compression="gzip"
 
 # Bootloader related
 deviceinfo_flash_method="fastboot"
