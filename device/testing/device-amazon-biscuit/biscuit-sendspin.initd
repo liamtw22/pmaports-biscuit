@@ -23,6 +23,8 @@ description="Sendspin audio target - makes the Echo a Music Assistant speaker"
 #     stream - which meant the volume ring never lit and there were two
 #     attenuations in series. --hook-set-volume now routes it to
 #     biscuit-audio instead, so there is one device volume again.
+#     --hook-volume-state carries it back: a change on the buttons or
+#     from Home Assistant is reported, so Music Assistant follows it.
 #
 #   "MPRIS not available: DBus address error"
 #     No session bus for a headless daemon. Affects metadata reporting only,
@@ -90,7 +92,7 @@ export PULSE_RUNTIME_PATH=/run/pipewire/pulse
 # these two variables set, both "default" and "pipewire" open cleanly.
 command="/usr/bin/env"
 
-command_args="XDG_RUNTIME_DIR=/run/pipewire PULSE_RUNTIME_PATH=/run/pipewire/pulse /usr/lib/sendspin/bin/sendspin daemon --name ${SENDSPIN_NAME} --audio-device ${SENDSPIN_AUDIO_DEVICE} --log-level ${SENDSPIN_LOG_LEVEL}${SENDSPIN_AUDIO_FORMAT:+ --audio-format ${SENDSPIN_AUDIO_FORMAT}} --settings-dir /opt/persist/sendspin --hook-set-volume /usr/bin/biscuit-sendspin-volume --hook-start '/usr/bin/biscuit-sendspin-stream start' --hook-stop '/usr/bin/biscuit-sendspin-stream stop' --manufacturer '${SENDSPIN_MANUFACTURER}' --product-name '${SENDSPIN_PRODUCT}'"
+command_args="XDG_RUNTIME_DIR=/run/pipewire PULSE_RUNTIME_PATH=/run/pipewire/pulse /usr/lib/sendspin/bin/sendspin daemon --name ${SENDSPIN_NAME} --audio-device ${SENDSPIN_AUDIO_DEVICE} --log-level ${SENDSPIN_LOG_LEVEL}${SENDSPIN_AUDIO_FORMAT:+ --audio-format ${SENDSPIN_AUDIO_FORMAT}} --settings-dir /opt/persist/sendspin --hook-set-volume /usr/bin/biscuit-sendspin-volume --hook-volume-state /run/biscuit-audio/volume --hook-start '/usr/bin/biscuit-sendspin-stream start' --hook-stop '/usr/bin/biscuit-sendspin-stream stop' --manufacturer '${SENDSPIN_MANUFACTURER}' --product-name '${SENDSPIN_PRODUCT}'"
 command_background=true
 pidfile="/run/${RC_SVCNAME}.pid"
 output_log="/var/log/sendspin.log"

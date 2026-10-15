@@ -272,6 +272,7 @@ source="
 	sendspin-visualizer-roles.diff
 	sendspin-media-commands.diff
 	sendspin-client-visualizer.diff
+	sendspin-volume-feedback.diff
 	biscuit-sendspin-server.py
 	biscuit-lva-processed-mic-profile.patch.txt
 	biscuit-lva-wake-agc-direct-input.patch.txt
@@ -1203,9 +1204,15 @@ package() {
 	# a tree with both patches above applied, so it goes last.
 	( cd "$pkgdir"/usr/lib/sendspin/lib/python3.14/site-packages \
 		&& patch -p1 --fuzz=0 < "$srcdir"/sendspin-client-visualizer.diff )
+	# Volume both ways: the hook controller now watches biscuit-audio's
+	# published level (--hook-volume-state in the initd), so a change on the
+	# buttons or from Home Assistant reaches Music Assistant instead of MA
+	# keeping a stale level.
+	( cd "$pkgdir"/usr/lib/sendspin/lib/python3.14/site-packages \
+		&& patch -p1 --fuzz=0 < "$srcdir"/sendspin-volume-feedback.diff )
 	# Apache-2.0 4(b): a file we changed says so, at the top where it is seen.
 	for _f in aiosendspin/models/controller.py aiosendspin/models/types.py \
-			sendspin/daemon/daemon.py; do
+			sendspin/daemon/daemon.py sendspin/cli.py sendspin/hook_volume.py; do
 		sed -i "1i # Modified by liamtw22 and contributors for the Echo Dot 2 port (sendspin-*.diff in pmaports-biscuit)." \
 			"$pkgdir"/usr/lib/sendspin/lib/python3.14/site-packages/$_f
 	done
@@ -1493,7 +1500,7 @@ e53d49b335da2e1255424392a03abbc7cd1b66cccd3cb3836a1c586e5725f08c91502a7e4fb92e59
 a097a7ebfc11e0ec7723656ef1667e8e4e8b7ed307fd2ae11ff39aea26472a2529e4c45839926c0c9c5278d54e33deb7c07fc799452f0de0126cec5c693c4dee  wlan-defer.conf
 c3f32e88a85cde435532c9a2dc1f047fe352acfb974ebf0ea3c9024cb1d004adac339bc74d0f311a62c862153ad0f4776785f5487a1ce85a48b30cf111352701  biscuit-voice-venv.tar.gz
 e6702e4495d353aa5ed08b71cc7c6085878cc177fd0356e36fd00d0bbc34d4e7b83e220c9c24eb6e71a6d7658f4f6fb3e281a159c47002749978b89bfebb498a  biscuit-sendspin-venv.tar.gz
-80c08408dc9bc7cc445357c49f99308ff3bcf2606c27d54b29d2ef3c40b13f243fa1d0194cf03957ea3e84e9676a2556aa2e483fc1b0cab08ce70651c49f867f  biscuit-sendspin.initd
+6cc8102e64f8c21c385fc2cd7fdf707dc5b02922bceed06eb73af810bf686ede541354b418541592bb2f6f0a7837a4be82f1c95cb2527a3e0ececa430f5a180e  biscuit-sendspin.initd
 b5c24cfe5d75d5dbc3024dd09f67c6bb0e1f531d716cddd2de163eccbbccf19142f3a54d19b0a4011b19a9d35416e022de4c6e48833f76bbea562d3b8c6ec875  biscuit-sendspin-watchdog.sh
 13aa842ddcc869c93cd92614adc5e9583532c65cabeb917dea8c4820a05c399d88bb2df2e8e3914f3b8ecdc0fb405534ce5781a07cb76d6596ef78cfeb5960d3  biscuit-sendspin-watchdog.initd
 9c175690a836c505caffbfc1c2f68d2439c1d9712b390e53d305edd780279ccb2c9b460aa8d8e9ab6a4bbb1cce69189bd4f61f06d0f6f689c1849d3a497bbbe7  biscuit-sendspin-volume.sh
@@ -1502,6 +1509,7 @@ b1afde51f35eaa115fd8b0fcf38d633076eef4c36482c12316cdda154a8c25dd4142a851e87e8347
 b82e4b7f02db22c49aea53e886beda23c2ac0ac6bd031850b35fc232cbcef6aed1f5228052f1e22198cb6afc87f357a7e9bc619b253a010edd4234ecbee03ce8  sendspin-visualizer-roles.diff
 432e916ba9ffbd2c7ac0337f095791045e0e4f216db6927604b5826fa5eb15382e87738dfd545015759d1c04c56bd86c4ccfd9b47ec2760af1e201aeb581151a  sendspin-media-commands.diff
 fc7584549ebf438f8c0b49ac4a5bd64612e4b7b917edc01456ccca89a9927bd9e1a60156daad1e698aca0a90e31f60d20f8abc518d9e19040c71e515190ca07e  sendspin-client-visualizer.diff
+7738da25ddb0b8aa2b74b31e7eeab31303955515df72c197e8b37fb4654fea7b31cc311fd5572bdf5ccd4b0c506fc7ad288b0b63bd5962754252336610190d6e  sendspin-volume-feedback.diff
 8e57e0a0bb909b6be7fdb2b121f8237d2f9d026c365d1c8930a3c86bdf1594a53ec88a8927dedd5db5260007c1a915a2a2ae068f7d5899fa9abbcb18b7bfcfef  biscuit-sendspin-server.py
 86a38319681429d0c69f62b04838814e7b625bf8e51862f96946dfb028b2fc947ab93bd567e455f5e50ee9df15914f803238ab2894890f6f4e4f73100dc902de  biscuit-lva-processed-mic-profile.patch.txt
 a856b17731c50bb3646c8a89e96f61301cf5a321dec669f9bf37c39cd9e30070e97ced8f45e87200489bb01c8809a9e2b9b7fa2ae8e2c30c0b18fd39c6eb2ca9  biscuit-lva-wake-agc-direct-input.patch.txt

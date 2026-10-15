@@ -1,0 +1,232 @@
+Report volume changes made on the device back to the server.
+
+HookVolumeController only ever pushed the server's volume out through the
+hook; its start_monitoring was a no-op, so a level changed on the Echo itself
+(the buttons, Home Assistant) never reached Music Assistant, which kept a
+stale slider - and so did the Spotify app through MA's "Sync Spotify app
+volume", which then pushed the stale level back on the next change.
+
+--hook-volume-state names a file holding the device's own level 0-100
+(biscuit-audio's /run/biscuit-audio/volume, replaced atomically). It is
+polled, and a level that is not explained by a hook request is reported
+through the volume callback, unmuted. Two things keep the hook and the
+watcher from driving each other:
+
+  * for 2 s after a hook request the file is not judged at all: it still
+    holds the previous level for a moment, and during a slider drag it
+    trails the latest request by several values. A device change made in
+    that window is reported when it ends, not lost;
+  * a level within 2 points of the request is the device's quantisation of
+    it (30 steps, 3.3 points apart), not a change. Once the file settles
+    there, that actual step is what later levels are compared against, so
+    a single button step is never swallowed by the tolerance.
+
+get_state also prefers the file to the persisted level, so a change made
+while sendspin was not running is picked up at start.
+
+--- a/sendspin/cli.py
++++ b/sendspin/cli.py
+@@ -229,6 +229,12 @@
+         help="Script to run for external volume control (receives effective volume 0-100)",
+     )
+     target.add_argument(
++        "--hook-volume-state",
++        type=str,
++        default=default,
++        help="File holding the device's own volume 0-100; changes made on the device are reported",
++    )
++    target.add_argument(
+         "--hook-stop",
+         type=str,
+         default=default,
+@@ -454,6 +460,12 @@
+         help="Script to run for external volume control (receives effective volume 0-100)",
+     )
+     daemon_parser.add_argument(
++        "--hook-volume-state",
++        type=str,
++        default=None,
++        help="File holding the device's own volume 0-100; changes made on the device are reported",
++    )
++    daemon_parser.add_argument(
+         "--hook-stop",
+         type=str,
+         default=None,
+@@ -871,7 +883,9 @@
+     volume_controller: VolumeController | None = None
+     if args.hook_set_volume:
+         LOGGER.info("Using hook-based external volume control via %s", args.hook_set_volume)
+-        volume_controller = HookVolumeController(args.hook_set_volume, settings)
++        volume_controller = HookVolumeController(
++            args.hook_set_volume, settings, getattr(args, "hook_volume_state", None)
++        )
+     elif args.hardware_volume:
+         # Try ALSA direct control first (works for hw: devices without PulseAudio).
+         alsa_info = await alsa_volume_check_available(audio_device)
+--- a/sendspin/hook_volume.py
++++ b/sendspin/hook_volume.py
+@@ -3,8 +3,11 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import contextlib
+ import logging
++import os
+ import shlex
++import time
+ from typing import TYPE_CHECKING
+ 
+ from sendspin.volume_controller import VolumeChangeCallback
+@@ -14,6 +17,19 @@
+ 
+ logger = logging.getLogger(__name__)
+ 
++# How often the state file is checked. A stat() per tick; the read only
++# happens when the file was replaced.
++_STATE_POLL_S = 0.25
++# A level within this many points of what the hook was asked for is the
++# device's quantisation of that request, not a change of its own. The Echo Dot
++# has 30 steps, 3.3 points apart, so rounding moves a request by at most 2.
++_ECHO_TOLERANCE = 2
++# How long after a hook request the file is left alone. The hook hands the
++# level on asynchronously, so for a moment the file still holds the previous
++# level, and during a fast slider drag it trails the latest request by several
++# values; none of that is the device changing by itself.
++_SETTLE_S = 2.0
++
+ 
+ class HookVolumeController:
+     """Controls external volume via a user-provided script.
+@@ -21,9 +37,18 @@
+     The hook script receives the effective output volume as the last argument
+     in the range 0-100. When muted, the hook receives ``0`` while the logical
+     volume and mute state remain persisted separately in settings.
++
++    With *state_file*, the device's own level (0-100, a single integer, replaced
++    atomically by whatever owns the volume) is watched too, so a change made on
++    the device - its buttons, Home Assistant - is reported to the server
++    instead of the server keeping a stale level. Levels that are just the
++    device applying a hook request are not reported back, so the hook and the
++    watcher cannot drive each other.
+     """
+ 
+-    def __init__(self, command: str, settings: ClientSettings) -> None:
++    def __init__(
++        self, command: str, settings: ClientSettings, state_file: str | None = None
++    ) -> None:
+         """Initialize the controller."""
+         argv = shlex.split(command)
+         if not argv:
+@@ -31,6 +56,13 @@
+ 
+         self._argv = argv
+         self._settings = settings
++        self._state_file = state_file
++        self._watch_task: asyncio.Task[None] | None = None
++        # The level the device should be at: the last hook request, or the
++        # last level the device reported by itself.
++        self._expected: int | None = None
++        # When the last hook request was made.
++        self._last_request = 0.0
+ 
+     async def set_state(self, volume: int, *, muted: bool) -> None:
+         """Set external volume and persist the logical state."""
+@@ -38,6 +70,8 @@
+             raise ValueError(f"Volume must be 0-100, got {volume}")
+ 
+         effective_volume = 0 if muted else volume
++        self._expected = effective_volume
++        self._last_request = time.monotonic()
+         logger.debug(
+             "Running volume hook %s with effective volume %d",
+             self._argv[0],
+@@ -68,13 +102,85 @@
+         self._settings.update(player_volume=volume, player_muted=muted)
+ 
+     async def get_state(self) -> tuple[int, bool]:
+-        """Return the persisted logical volume state."""
++        """Return the logical volume state.
++
++        The persisted state, unless the device's own level says otherwise:
++        the device may have been changed while nothing was listening.
++        """
+         volume = max(0, min(100, self._settings.player_volume))
+         muted = bool(self._settings.player_muted)
++        device = self._read_state_file()
++        if device is not None and not self._explains(device, 0 if muted else volume):
++            volume, muted = device, False
++            self._settings.update(player_volume=volume, player_muted=muted)
+         return volume, muted
+ 
+-    async def start_monitoring(self, _callback: VolumeChangeCallback) -> None:
+-        """Hook-based volume control does not support external monitoring."""
++    async def start_monitoring(self, callback: VolumeChangeCallback) -> None:
++        """Start reporting levels set on the device itself, if a file is given."""
++        if self._state_file is None or self._watch_task is not None:
++            return
++        volume, muted = await self.get_state()
++        self._expected = 0 if muted else volume
++        self._watch_task = asyncio.get_running_loop().create_task(self._watch(callback))
+ 
+     async def stop_monitoring(self) -> None:
+-        """Hook-based volume control does not support external monitoring."""
++        """Stop the state file watcher if running."""
++        if self._watch_task is not None:
++            self._watch_task.cancel()
++            with contextlib.suppress(asyncio.CancelledError):
++                await self._watch_task
++            self._watch_task = None
++
++    def _read_state_file(self) -> int | None:
++        if self._state_file is None:
++            return None
++        try:
++            with open(self._state_file, encoding="ascii") as handle:
++                level = int(handle.read().strip())
++        except (OSError, ValueError):
++            return None
++        return max(0, min(100, level))
++
++    @staticmethod
++    def _explains(device: int, requested: int) -> bool:
++        return abs(device - requested) <= _ECHO_TOLERANCE
++
++    async def _watch(self, callback: VolumeChangeCallback) -> None:
++        """Poll the state file and report levels no hook request explains.
++
++        Re-evaluated on every tick, not only when the file changes, so a
++        change made on the device while a request was settling is reported
++        once it has settled rather than lost.
++        """
++        assert self._state_file is not None
++        last_stat: tuple[int, int] | None = None
++        device: int | None = None
++        while True:
++            await asyncio.sleep(_STATE_POLL_S)
++            try:
++                st = os.stat(self._state_file)
++            except OSError:
++                continue
++            if (st.st_ino, st.st_mtime_ns) != last_stat:
++                last_stat = (st.st_ino, st.st_mtime_ns)
++                device = self._read_state_file()
++            if device is None or self._expected is None:
++                continue
++            if time.monotonic() - self._last_request < _SETTLE_S:
++                continue
++            if self._explains(device, self._expected):
++                # Settled on the device's own step for the request. Track that
++                # step from now on: compared against the request instead, a
++                # one-step button press could still fall inside the tolerance.
++                self._expected = device
++                continue
++
++            # Changed on the device. Any level there means it is not muted,
++            # including 0, which is how the device says "silent".
++            logger.debug("Device volume changed to %d", device)
++            self._expected = device
++            self._settings.update(player_volume=device, player_muted=False)
++            try:
++                callback(device, False)
++            except Exception:
++                logger.exception("Volume change callback failed")
