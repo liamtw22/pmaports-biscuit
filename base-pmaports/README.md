@@ -16,7 +16,7 @@ commit, plus the three patches in this directory.
 | Patch | What it does | Does it end up in the image? |
 |---|---|---|
 | `0001-device-archived-remove-amazon-biscuit-...` | Deletes upstream's `device/archived/device-amazon-biscuit` and `device/archived/linux-amazon-biscuit` (the old Fire OS 3.18 vendor-kernel port). pmbootstrap refuses two aports with the same package name, so they must go before this overlay is copied in. | No: it only removes files. |
-| `0002-main-boot-deploy-wrap-the-dtb-appended-kernel-in-the...` | `boot-deploy` 0.24.0-r1: puts the MediaTek header on the kernel that actually goes into `boot.img` when `deviceinfo_append_dtb=true`. Without it the MT8163 bootloader treats the kernel as 32-bit and the device bootloops about 11 s after power-on. | **Yes.** It is the `boot-deploy` in the image, and it rebuilds `/boot/boot.img` on every kernel or initramfs update. boot-deploy is GPL-2.0-or-later; this patch is its corresponding source. |
+| `0002-main-boot-deploy-wrap-the-dtb-appended-kernel-in-the...` | `boot-deploy` 0.25.0-r1: puts the MediaTek header on the kernel that actually goes into `boot.img` when `deviceinfo_append_dtb=true`. Without it the MT8163 bootloader treats the kernel as 32-bit and the device bootloops about 11 s after power-on. | **Yes.** It is the `boot-deploy` in the image, and it rebuilds `/boot/boot.img` on every kernel or initramfs update. boot-deploy is GPL-2.0-or-later; this patch is its corresponding source. |
 | `0003-main-postmarketos-zram-accept-a-built-in-zram-driver` | `postmarketos-zram` 3-r1: accepts a zram driver built into the kernel. | No. Upstream has since moved to 4-r0, which outranks it, so current images install upstream's package. It is kept so this tree matches the one the releases were built from. |
 
 Nothing else differs. The build machine's tree also had its `maintainer=` line
@@ -38,13 +38,23 @@ package from the Nura/postmarketOS and Alpine repositories whenever it is newer
 than the local aport, so almost everything in an image is current edge, whatever
 this base says. The only local packages that win are the ones whose version is
 higher than the binary repository's: this port's two packages, and `boot-deploy`
-0.24.0-r1 from `0002` (upstream is at 0.24.0-r0 as of 2026-09-29).
+0.25.0-r1 from `0002` (upstream is at 0.25.0-r0 as of 2026-10-15, still without
+the fix).
 
 **Check this before every release.** When upstream releases a `boot-deploy`
-that outranks 0.24.0-r1, the image silently gets the unpatched version and stops
-booting. Rebase `0002` onto the new version and bump its `pkgrel` above
+that outranks the patched one, the image silently gets the unpatched version
+and stops booting. Rebase `0002` onto the new version and bump its `pkgrel` above
 upstream's, then check that the first four bytes of the kernel in `boot.img` are
 `88 16 88 58`.
+
+It matters for installed Echos as well as images: apk takes the highest version
+from any repository, so the patched build has to be published on the biscuit
+feed too, at that same version. Upstream's 0.25.0-r0 outranked the 0.24.0-r1
+the feed carried, and the settings page's system update replaced it - after
+which every boot image this Echo built was refused by `biscuit-boot-update`
+(issue #1). `biscuit-pkgjob.sh` now holds a patched `boot-deploy` during a system
+update whenever the newest one on offer is not from the feed, but that only
+stops the damage; publishing the rebased package is the fix.
 
 ## Applying them
 

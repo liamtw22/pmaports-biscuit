@@ -600,10 +600,45 @@ pin_python() {
 	log "holding python3 at $_mm"
 }
 
+# Keep the boot-deploy that can build this Echo's boot image.
+#
+# Upstream boot-deploy wraps the bare kernel in the MediaTek header while the
+# boot image takes the dtb-appended one, so with deviceinfo_append_dtb=true it
+# ships a kernel with no header, and LK bootloops on it. This port carries the
+# fix (base-pmaports/0002, published on its own feed at a pkgrel above
+# upstream's), but apk takes the highest version from any repository: when
+# upstream released 0.25.0-r0 it outranked the patched 0.24.0-r1, and a system
+# update swapped it in. Every boot image built after that is refused by
+# biscuit-boot-update, so no later kernel update could be installed (#1).
+#
+# So while the installed boot-deploy has the fix, and the newest one on offer
+# does not come from this Echo's feed, it is held at the installed version for
+# this update. Decided afresh on every run - the hold is removed first - so a
+# patched release on the feed is taken as soon as it appears.
+BOOT_DEPLOY_FUNCS=/usr/share/boot-deploy/boot-deploy-functions.sh
+hold_boot_deploy() {
+	sed -i '/^boot-deploy[~=<>]/d' "$WORLD"
+	grep -qF '_kernel="${_kernel}-dtb"' "$BOOT_DEPLOY_FUNCS" 2>/dev/null || return 0
+	_have=$(apk info -e -v boot-deploy 2>/dev/null | sed 's/^boot-deploy-//')
+	[ -n "$_have" ] || return 0
+	# apk policy lists versions lowest first, each followed by the
+	# repositories that carry it; the last block is what an upgrade takes.
+	_best_from=$(apk policy boot-deploy 2>/dev/null | awk '
+		/^  [^ ].*:$/ { repos = ""; next }
+		/^    / { repos = repos " " $1 }
+		END { print repos }')
+	case "$_best_from" in
+	*"$FEED_MATCH"*|*lib/apk/db/installed*) return 0 ;;
+	esac
+	echo "boot-deploy=$_have" >> "$WORLD"
+	log "holding boot-deploy at $_have: the newest on offer lacks the MediaTek header fix"
+}
+
 # Update postmarketOS's own packages: those named, or all of them. The kernel
 # is not on any feed, so it stays as installed; so does anything pinned.
 update_system() {
 	pin_python
+	hold_boot_deploy
 	if [ -n "$PACKAGES" ]; then
 		# shellcheck disable=SC2086
 		apk --wait "$APK_WAIT" add --no-progress -u $PACKAGES > "$RUNDIR/sysupdate.out" 2>&1
