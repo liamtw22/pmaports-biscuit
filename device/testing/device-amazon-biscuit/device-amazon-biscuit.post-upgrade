@@ -161,4 +161,21 @@ if [ -e /run/openrc/softlevel ]; then
 	rc-service --ifstarted sshd reload >/dev/null 2>&1 || true
 fi
 
+# Drop an ALSA override left by a hand-built bluez-alsa 5.0 in /usr/local.
+#
+# Before bluez-alsa 5.0.0 was packaged, running 5.0 meant building it into
+# /usr/local and pointing the "bluealsa:" ALSA plugin types there with a
+# file in /etc/alsa/conf.d, which no package owns. The packaged 5.0.0 installs
+# its plugins in /usr/lib, and once the /usr/local copy is removed that file
+# points at libraries that no longer exist: every "bluealsa:" open fails, and
+# biscuit-btcast logs "bridge did not start" for every cast, with nothing to
+# say why. Found on a real device. Only removed while the library it names
+# is missing, so a /usr/local build still in use is left alone.
+for _conf in /etc/alsa/conf.d/*bluealsa*.conf; do
+	[ -f "$_conf" ] && [ ! -L "$_conf" ] || continue
+	_lib=$(sed -n 's|^[[:space:]]*lib[[:space:]]*"\(/usr/local/[^"]*\)".*|\1|p' "$_conf" | head -n 1)
+	[ -n "$_lib" ] && [ ! -e "$_lib" ] || continue
+	rm -f "$_conf"
+done
+
 exit 0

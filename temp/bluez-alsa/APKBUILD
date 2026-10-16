@@ -1,0 +1,120 @@
+# Forked from Alpine to update to 5.0.0, which reports the A2DP delay to the
+# source (BlueZ MediaTransport1.Delay). 4.3.1 never does, so a phone playing
+# video to the Echo cannot hold the picture back and the sound lags it.
+# Drop this fork once Alpine packages 5.0.
+#
+# 5.0 renames bluealsa -> bluealsad and bluealsa-cli -> bluealsactl, with no
+# compatibility names. The OpenRC service stays "bluealsa" (see the initd).
+#
+# Contributor: Liam Hurwitz <lgh@e.email>
+# Maintainer: Bradley Saulteaux <-@bradso.to>
+pkgname=bluez-alsa
+pkgver=5.0.0
+pkgrel=0
+pkgdesc="Bluetooth Audio ALSA Backend"
+url="https://github.com/Arkq/bluez-alsa"
+arch="all"
+license="MIT"
+depends="bluez"
+subpackages="$pkgname-doc $pkgname-openrc $pkgname-utils"
+makedepends="
+	alsa-lib-dev
+	autoconf
+	automake
+	bluez-dev
+	dbus-dev
+	fdk-aac-dev
+	glib-dev
+	libbsd-dev
+	liblc3-dev
+	libfreeaptx-dev
+	libtool
+	ncurses-dev
+	readline-dev
+	sbc-dev
+	spandsp-dev
+	tiff-dev
+	py3-docutils
+	lame-libs
+	mpg123-dev
+	opus-dev
+	"
+case "$CARCH" in
+s390x)
+	# libldac broken on s390x
+	;;
+*)
+	makedepends="$makedepends libldac-dev"
+	;;
+esac
+source="$pkgname-$pkgver.tar.gz::https://github.com/Arkq/bluez-alsa/archive/v$pkgver.tar.gz
+	bluealsa.initd
+	bluealsa.confd
+	"
+
+prepare() {
+	default_prepare
+	autoreconf -fvi
+}
+
+build() {
+	local _enable_ldac
+	case "$CARCH" in
+	s390x) _enable_ldac="" ;;
+	*) _enable_ldac="--enable-ldac" ;;
+	esac
+
+	# 5.0: --enable-cli is now --enable-ctl, and bluealsa-aplay is no longer
+	# built unless asked for.
+	CFLAGS="$CFLAGS -flto=auto" \
+		./configure \
+		--host=$CHOST \
+		--build=$CBUILD \
+		--prefix=/usr \
+		--sysconfdir=/etc \
+		--enable-a2dpconf \
+		--enable-aac \
+		--enable-aplay \
+		--enable-aptx \
+		--enable-aptx-hd \
+		--enable-ctl \
+		--enable-hcitop \
+		--enable-lc3-swb \
+		$_enable_ldac \
+		--enable-manpages \
+		--enable-mpg123 \
+		--enable-msbc \
+		--enable-ofono \
+		--enable-opus \
+		--enable-rfcomm \
+		--enable-upower \
+		--disable-static \
+		--with-dbusconfdir=/usr/share/dbus-1/system.d \
+		--with-libfreeaptx
+	make
+}
+
+check() {
+	make check
+}
+
+package() {
+	make DESTDIR="$pkgdir" install
+	install -Dm755 "$srcdir"/bluealsa.initd "$pkgdir"/etc/init.d/bluealsa
+	install -Dm644 "$srcdir"/bluealsa.confd "$pkgdir"/etc/conf.d/bluealsa
+}
+
+utils() {
+	pkgdesc="Bluetooth Audio ALSA Backend utils"
+	amove \
+		usr/bin/bluealsa-aplay \
+		usr/bin/bluealsactl \
+		usr/bin/bluealsa-rfcomm \
+		usr/bin/a2dpconf \
+		usr/bin/hcitop
+}
+sha512sums="
+045b6286535191df9a85c0a1a0b9f1d5e0d5e10c65ba8d10c75dff895eb902717a0a022b5479f23216b9c59f6b55f51ffc1a2d61ad9cfd74c730f3ab035434fc  bluez-alsa-5.0.0.tar.gz
+3173815246f7d46c3df700ee9eee7dd648f6b0d1bf5b5a100e7361a00e3c47ab1a03d1b29390db01fa4734926f35d3f10e1d54f1e02c7acf279e49f853e9003d  bluealsa.initd
+d9c063b86eac7ae2ee20208677ebfeaa2870110bb6ede8539446f2f0df2bdf7f04a4119f3c9a3f96636dfdcf4ec38693c2d53991396248da248498d663499566  bluealsa.confd
+"
