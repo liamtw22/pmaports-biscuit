@@ -272,6 +272,7 @@ source="
 	sendspin-visualizer-roles.diff
 	sendspin-media-commands.diff
 	sendspin-client-visualizer.diff
+	sendspin-starved-silence.diff
 	biscuit-sendspin-server.py
 	biscuit-lva-processed-mic-profile.patch.txt
 	biscuit-lva-wake-agc-direct-input.patch.txt
@@ -1203,9 +1204,14 @@ package() {
 	# a tree with both patches above applied, so it goes last.
 	( cd "$pkgdir"/usr/lib/sendspin/lib/python3.14/site-packages \
 		&& patch -p1 --fuzz=0 < "$srcdir"/sendspin-client-visualizer.diff )
+	# Silence, not clicks, when a stream stalls without ending - Spotify
+	# Connect through Music Assistant does on every pause: the drift
+	# correction wrote the last real sample into the padding.
+	( cd "$pkgdir"/usr/lib/sendspin/lib/python3.14/site-packages \
+		&& patch -p1 --fuzz=0 < "$srcdir"/sendspin-starved-silence.diff )
 	# Apache-2.0 4(b): a file we changed says so, at the top where it is seen.
 	for _f in aiosendspin/models/controller.py aiosendspin/models/types.py \
-			sendspin/daemon/daemon.py; do
+			sendspin/daemon/daemon.py sendspin/audio.py; do
 		sed -i "1i # Modified by liamtw22 and contributors for the Echo Dot 2 port (sendspin-*.diff in pmaports-biscuit)." \
 			"$pkgdir"/usr/lib/sendspin/lib/python3.14/site-packages/$_f
 	done
@@ -1502,6 +1508,7 @@ b1afde51f35eaa115fd8b0fcf38d633076eef4c36482c12316cdda154a8c25dd4142a851e87e8347
 b82e4b7f02db22c49aea53e886beda23c2ac0ac6bd031850b35fc232cbcef6aed1f5228052f1e22198cb6afc87f357a7e9bc619b253a010edd4234ecbee03ce8  sendspin-visualizer-roles.diff
 432e916ba9ffbd2c7ac0337f095791045e0e4f216db6927604b5826fa5eb15382e87738dfd545015759d1c04c56bd86c4ccfd9b47ec2760af1e201aeb581151a  sendspin-media-commands.diff
 fc7584549ebf438f8c0b49ac4a5bd64612e4b7b917edc01456ccca89a9927bd9e1a60156daad1e698aca0a90e31f60d20f8abc518d9e19040c71e515190ca07e  sendspin-client-visualizer.diff
+7e762d7b386eb4b2f91cb284cef89bce8ad46f64717cf7baef53e93673a60d07e3ee3624e90b3988cf6c29f90499df2d8c7e2c621ac3a8cddb82a7a270457049  sendspin-starved-silence.diff
 8e57e0a0bb909b6be7fdb2b121f8237d2f9d026c365d1c8930a3c86bdf1594a53ec88a8927dedd5db5260007c1a915a2a2ae068f7d5899fa9abbcb18b7bfcfef  biscuit-sendspin-server.py
 86a38319681429d0c69f62b04838814e7b625bf8e51862f96946dfb028b2fc947ab93bd567e455f5e50ee9df15914f803238ab2894890f6f4e4f73100dc902de  biscuit-lva-processed-mic-profile.patch.txt
 a856b17731c50bb3646c8a89e96f61301cf5a321dec669f9bf37c39cd9e30070e97ced8f45e87200489bb01c8809a9e2b9b7fa2ae8e2c30c0b18fd39c6eb2ca9  biscuit-lva-wake-agc-direct-input.patch.txt

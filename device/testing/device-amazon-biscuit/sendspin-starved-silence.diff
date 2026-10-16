@@ -1,0 +1,46 @@
+Keep a starved player silent while a sync correction is scheduled.
+
+When the stream stalls without ending - Spotify Connect through Music
+Assistant does this on every pause: the source stops writing PCM, and Music
+Assistant ends the stream only after its 'paused' event and half a second
+without audio - the queue runs dry and the callback pads with silence. But
+the drift correction keeps its schedule, and each insert or drop wrote
+_last_output_frame into that silence. That frame was the last REAL sample:
+_read_input_frames_bulk saved the last frame read, not the last frame
+output, and the drop path fell back to it when there was no next frame. At
+the maximum correction rate that is ~96 single-sample clicks a second, a
+stutter that lasts until the stream finally ends - for good, if the pause
+never reaches Music Assistant.
+
+Now the saved frame is the last one output, padding included, and a drop
+with nothing behind it outputs silence. With audio queued nothing changes:
+the padding is empty, so the last frame output is the last frame read.
+
+--- a/sendspin/audio.py
++++ b/sendspin/audio.py
+@@ -541,7 +541,9 @@
+                                 _ = self._read_one_input_frame()
+                                 replacement_frame = self._read_one_input_frame()
+                                 if replacement_frame is None:
+-                                    replacement_frame = self._last_output_frame
++                                    # Nothing left to play: silence, as the
++                                    # bulk read would have given.
++                                    replacement_frame = b"\x00" * frame_size
+                                 drop_counter = drop_every_n
+                                 self._frames_dropped_since_log += 1
+                                 output_buffer[bytes_written : bytes_written + frame_size] = (
+@@ -725,9 +727,11 @@
+             if self._current_chunk_offset >= len(chunk_data):
+                 self._advance_finished_chunk()
+ 
+-        # Save last frame for potential duplication
+-        if bytes_written >= frame_size:
+-            self._last_output_frame = bytes(result[bytes_written - frame_size : bytes_written])
++        # Save last frame for potential duplication. It is the last frame
++        # OUTPUT, padding included: once the queue runs dry an insert must
++        # repeat silence, not the last real sample, or every correction
++        # event writes that sample into the silence as a click.
++        self._last_output_frame = bytes(result[-frame_size:])
+ 
+         return bytes(result)
+ 
