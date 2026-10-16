@@ -117,6 +117,9 @@ static struct er_writer *render_reference;
  * - and those two are presses with no gap at all, which no silence detector can
  * separate. Going below 10 ms buys nothing. */
 #define DYN_RESET_SAMPLES 480      /* 10 ms */
+/* ...and the bands must also have died away below this (-100 dBFS) before
+ * the reset, see process(). */
+#define DYN_QUIET 1e-5f
 #define IDLE_PERIODS  1875
 /* How long a single "call on" holds the codec open without being refreshed.
  *
@@ -378,7 +381,7 @@ typedef struct {
 
 	int volume;
 	int silent_periods;
-	int zero_run, dyn_reset_done;
+	int zero_run, quiet_run, dyn_reset_done;
 	int wake_request;            /* open the codec before audio arrives */
 	int cast_mute;               /* audio is going to Bluetooth instead */
 	double call_until;           /* monotonic deadline: hold the codec open */
@@ -786,15 +789,14 @@ static void reset_state(engine *e)
 static void process(engine *e, float *buf, int frames)
 {
 	for (int n = 0; n < frames; n++) {
+		/* Only counted here; the reset itself waits for the chain to go
+		 * quiet too, inside the MBCL block below. */
 		if (buf[n] == 0.0f) {
 			if (e->zero_run < DYN_RESET_SAMPLES)
 				e->zero_run++;
-			if (e->zero_run >= DYN_RESET_SAMPLES && !e->dyn_reset_done) {
-				reset_dynamics(e);
-				e->dyn_reset_done = 1;
-			}
 		} else {
 			e->zero_run = 0;
+			e->quiet_run = 0;
 			e->dyn_reset_done = 0;
 		}
 		float x = buf[n] * e->in_gain;
@@ -846,6 +848,29 @@ static void process(engine *e, float *buf, int frames)
 					  bq_run(&e->align_b1_mid, lo1));
 			float b2 = bq_run(&e->align_b2_high, lo2);
 			float b3 = lo3;
+
+			/* Reset the dynamics once the input has been zero for
+			 * DYN_RESET_SAMPLES AND the bands have died away, for a
+			 * look-ahead's length so the delay lines hold nothing but
+			 * that quiet. Resetting on the input alone fired 10 ms
+			 * after any sound stopped, while the 1024-tap correction
+			 * and the 115 Hz crossover were still ringing: band 1's
+			 * gain, held far down by its 20:1 compressor, jumped back
+			 * to unity on that tail and the look-ahead lines were
+			 * zeroed mid-signal - a click at the end of every stream,
+			 * however cleanly the stream itself faded. Measured on the
+			 * band inputs, before any gain, so a reset can raise
+			 * nothing above DYN_QUIET. */
+			if (e->zero_run >= DYN_RESET_SAMPLES && !e->dyn_reset_done) {
+				float m = fmaxf(fmaxf(fabsf(b1), fabsf(b2)),
+						fmaxf(fabsf(b3), fabsf(b4)));
+				if (m >= DYN_QUIET)
+					e->quiet_run = 0;
+				else if (++e->quiet_run >= LOOKAHEAD) {
+					reset_dynamics(e);
+					e->dyn_reset_done = 1;
+				}
+			}
 
 			y = mbl_run(&e->band[0], comp_run(&e->band[0], b1))
 			  + mbl_run(&e->band[1], comp_run(&e->band[1], b2))
