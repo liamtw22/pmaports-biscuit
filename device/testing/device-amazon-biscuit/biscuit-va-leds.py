@@ -66,6 +66,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import biscuit_services as services
 import sys
@@ -2232,9 +2233,13 @@ class Ducker:
 
     def __init__(self):
         self.saved = {}          # sink-input id -> volume percent to restore
+        self.ducked = {}         # sink-input id -> volume percent it was ducked to
         self.cfg = load_duck()
         self._mtime = duck_mtime()
         self._ducked_at = 0.0
+        # Set from the event loop by a wake word, read by a fade in its worker
+        # thread: stop raising the music, the user is talking again.
+        self.abort_fade = threading.Event()
         self._recover()
 
     def expired(self, now=None):
@@ -2264,7 +2269,7 @@ class Ducker:
         if self.saved:
             _LOGGER.warning("found %d stream(s) left ducked by a previous run; "
                             "restoring", len(self.saved))
-            self.restore()
+            self.restore(fade=False)
 
     def refresh(self):
         mt = duck_mtime()
@@ -2360,8 +2365,19 @@ class Ducker:
 
     def duck(self):
         self.refresh()
-        if not self.cfg["enabled"] or self.saved:
-            return                      # disabled, or already ducked
+        # Cleared here, not when a fade starts: a wake word that lands just
+        # before its restore begins must still stop that restore.
+        self.abort_fade.clear()
+        if self.saved:
+            # Still holding: either the duck was never lifted, or a fade back up
+            # was cut short by this wake word. Put the music back down to where
+            # it was ducked to rather than leave it wherever the fade stopped.
+            for sid, target in self.ducked.items():
+                pactl("set-sink-input-volume", sid, "%d%%" % target)
+            self._ducked_at = time.monotonic()
+            return
+        if not self.cfg["enabled"]:
+            return
         skip = self.assistant_pids()
         level = self.cfg["level"]
         for sid, vol, pid, app in self.streams():
@@ -2369,6 +2385,16 @@ class Ducker:
                 continue
             if any(name in app for name in self.FEEDBACK_PLAYERS):
                 continue
+            if vol == 0:
+                # 0% here means "never set", not silent. With stream restore off
+                # (52-biscuit-no-stream-restore.conf) nothing gives a stream
+                # opened through the PipeWire ALSA plugin - sendspin, aplay - any
+                # channel volumes, it plays at unity, and pactl reports the empty
+                # list as 0%. Taken at face value the check below skipped it as
+                # already ducked, so music was never turned down at all. A stream
+                # is only ever deliberately quiet on this device while we hold
+                # it ducked, so unity is the right thing to save and restore.
+                vol = 100
             if vol <= level:
                 # Already at or below the ducked level. Either this is a duck of
                 # ours that was never lifted, or the stream is deliberately
@@ -2384,22 +2410,61 @@ class Ducker:
                 continue                # nothing to gain
             if pactl("set-sink-input-volume", sid, "%d%%" % target).returncode == 0:
                 self.saved[sid] = vol
+                self.ducked[sid] = target
         if self.saved:
             self._ducked_at = time.monotonic()
             self._persist()
             _LOGGER.info("ducked %d stream(s) to %d%% of their volume",
                          len(self.saved), level)
 
-    def restore(self):
+    # The music fades back up rather than jumping: from 40% to 100% in one
+    # step is a 24 dB jump, heard as the music slamming back in. Each step is
+    # one pactl per stream, run side by side; a pactl costs ~50 ms here, so
+    # 1.5 s gives some 25-30 steps of under 1 dB each.
+    FADE_S = 1.5
+
+    @staticmethod
+    def _set_all(volumes):
+        procs = []
+        env = dict(os.environ, XDG_RUNTIME_DIR="/run/pipewire")
+        for sid, vol in volumes.items():
+            try:
+                procs.append(subprocess.Popen(
+                    ("pactl", "set-sink-input-volume", sid, "%d%%" % vol),
+                    env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
+            except OSError:
+                pass
+        for p in procs:
+            try:
+                p.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                p.kill()
+
+    def restore(self, fade=True):
         if not self.saved:
             return
         # No liveness check: setting the volume of a stream that has already
         # gone just fails harmlessly, and enumerating to find out cost more than
         # the failed calls do.
-        for sid, vol in self.saved.items():
-            pactl("set-sink-input-volume", sid, "%d%%" % vol)
+        if fade:
+            start = time.monotonic()
+            while True:
+                t = (time.monotonic() - start) / self.FADE_S
+                if t >= 1.0:
+                    break
+                if self.abort_fade.is_set():
+                    # A wake word mid-fade. Keep holding; the duck() queued
+                    # behind this puts the music back down.
+                    _LOGGER.info("fade back up interrupted by a wake word")
+                    return
+                self._set_all({
+                    sid: round(self.ducked.get(sid, vol)
+                               + (vol - self.ducked.get(sid, vol)) * t)
+                    for sid, vol in self.saved.items()})
+        self._set_all(self.saved)
         _LOGGER.info("restored %d stream(s)", len(self.saved))
         self.saved.clear()
+        self.ducked.clear()
         self._ducked_at = 0.0
         self._persist()
 
@@ -2948,6 +3013,7 @@ class Ring:
         self.ducker = Ducker()
         self._duck_lock = asyncio.Lock()
         self._duck_queued = False
+        self._restore_handle = None
         self.volume = VolumeReconciler()
         # The HA commands that start or stop a service, in order.
         self.jobs = SerialJobs()
@@ -3349,7 +3415,10 @@ class Ring:
             return
         if name in IDLE_EVENTS:
             self.activity = None
-            self._duck_async(self.ducker.restore)
+            if name == "disconnected":
+                self._duck_async(self.ducker.restore)
+            else:
+                self._restore_later()
             if self.muted:
                 self._play(self.mute_animation())
             else:
@@ -3384,9 +3453,47 @@ class Ring:
         # interaction, and raising the music underneath it would talk over the
         # answer the user just asked for.
         if name == "wake_word_detected":
+            self._cancel_restore()
+            self.ducker.abort_fade.set()
             self._duck_async(self.ducker.duck)
         elif name in ("tts_finished", "pipeline_error"):
+            self._restore_later()
+
+    # How long the music stays down after the assistant says it has finished.
+    #
+    # tts_finished is mpv's end-of-file, and mpv reaches end-of-file as soon as
+    # the last of the reply is in its 0.8 s audio buffer (libmpv.py), not when
+    # it has been heard - and the PipeWire, loopback and DSP stages add their
+    # own latency after that. Measured on a 2.1 s reply: the music came back
+    # 1.3 s in, 0.8 s before the reply's stream closed, talking over the end of
+    # the answer. The assistant's buffer is upstream's choice and keeps its
+    # earcons gapless, so the wait is here instead.
+    RESTORE_DELAY_S = 1.2
+
+    def _cancel_restore(self):
+        handle, self._restore_handle = self._restore_handle, None
+        if handle is not None:
+            handle.cancel()
+
+    def _restore_later(self):
+        """Lift the duck once the reply has actually been heard.
+
+        A wake word inside the delay cancels it, so a follow-up question keeps
+        the music down instead of having it lifted under the new duck - which
+        would otherwise be a no-op, since the ducker is still holding.
+        """
+        self._cancel_restore()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
             self._duck_async(self.ducker.restore)
+            return
+
+        def _fire():
+            self._restore_handle = None
+            self._duck_async(self.ducker.restore)
+
+        self._restore_handle = loop.call_later(self.RESTORE_DELAY_S, _fire)
 
     def _duck_async(self, action):
         """Run a duck/restore in a worker thread, preserving their order.
