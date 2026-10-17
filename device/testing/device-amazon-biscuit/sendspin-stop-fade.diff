@@ -1,0 +1,216 @@
+Fade the output in and out at the edges of a stream, and let a stop play out.
+
+Stopping Spotify Connect through Music Assistant clicked: recorded at the
+PipeWire sink, the music went from full level to exact zero in one sample.
+Two things caused it. The queue running dry padded with zeros straight away,
+a step from the last sample to 0; and clear() stopped the stream at once,
+which discards whatever is still buffered between here and PipeWire, so even
+a fade written into the padding was never heard.
+
+Now padding continues from the last frame output and decays to silence
+(-60 dB in 5 ms), the drop path takes the next step of that decay instead of
+a zero, and clear() mid-music waits for the callback to write the fade and
+for the output latency to play it before stopping (at most ~0.8 s). The
+other way round, output going from silence to sound - a track start, a
+resume - is ramped up over 10 ms. Silence for that purpose is 32 zero
+frames, so music crossing zero on both channels does not dip.
+
+The last frame survives clear() for that fade, so a format change drops
+it when its size no longer fits: a sync insert would otherwise write an
+old-size frame into the new stream's buffer.
+
+--- a/sendspin/audio.py
++++ b/sendspin/audio.py
+@@ -11,6 +11,7 @@
+ import concurrent.futures
+ import logging
+ import queue
++import threading
+ import time
+ from collections.abc import Callable
+ from dataclasses import dataclass
+@@ -175,6 +176,13 @@
+         self._stream_executor = concurrent.futures.ThreadPoolExecutor(
+             max_workers=1, thread_name_prefix="sendspin-audio"
+         )
++        # Set by the callback once the output has faded to silence; a stop
++        # waits on it so the fade is heard instead of cut off.
++        self._tail_silent = threading.Event()
++        # Fade in state: whether the output last ended in silence, and how
++        # many frames of a fade in are still to go.
++        self._output_silent = True
++        self._fade_in_left = 0
+         self._first_real_chunk = True  # Flag to initialize timing from first chunk
+ 
+         self._volume: int = 100  # 0-100 range
+@@ -259,6 +267,11 @@
+         # Reset state on format change
+         self._stream_started = False
+         self._first_real_chunk = True
++        # clear() keeps the last frame for the fade out, but it is only
++        # meaningful at its own frame size: a sync insert would write an
++        # old-size frame into a buffer of the new one.
++        if len(self._last_output_frame) != pcm_format.frame_size:
++            self._last_output_frame = b""
+ 
+         # Low latency settings for accurate playback (chunks arrive 5+ seconds early)
+         self._stream = sounddevice.RawOutputStream(
+@@ -365,6 +378,12 @@
+         self._stream_started = False
+         stream = self._stream
+         if stream is not None:
++            if any(self._last_output_frame):
++                # Mid-music: stopping now ends the stream on whatever sample
++                # was last written, heard as a click. Let the callback write
++                # the fade to silence (_decay_frames) first, then stop.
++                self._tail_silent.clear()
++                self._stream_executor.submit(self._wait_for_tail, stream)
+             self._stream_executor.submit(self._call_stream, stream.stop)
+ 
+         # Drain all queued chunks
+@@ -398,7 +417,7 @@
+         self._drop_every_n_frames = 0
+         self._frames_until_next_insert = 0
+         self._frames_until_next_drop = 0
+-        self._last_output_frame = b""
++        # _last_output_frame is kept: it is where the fade out starts.
+         self._sync_error_filter.reset()
+         self._sync_error_filtered_us = 0.0
+         self._last_reanchor_loop_time_us = 0
+@@ -541,9 +560,11 @@
+                                 _ = self._read_one_input_frame()
+                                 replacement_frame = self._read_one_input_frame()
+                                 if replacement_frame is None:
+-                                    # Nothing left to play: silence, as the
+-                                    # bulk read would have given.
+-                                    replacement_frame = b"\x00" * frame_size
++                                    # Nothing left to play: the next step of
++                                    # the fade out, as the bulk read gives.
++                                    replacement_frame = self._decay_frames(
++                                        self._last_output_frame, 1
++                                    )
+                                 drop_counter = drop_every_n
+                                 self._frames_dropped_since_log += 1
+                                 output_buffer[bytes_written : bytes_written + frame_size] = (
+@@ -581,6 +602,8 @@
+             self._current_chunk = None
+             self._current_chunk_offset = 0
+ 
++        self._fade_in(output_buffer)
++
+         # Apply volume scaling to the output
+         self._apply_volume(output_buffer)
+ 
+@@ -701,9 +724,16 @@
+                 try:
+                     self._initialize_current_chunk()
+                 except queue.Empty:
+-                    # No more data - pad with silence
+-                    silence_bytes = total_bytes_needed - bytes_written
+-                    result[bytes_written:] = b"\x00" * silence_bytes
++                    # No more data - fade the last frame out, then silence.
++                    # Padding with zeros straight away put a step from the
++                    # last sample to 0 into the output: a click at every stop.
++                    if bytes_written >= frame_size:
++                        last = bytes(result[bytes_written - frame_size : bytes_written])
++                    else:
++                        last = self._last_output_frame
++                    result[bytes_written:] = self._decay_frames(
++                        last, (total_bytes_needed - bytes_written) // frame_size
++                    )
+                     break
+ 
+             # Calculate how much we can read from current chunk
+@@ -732,9 +762,92 @@
+         # repeat silence, not the last real sample, or every correction
+         # event writes that sample into the silence as a click.
+         self._last_output_frame = bytes(result[-frame_size:])
++        if not any(self._last_output_frame):
++            self._tail_silent.set()
+ 
+         return bytes(result)
+ 
++    # 10 ms at 48 kHz. Music starting mid-waveform out of silence - a track
++    # start, a resume - is the same step as stopping on one, the other way.
++    _FADE_IN_FRAMES: Final = 480
++
++    def _fade_in(self, output_buffer: memoryview) -> None:
++        """Ramp the output up where it goes from silence to sound."""
++        assert self._format is not None
++        frame_size = self._format.frame_size
++        width = self._format.bit_depth // 8
++        n_frames = len(output_buffer) // frame_size
++        if n_frames == 0:
++            return
++        start = 0
++        if self._fade_in_left == 0:
++            if self._output_silent:
++                data = bytes(output_buffer)
++                sound = data.lstrip(b"\x00")
++                if sound:
++                    start = (len(data) - len(sound)) // frame_size
++                    self._fade_in_left = self._FADE_IN_FRAMES
++        if self._fade_in_left > 0:
++            total = self._FADE_IN_FRAMES
++            count = min(self._fade_in_left, n_frames - start)
++            done = total - self._fade_in_left
++            for f in range(start, start + count):
++                gain = (done + f - start + 1) / total
++                for pos in range(f * frame_size, (f + 1) * frame_size, width):
++                    v = int.from_bytes(output_buffer[pos : pos + width], "little", signed=True)
++                    output_buffer[pos : pos + width] = int(v * gain).to_bytes(
++                        width, "little", signed=True
++                    )
++            self._fade_in_left -= count
++        # Silence means a run of zero frames, not one: music crosses zero on
++        # both channels at once now and then, and a fade in started there
++        # would dip the music.
++        self._output_silent = not any(output_buffer[-32 * frame_size :])
++
++    def _wait_for_tail(self, stream: sounddevice.RawOutputStream) -> None:
++        """Block (executor thread) until the fade out has been played.
++
++        Written is not enough: stopping the stream discards whatever is still
++        buffered between here and PipeWire - measured, the cut landed mid-music
++        with the fade never heard. So wait for the callback to write the fade,
++        then for the output latency to play it out.
++        """
++        self._tail_silent.wait(0.25)
++        try:
++            latency = float(stream.latency)
++        except Exception:  # noqa: BLE001 - a closed stream has none
++            latency = 0.0
++        time.sleep(min(max(latency, 0.0), 0.5) + 0.02)
++
++    # Per-frame gain of the fade out: -60 dB in 5 ms at 48 kHz. Truncating
++    # toward zero, rather than rounding, makes it reach exact silence.
++    _DECAY_PER_FRAME: Final = 10 ** (-3 / 240)
++
++    def _decay_frames(self, last_frame: bytes, n_frames: int) -> bytes:
++        """N frames continuing from last_frame, decaying to silence."""
++        assert self._format is not None
++        frame_size = self._format.frame_size
++        width = self._format.bit_depth // 8
++        if n_frames <= 0:
++            return b""
++        if len(last_frame) != frame_size or not any(last_frame):
++            return b"\x00" * (n_frames * frame_size)
++        values = [
++            int.from_bytes(last_frame[i : i + width], "little", signed=True)
++            for i in range(0, frame_size, width)
++        ]
++        out = bytearray(n_frames * frame_size)
++        k = self._DECAY_PER_FRAME
++        pos = 0
++        for _ in range(n_frames):
++            values = [int(v * k) for v in values]
++            if not any(values):
++                break  # the rest of out is already zero
++            for v in values:
++                out[pos : pos + width] = v.to_bytes(width, "little", signed=True)
++                pos += width
++        return bytes(out)
++
+     def _advance_finished_chunk(self) -> None:
+         """Update durations and state when current chunk is fully consumed."""
+         assert self._format is not None
