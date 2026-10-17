@@ -52,6 +52,13 @@ sequencing and the Bluetooth transport.
 - **Coexistence:** Wi-Fi and Bluetooth share one radio. Bluetooth audio (A2DP,
   and the eSCO link of a call) takes most of the 2.4 GHz airtime, so Wi-Fi on
   2.4 GHz slows to a trickle while it runs. 5 GHz Wi-Fi is unaffected.
+- **Speaker latency:** a phone playing to the Echo goes through bluealsad,
+  bluealsa-aplay, PipeWire, the loopback and biscuit-dsp. With
+  bluealsa-aplay's default buffers and the sink's old 8192-frame headroom that
+  was about 0.8 s; `biscuit-btaudio.sh` and `10-biscuit-sink.conf` now keep it
+  near 0.25 s. bluez-alsa 5.0 (`temp/bluez-alsa`) reports the delay to the
+  phone through BlueZ's `MediaTransport1.Delay`, so a phone that supports A2DP
+  delay reporting holds video back to match. 4.3.1 reported 0 ms.
 - **Bluetooth address:** read from the unit's identity block (IDME) and
   programmed into the controller at start-up (0097).
 - **Calls:** the controller does not send call audio over HCI. It leaves it in a

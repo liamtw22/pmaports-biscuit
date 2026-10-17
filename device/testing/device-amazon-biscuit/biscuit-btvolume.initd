@@ -1,0 +1,30 @@
+#!/sbin/openrc-run
+# One volume for a phone playing over Bluetooth: the phone's slider moves the
+# Echo's volume, and the Echo's buttons move the phone's slider. See
+# biscuit-btvolume.py.
+#
+# Separate from biscuit-audio for the same reason as biscuit-btring: it needs
+# bluealsa, and the buttons and the jack must keep working without it.
+
+name="biscuit-btvolume"
+description="Keep a Bluetooth phone's volume and the Echo's volume the same"
+
+command="/usr/bin/python3"
+command_args="/usr/bin/biscuit-btvolume.py"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/biscuit-btvolume.log"
+error_log="/var/log/biscuit-btvolume.log"
+
+depend() {
+	need localmount
+	after bluealsa biscuit-audio
+}
+
+start_pre() {
+	if [ ! -r /usr/bin/biscuit-btvolume.py ]; then
+		eerror "biscuit-btvolume.py is not installed"
+		return 1
+	fi
+	return 0
+}

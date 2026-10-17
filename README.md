@@ -132,6 +132,7 @@ the ambient ring effects. [PROVENANCE.md](PROVENANCE.md) lists them.
 |---|---|
 | `device/testing/device-amazon-biscuit/` | The device package: services, audio DSP, settings page, setup, and the optional apps as subpackages |
 | `device/testing/linux-amazon-biscuit/` | The kernel package: upstream source pin, 109 patches (the device tree is built by them), the MT6625L Wi-Fi driver, the kernel configuration |
+| `temp/bluez-alsa/` | Alpine's bluez-alsa updated to 5.0.0 for A2DP delay reporting, until Alpine packages it |
 | `base-pmaports/` | The three patches to upstream pmaports this port is built on |
 | `installer/` | The TWRP zips' source, their build script and tools, and the installation guide |
 | `tools/` | Developer tools; see [tools/README.md](tools/README.md) |

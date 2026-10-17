@@ -154,7 +154,7 @@ static int negotiated_codec(void)
 {
 	char paths[8][256], line[512];
 	int count = 0, selected = -1;
-	FILE *list = popen("timeout 1 bluealsa-cli list-pcms 2>/dev/null", "r");
+	FILE *list = popen("timeout 1 bluealsactl list-pcms 2>/dev/null", "r");
 	if (!list) return -1;
 	while (fgets(line, sizeof(line), list)) {
 		line[strcspn(line, "\r\n")] = 0;
@@ -170,7 +170,7 @@ static int negotiated_codec(void)
 	pclose(list);
 	for (int i = 0; i < count; i++) {
 		char command[384];
-		snprintf(command, sizeof(command), "timeout 1 bluealsa-cli codec %.255s 2>/dev/null", paths[i]);
+		snprintf(command, sizeof(command), "timeout 1 bluealsactl codec %.255s 2>/dev/null", paths[i]);
 		FILE *info = popen(command, "r");
 		if (!info) return -1;
 		int codec = -1;

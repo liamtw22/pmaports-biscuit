@@ -618,7 +618,7 @@ def bt_audio_transports():
     Returns {mac: set(of directions)} where a direction is "sink" (we play to
     it) or "source" (it plays to us).
     """
-    rc, out, _ = _run(["bluealsa-cli", "list-pcms"], timeout=8)
+    rc, out, _ = _run(["bluealsactl", "list-pcms"], timeout=8)
     if rc != 0:
         return {}
     found = {}
@@ -734,7 +734,7 @@ def bt_devices():
     """Paired peers, each with its role and connection state.
 
     bluealsa is asked ONCE and the answer passed down, rather than per device:
-    each `bluealsa-cli list-pcms` is a round trip, and this already pays for one
+    each `bluealsactl list-pcms` is a round trip, and this already pays for one
     `bluetoothctl info` per peer.
     """
     transports = bt_audio_transports()

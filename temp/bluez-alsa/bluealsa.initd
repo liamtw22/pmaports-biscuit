@@ -1,0 +1,10 @@
+#!/sbin/openrc-run
+# The service keeps its 4.x name, bluealsa, so runlevel links, other services'
+# dependencies and /etc/conf.d/bluealsa carry over; 5.0 renamed only the daemon.
+depend() {
+	need bluetooth
+}
+command="/usr/bin/bluealsad"
+command_args="${BLUEALSA_CONF}"
+command_background="yes"
+pidfile="/run/$RC_SVCNAME.pid"

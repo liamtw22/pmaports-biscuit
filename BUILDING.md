@@ -20,8 +20,8 @@ In the commands, `~/pmaports-biscuit` is a clone of this repository and
 ## 1. The pmaports tree
 
 **This repository is an overlay, not a buildable pmaports tree.** It contains
-only `device/testing/device-amazon-biscuit` and
-`device/testing/linux-amazon-biscuit`. A build needs upstream pmaports under it:
+only `device/testing/device-amazon-biscuit`,
+`device/testing/linux-amazon-biscuit` and `temp/bluez-alsa`. A build needs upstream pmaports under it:
 `pmaports.cfg`, `main/`, `cross/` and everything else. Pointing pmbootstrap at a
 clone of this repository alone fails at once with
 `ERROR: Invalid pmaports repository, could not find the config`.
@@ -39,10 +39,18 @@ git am ~/pmaports-biscuit/base-pmaports/*.patch
 # pmbootstrap reads channels.cfg from origin/main, not from the working tree.
 git fetch --depth 1 origin main
 
-# Overlay this repository's two packages.
+# Overlay this repository's three packages.
 cp -a ~/pmaports-biscuit/device/testing/device-amazon-biscuit ~/pmaports-build/device/testing/
 cp -a ~/pmaports-biscuit/device/testing/linux-amazon-biscuit  ~/pmaports-build/device/testing/
+mkdir -p ~/pmaports-build/temp
+cp -a ~/pmaports-biscuit/temp/bluez-alsa ~/pmaports-build/temp/
 ```
+
+`temp/bluez-alsa` is Alpine's bluez-alsa updated to 5.0.0, which reports the
+A2DP delay to the phone so video stays in sync; Alpine ships 4.3.1. The device
+package depends on `bluez-alsa>=5.0.0`, so build it before the device package:
+`pmbootstrap -p ~/pmaports-build build bluez-alsa --arch aarch64`. Drop the fork
+once Alpine has 5.0.
 
 `pmaports.cfg` at that base says `version=7`, `channel=edge`. The packages
 pmbootstrap installs from the binary repositories are current edge, whatever
