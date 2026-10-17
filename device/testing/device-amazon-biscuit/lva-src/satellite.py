@@ -422,6 +422,7 @@ class VoiceSatelliteProtocol(APIServer):
         # It cannot tell the difference, so it rings alongside the new loop.
         self._processing = False
         self._pipeline_active = False
+        self._run_watchdog: Optional[threading.Timer] = None
         self._external_wake_words: Dict[str, VoiceAssistantExternalWakeWord] = {}
         self._disconnect_event = asyncio.Event()
 
@@ -827,6 +828,83 @@ class VoiceSatelliteProtocol(APIServer):
         elif event_type == VoiceAssistantEventType.VOICE_ASSISTANT_ERROR:
             self._emit(LVAEvent.PIPELINE_ERROR)
 
+        if self._pipeline_active:
+            self._touch_run()
+        else:
+            self._end_run_watchdog()
+
+    # ------------------------------------------------------------------
+    # BISCUIT: a run that never ends must not deafen the satellite
+    # ------------------------------------------------------------------
+    #
+    # _pipeline_active is cleared only by RUN_END, the TTS done callback or a
+    # disconnect, and while it is set every wake word is ignored. A run whose
+    # server side never finishes therefore left the satellite deaf until the
+    # service restarted. Observed: an intent_script that waited on a Music
+    # Assistant search that never returned held the run in INTENT_START, Home
+    # Assistant showed the satellite "processing" indefinitely, and muting and
+    # unmuting cleared the ring but not the run.
+    #
+    # Each pipeline event, wake word and button press pushes a deadline out by
+    # RUN_STALL_S. Reaching it ends the run: Home Assistant is asked to stop
+    # it, the duck is lifted and the ring goes idle, so the next wake word
+    # works. A reply still playing is not a stall - TTS_END arrives before
+    # playback, and a long announcement has no events while it plays - so the
+    # deadline is simply pushed out again.
+    RUN_STALL_S = 45.0
+
+    def _touch_run(self) -> None:
+        timer = threading.Timer(self.RUN_STALL_S, lambda: self._on_run_watchdog(timer))
+        timer.daemon = True
+        old, self._run_watchdog = self._run_watchdog, timer
+        if old is not None:
+            old.cancel()
+        timer.start()
+
+    def _end_run_watchdog(self) -> None:
+        old, self._run_watchdog = self._run_watchdog, None
+        if old is not None:
+            old.cancel()
+
+    def _on_run_watchdog(self, timer: threading.Timer) -> None:
+        """Timer thread: hand the stall check to the event loop.
+
+        Every flag _run_stalled clears, and the duck and ring it drives, are
+        otherwise only touched on the loop; ending a run from the timer thread
+        raced a RUN_END or wake word arriving at the same moment. Without a
+        loop there is no connection, and the disconnect has ended the run.
+        """
+        loop = self._loop
+        if loop is not None:
+            loop.call_soon_threadsafe(self._run_stalled, timer)
+
+    def _run_stalled(self, timer: threading.Timer) -> None:
+        # A run touched or ended since this timer fired has moved on.
+        if timer is not self._run_watchdog:
+            return
+        if not self._pipeline_active or self._timer_finished:
+            return
+        if self.state.tts_player.is_playing:
+            self._touch_run()
+            return
+        _LOGGER.warning(
+            "Voice run stalled: no pipeline event for %.0f s; ending it",
+            self.RUN_STALL_S,
+        )
+        self._run_watchdog = None
+        self._is_streaming_audio = False
+        self._continue_conversation = False
+        self._tts_played = False
+        self._processing = False
+        try:
+            self.send_messages([VoiceAssistantRequest(start=False)])
+        except Exception:  # noqa: BLE001 - a dead connection is cleaned up elsewhere
+            _LOGGER.exception("Could not ask Home Assistant to stop the stalled run")
+        self.state.active_wake_words.discard(self.state.stop_word.id)
+        self._pipeline_active = False
+        self.unduck()
+        self._emit(LVAEvent.IDLE)
+
     # ------------------------------------------------------------------
     # Timer event handler
     # ------------------------------------------------------------------
@@ -1110,6 +1188,7 @@ class VoiceSatelliteProtocol(APIServer):
         self._end_timer_ring()
         _LOGGER.debug("Stopping timer finished sound")
         self._pipeline_active = True
+        self._touch_run()
         self._emit(LVAEvent.WAKE_WORD_DETECTED)
         self.duck()
         if self.state.listen_during_wake_sound:
@@ -1162,6 +1241,7 @@ class VoiceSatelliteProtocol(APIServer):
         self._end_timer_ring()
         _LOGGER.debug("Stopping timer finished sound")
         self._pipeline_active = True
+        self._touch_run()
         self.duck()
         self.state.tts_player.play(
             self.state.start_listening_sound,
@@ -1178,6 +1258,7 @@ class VoiceSatelliteProtocol(APIServer):
     def stop(self) -> None:
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self._pipeline_active = False
+        self._end_run_watchdog()
 
         if self._timer_finished:
             self._end_timer_ring()
@@ -1208,6 +1289,7 @@ class VoiceSatelliteProtocol(APIServer):
 
     def _tts_finished(self) -> None:
         self._pipeline_active = False
+        self._end_run_watchdog()
         self.state.active_wake_words.discard(self.state.stop_word.id)
         self.send_messages([VoiceAssistantAnnounceFinished()])
         self._emit(LVAEvent.TTS_FINISHED)
@@ -1217,6 +1299,7 @@ class VoiceSatelliteProtocol(APIServer):
             # Keep pipeline active during the settle delay so the mic stays closed
             # and does not capture the tail end of the TTS audio from the speaker.
             self._pipeline_active = True
+            self._touch_run()
             self._emit(LVAEvent.LISTENING)
             _LOGGER.debug("Continuing conversation after %.2fs settle delay", self.state.continue_conversation_delay)
 
@@ -1224,6 +1307,7 @@ class VoiceSatelliteProtocol(APIServer):
                 if self.state.muted:
                     _LOGGER.debug("Skipping continued conversation: muted")
                     self._pipeline_active = False
+                    self._end_run_watchdog()
                     self.unduck()
                     return
                 self.send_messages([VoiceAssistantRequest(start=True)])
@@ -1489,6 +1573,7 @@ class VoiceSatelliteProtocol(APIServer):
         # satellite, which is harmless: everything it touches - the state, the
         # player, the peripheral API - is shared and outlives the connection.
         self._pipeline_active = False
+        self._end_run_watchdog()
 
         # Deregister this connection.
         if self in self.state.connections:
