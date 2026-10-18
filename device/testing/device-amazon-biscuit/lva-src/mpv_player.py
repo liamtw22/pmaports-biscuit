@@ -7,14 +7,62 @@
 # licensed under the Apache License 2.0 (LICENSES/Apache-2.0.txt).
 # Changed by liamtw22 and contributors, 2026, for the Amazon Echo Dot
 # (2nd gen) postmarketOS port. The upstream copyright is unchanged.
-# Changes: qualification instrumentation hooks (read-only).
+# Changes: qualification instrumentation hooks (read-only); waits for the
+# speaker amplifier before a sound starts (_wait_for_amplifier), off the
+# caller's thread.
 # mpv_player.py
 from . import qualification_v1 as _qualification_v1
 import logging
+import os
+import threading
+import time
 from typing import Callable, List, Optional, Union
 
 from .player.libmpv import LibMpvPlayer
 from .player.state import PlayerState
+
+
+# biscuit-dsp's speaker amplifier state, and its control FIFO. See
+# biscuit-amp-wait: after ten seconds of silence the amplifier is off, and comes
+# back about 275 ms after the next sound starts, so the wake chime, the mute
+# sound and the start of every reply lost their beginning and were cut by the
+# click of the amplifier switching on.
+_AMP_STATE = "/run/biscuit-dsp/amp"
+_DSP_CONTROL = "/run/biscuit-dsp/control"
+_AMP_WAIT_S = 0.6
+
+
+def _read_amp_state() -> str:
+    try:
+        with open(_AMP_STATE) as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _wait_for_amplifier() -> None:
+    """Return once the amplifier can be heard; wake it if it is off.
+
+    At once when it is already up or biscuit-dsp is not running, and never
+    longer than _AMP_WAIT_S: a late sound is better than none.
+    """
+    state = _read_amp_state()
+    if state in ("", "ready"):
+        return
+    if state == "off":
+        try:
+            fd = os.open(_DSP_CONTROL, os.O_WRONLY | os.O_NONBLOCK)
+            try:
+                os.write(fd, b"wake\n")
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+    deadline = time.monotonic() + _AMP_WAIT_S
+    while time.monotonic() < deadline:
+        time.sleep(0.01)
+        if _read_amp_state() in ("", "ready"):
+            return
 
 
 class MpvMediaPlayer:
@@ -30,6 +78,13 @@ class MpvMediaPlayer:
         self._player = LibMpvPlayer(device=device)
         self._done_callback: Optional[Callable[[], None]] = None
         self._playlist: List[str] = []
+        # BISCUIT: a sound waiting for the amplifier. play() is called on the
+        # satellite's event loop, so the wait happens in a thread of its own;
+        # every play() and stop() bumps the generation, and a waiting start
+        # whose generation is no longer current is dropped.
+        self._start_lock = threading.Lock()
+        self._generation = 0
+        self._pending = False
 
         self._log.debug("MpvMediaPlayer initialized (device=%s)", device)
 
@@ -71,9 +126,30 @@ class MpvMediaPlayer:
         self._playlist = urls
         self._done_callback = done_callback
 
-        # Start playing first URL
-        next_url = self._playlist.pop(0)
-        self._player.play(next_url, done_callback=self._on_track_finished, stop_first=stop_first)
+        # Start playing first URL, once the speaker can be heard. Normally at
+        # once: the amplifier is held on unless mbcl.conf sets idle_release_s.
+        with self._start_lock:
+            self._generation += 1
+            generation = self._generation
+            self._pending = _read_amp_state() not in ("", "ready")
+        if not self._pending:
+            self._start(generation, stop_first)
+            return
+        threading.Thread(
+            target=self._start_when_audible, args=(generation, stop_first), daemon=True
+        ).start()
+
+    def _start_when_audible(self, generation: int, stop_first: bool) -> None:
+        _wait_for_amplifier()
+        self._start(generation, stop_first)
+
+    def _start(self, generation: int, stop_first: bool) -> None:
+        with self._start_lock:
+            if generation != self._generation or not self._playlist:
+                return  # stopped, or replaced by a newer play(), while waiting
+            self._pending = False
+            next_url = self._playlist.pop(0)
+            self._player.play(next_url, done_callback=self._on_track_finished, stop_first=stop_first)
 
     @_qualification_v1.activity
     def _on_track_finished(self) -> None:
@@ -110,6 +186,9 @@ class MpvMediaPlayer:
         """Stop playback and invoke the done callback if present."""
         self._log.debug("stop() called")
 
+        with self._start_lock:
+            self._generation += 1
+            self._pending = False
         self._player.stop()
 
         if self._done_callback:
@@ -123,7 +202,9 @@ class MpvMediaPlayer:
     def is_playing(self) -> bool:
         """Check if the player is currently playing or paused."""
         state = self._player.state()
-        return state in (PlayerState.PLAYING, PlayerState.PAUSED, PlayerState.LOADING)
+        return self._pending or state in (
+            PlayerState.PLAYING, PlayerState.PAUSED, PlayerState.LOADING
+        )
 
     def set_volume(self, volume: float) -> None:
         """

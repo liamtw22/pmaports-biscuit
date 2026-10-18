@@ -7,7 +7,8 @@
 # licensed under the Apache License 2.0 (LICENSES/Apache-2.0.txt).
 # Changed by liamtw22 and contributors, 2026, for the Amazon Echo Dot
 # (2nd gen) postmarketOS port. The upstream copyright is unchanged.
-# Changes: qualification instrumentation hooks (read-only).
+# Changes: qualification instrumentation hooks (read-only); audio-stream-silence
+# off, so a sound's last ~60 ms is no longer dropped.
 from linux_voice_assistant import qualification_v1 as _qualification_v1
 import logging
 import threading
@@ -60,11 +61,19 @@ class LibMpvPlayer(AudioPlayer):
         # noticeable latency for a user-facing notification sound.
         self._mpv["audio-buffer"] = 0.8
 
-        # Keep the PulseAudio/PipeWire stream open between files by outputting
-        # silence when idle.  This eliminates the per-play sink re-initialisation
-        # penalty entirely, so back-to-back short sounds (wakeup → TTS, mute →
-        # unmute) never lose their first samples regardless of system load.
-        self._mpv["audio-stream-silence"] = True
+        # BISCUIT: no audio-stream-silence. Upstream turns it on to keep the
+        # stream open between files, so a sound's first samples are not lost to
+        # the sink re-initialising. Here it cost the END instead: when a file
+        # finishes, mpv switches to its silence stream and drops what is still
+        # queued, so every sound lost its last ~60 ms and stopped mid-waveform,
+        # which is the click heard after the wake chime. Measured on the
+        # Echo's DSP output, wake chime (629 ms): with it, 569 ms and an 8 ms
+        # gap, at any audio-buffer and with gapless-audio; without it, 629 ms
+        # every time, five single plays and a back-to-back pair, start intact -
+        # the speaker sink never suspends on this device (biscuit-tick holds a
+        # stream on it and biscuit-dsp holds the codec), so there is no
+        # re-initialisation left to protect against.
+        self._mpv["audio-stream-silence"] = False
 
         # Callback Handling
         self._done_callback: Optional[Callable[[], None]] = None

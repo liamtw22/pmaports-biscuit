@@ -89,6 +89,12 @@ static struct er_writer *render_reference;
 #define NUM_BANDS     4
 #define MAX_USER_EQ   16
 #define GAIN_SLEW_MS  120.0f       /* volume-push ramp */
+/* The volume taper's ramp, separate from the push's. Sharing the push's
+ * 120 ms made every key press take about 0.35 s to be heard in full, so a
+ * quick run of presses always trailed the fingers. The taper moves about
+ * 2 dB per step, and a 20 ms ramp is still far too slow to click; the push
+ * keeps 120 ms because its top step is a 14.6 dB jump. */
+#define VOL_SLEW_MS   20.0f
 #define LOOKAHEAD     192          /* 4 ms: stock has a dedicated 48 kHz MBC buffer */
 /* Stock's libasp exposes LookAhead_ms and HoldTime_ms for MBLimiter but its
  * public MBCL.cfg exposes only threshold and release.  Sixteen milliseconds
@@ -118,6 +124,16 @@ static struct er_writer *render_reference;
  * separate. Going below 10 ms buys nothing. */
 #define DYN_RESET_SAMPLES 480      /* 10 ms */
 #define IDLE_PERIODS  1875
+/* The codec is NOT released when idle unless mbcl.conf sets
+ * idle_release_s: it is opened at start and held, so the amplifier is always
+ * on. Each amplifier transition is an audible pop - measured on pure digital
+ * silence, at both enable and disable - and releasing after ten seconds put
+ * one before the first sound of nearly every interaction, plus the 0.3 s the
+ * amplifier needs to come back. Stock does not cycle it per sound either.
+ * Measured cost of holding it: the SoC and CPU sensors read about 1.2 C
+ * warmer after nine minutes (the amplifier itself has no sensor).
+ * idle_release_s = 10 restores the old release, with IDLE_PERIODS's ten
+ * seconds. */
 /* How long a single "call on" holds the codec open without being refreshed.
  *
  * This is a WATCHDOG, not the call length. biscuit-btcall refreshes it every
@@ -129,6 +145,24 @@ static struct er_writer *render_reference;
 #define CALL_HOLD_S   20.0
 
 #define CTRL_FIFO     "/run/biscuit-dsp/control"
+/* Whether the speaker amplifier can be heard yet: "off", "warming" or "ready".
+ *
+ * Opening the codec does not make the speaker audible at once. The machine
+ * driver enables the amplifier 250 ms after the stream starts, so it is not
+ * live across the DAC's power-up transient, and the amplifier then takes 25 ms
+ * to warm up (MT8163_BISCUIT_AMP_ON_DELAY_MS and _WARMUP_MS in the kernel). A
+ * short sound played into that window loses its start, and the amplifier
+ * switching on part way through it is heard as a click. That was always true
+ * of the earcons, whose player took about 190 ms to start and so lost the rest;
+ * the volume tick, which reaches the codec in a few milliseconds, lost most of
+ * itself.
+ *
+ * Short sounds read this before they start: on "off" they ask for a wake and,
+ * like "warming", wait for "ready". Long ones - music, a call - do not need to,
+ * and nothing here delays them. Replaced atomically, so a reader never sees a
+ * partial word. */
+#define AMP_STATE     "/run/biscuit-dsp/amp"
+#define AMP_READY_S   0.30         /* 250 ms delay + 25 ms warm-up + margin */
 /* The speaker correction curve, in the order it is looked for:
  *
  *   EQ_OVERRIDE_FIR   a hand-placed curve, and the unity impulse biscuit_eq.py
@@ -352,6 +386,7 @@ typedef struct {
 	int   hpos;
 	float push, push_target;     /* linear gain, slewed */
 	float push_slew;
+	float vol_slew;                 /* the taper's, see VOL_SLEW_MS */
 
 	/* user EQ */
 	biquad user_eq[MAX_USER_EQ];
@@ -378,6 +413,7 @@ typedef struct {
 
 	int volume;
 	int silent_periods;
+	int idle_release_periods;     /* 0: never release the codec */
 	int zero_run, dyn_reset_done;
 	int wake_request;            /* open the codec before audio arrives */
 	int cast_mute;               /* audio is going to Bluetooth instead */
@@ -513,6 +549,7 @@ static void load_mbcl(engine *e)
 	float limrel[NUM_BANDS]   = { 200.0f,   1.0f,   1.0f,   1.0f };
 	float full_th = -0.1f, full_rel = 200.0f, in_gain = 0.0f;
 	int   vol_after_lim = 1;
+	float idle_release_s = 0.0f;  /* 0: hold the codec, amplifier always on */
 	/* Stock gain staging uses a neutral terminal trim.  Keep all available
 	 * headroom at the codec/amplifier instead of compensating with a post-MBCL
 	 * attenuation. */
@@ -536,6 +573,7 @@ static void load_mbcl(engine *e)
 			else if (!strcmp(k, "full_lim_thresh_db")) full_th = v;
 			else if (!strcmp(k, "full_lim_release_ms")) full_rel = v;
 			else if (!strcmp(k, "volume_after_limiter")) vol_after_lim = (int)v;
+			else if (!strcmp(k, "idle_release_s")) idle_release_s = v;
 			else if (!strcmp(k, "push_80_db"))   push_db[1] = v;
 			else if (!strcmp(k, "push_90_db"))   push_db[2] = v;
 			else if (!strcmp(k, "push_100_db"))  push_db[3] = v;
@@ -559,6 +597,8 @@ static void load_mbcl(engine *e)
 	e->in_gain = db_to_lin(in_gain);
 	e->post_gain = db_to_lin(output_trim_db);
 	e->vol_after_lim = vol_after_lim;
+	e->idle_release_periods = idle_release_s > 0.0f
+		? (int)(idle_release_s * RATE / PERIOD + 0.5f) : 0;
 	for (int i = 0; i < 3; i++)
 		split_init(e, i, fc[i]);
 	/* Band 1 must traverse the allpass of every crossover above it and
@@ -912,7 +952,7 @@ static void process(engine *e, float *buf, int frames)
 			 * volume - measured about 2 dB of crest factor on mid-level
 			 * content. Set volume_after_limiter = 0 to get the old
 			 * behaviour back. */
-			e->vol_post += (e->vol_post_target - e->vol_post) * e->push_slew;
+			e->vol_post += (e->vol_post_target - e->vol_post) * e->vol_slew;
 			y *= e->vol_post;
 		}
 
@@ -1023,6 +1063,26 @@ static double now_monotonic(void)
 	struct timespec t;
 	clock_gettime(CLOCK_MONOTONIC, &t);
 	return (double)t.tv_sec + (double)t.tv_nsec / 1e9;
+}
+
+static int amp_state = -1;         /* 0 off, 1 warming, 2 ready */
+static double amp_opened_at;
+static double hold_retry_at;     /* next attempt to hold the codec open */
+
+static void set_amp_state(int state)
+{
+	static const char *const names[] = { "off", "warming", "ready" };
+	if (state == amp_state)
+		return;
+	amp_state = state;
+	if (state == 1)
+		amp_opened_at = now_monotonic();
+	FILE *f = fopen(AMP_STATE ".tmp", "w");
+	if (!f)
+		return;
+	fprintf(f, "%s\n", names[state]);
+	if (fclose(f) == 0)
+		rename(AMP_STATE ".tmp", AMP_STATE);
 }
 
 static void drain_control(engine *e, int fd)
@@ -1151,6 +1211,7 @@ int main(int argc, char **argv)
 	e->push = e->push_target = 1.0f;
 	e->vol_post = e->vol_post_target = 1.0f;
 	e->push_slew = 1.0f - expf(-1.0f / (RATE * (GAIN_SLEW_MS / 1000.0f)));
+	e->vol_slew = 1.0f - expf(-1.0f / (RATE * (VOL_SLEW_MS / 1000.0f)));
 	load_curves(e);
 	load_user_eq(e);
 	load_mbcl(e);
@@ -1201,6 +1262,7 @@ int main(int argc, char **argv)
 	/* O_RDWR, not O_RDONLY: keeps a writer on the pipe so reads return 0
 	 * instead of EOF-spinning when no one has it open. */
 	int ctrl = open(CTRL_FIFO, O_RDWR | O_NONBLOCK);
+	set_amp_state(0);
 	if (ctrl < 0)
 		logmsg("control fifo unavailable: %s", strerror(errno));
 
@@ -1230,9 +1292,22 @@ int main(int argc, char **argv)
 		if (e->wake_request) {
 			e->wake_request = 0;
 			e->silent_periods = 0;
-			if (!out)
-				open_output(&out, out_dev, verbose);
+			if (!out && open_output(&out, out_dev, verbose) == 0)
+				set_amp_state(1);
 		}
+		/* Held open: open it now rather than at the first sound, so the
+		 * one pop of the amplifier coming up happens at start, not in
+		 * front of whatever plays first. Retried every two seconds while
+		 * something else (biscuit_direct) holds the card. */
+		if (!out && e->idle_release_periods == 0 &&
+		    now_monotonic() >= hold_retry_at) {
+			if (open_output(&out, out_dev, verbose) == 0)
+				set_amp_state(1);
+			else
+				hold_retry_at = now_monotonic() + 2.0;
+		}
+		if (amp_state == 1 && now_monotonic() - amp_opened_at >= AMP_READY_S)
+			set_amp_state(2);
 
 		snd_pcm_sframes_t got = snd_pcm_readi(in, ibuf, PERIOD);
 		if (got < 0) {
@@ -1286,7 +1361,7 @@ int main(int argc, char **argv)
 		}
 
 		if (silent) {
-			if (e->silent_periods < IDLE_PERIODS)
+			if (e->silent_periods < 1 << 30)
 				e->silent_periods++;
 
 			/* Never open the codec just to push silence into it.
@@ -1302,11 +1377,13 @@ int main(int argc, char **argv)
 			if (!out)
 				continue;
 
-			if (e->silent_periods >= IDLE_PERIODS &&
+			if (e->idle_release_periods > 0 &&
+			    e->silent_periods >= e->idle_release_periods &&
 			    e->call_until <= now_monotonic()) {
 				er_writer_reset(render_reference); snd_pcm_close(out);
 				out = NULL;
 				reset_state(e);
+				set_amp_state(0);
 				if (verbose)
 					logmsg("idle: codec released");
 				continue;
@@ -1335,7 +1412,8 @@ int main(int argc, char **argv)
 		}
 
 		if (!out) {
-			open_output(&out, out_dev, verbose);
+			if (open_output(&out, out_dev, verbose) == 0)
+				set_amp_state(1);
 			if (!out) {
 				/* Something else holds the codec - most likely a
 				 * deliberate biscuit_direct test. Drop this
@@ -1359,6 +1437,7 @@ int main(int argc, char **argv)
 			logmsg("write: %s", snd_strerror((int)put));
 			er_writer_reset(render_reference); snd_pcm_close(out);
 			out = NULL;
+			set_amp_state(0);
 		}
 	}
 
@@ -1367,6 +1446,7 @@ int main(int argc, char **argv)
 	if (out) { er_writer_reset(render_reference); snd_pcm_close(out); }
 	if (ctrl >= 0) close(ctrl);
 	unlink(CTRL_FIFO);
+	unlink(AMP_STATE);
 	er_writer_close(render_reference);
 	free(ibuf);
 	free(mono);

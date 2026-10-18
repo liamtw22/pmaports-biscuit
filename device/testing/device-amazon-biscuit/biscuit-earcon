@@ -40,6 +40,12 @@ for d in /usr/lib/linux-voice-assistant/lib/python3.*/site-packages/sounds; do
 	[ -d "$d" ] && EARCON_DIRS="$EARCON_DIRS $d"
 done
 
+# Each sound waits for the speaker amplifier first, inside the detached
+# process so no caller waits with it: after ten seconds of silence the
+# amplifier is off, and a sound started before it is back loses its beginning
+# and is cut by the click of it switching on. See biscuit-amp-wait.
+PLAY='/usr/bin/biscuit-amp-wait; exec sndfile-play "$1"'
+
 path_only=0
 if [ "$1" = "--path" ]; then
 	path_only=1
@@ -59,7 +65,7 @@ elif [ "$1" = "--file" ]; then
 	for d in $EARCON_DIRS; do
 		for ext in .flac .wav .ogg .mp3; do
 			if [ -f "$d/$1$ext" ]; then
-				setsid sndfile-play "$d/$1$ext" \
+				setsid sh -c "$PLAY" sh "$d/$1$ext" \
 					>/dev/null 2>"$CACHE_DIR/last-error" &
 				exit 0
 			fi
@@ -120,5 +126,5 @@ fi
 # paths do - does not cut the sound off partway through. stderr is kept, in one
 # fixed-size file on tmpfs, because sndfile-play reports "cannot open audio
 # device" and still exits 0: this failure mode was invisible for a long time.
-setsid sndfile-play "$path" >/dev/null 2>"$CACHE_DIR/last-error" &
+setsid sh -c "$PLAY" sh "$path" >/dev/null 2>"$CACHE_DIR/last-error" &
 exit 0

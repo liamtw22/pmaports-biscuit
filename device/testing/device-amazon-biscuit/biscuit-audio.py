@@ -388,6 +388,43 @@ def save_volume(level):
         log("cannot persist volume: %s" % err)
 
 
+# The save waits until the level has been still this long. Two fsyncs cost
+# about 13 ms on this eMMC, and a run of presses only needs the level it
+# settles on; losing the last second to a power cut costs one or two steps.
+VOLUME_SAVE_DELAY_S = 1.0
+_save_timer = None
+_save_lock = threading.Lock()
+_save_pending = None
+
+
+def _save_pending_volume():
+    global _save_pending
+    with _save_lock:
+        level, _save_pending = _save_pending, None
+    if level is not None:
+        save_volume(level)
+
+
+def save_volume_later(level):
+    """Persist `level` once the volume has stopped moving."""
+    global _save_timer, _save_pending
+    with _save_lock:
+        _save_pending = level
+        if _save_timer is not None:
+            _save_timer.cancel()
+        _save_timer = threading.Timer(VOLUME_SAVE_DELAY_S, _save_pending_volume)
+        _save_timer.daemon = True
+        _save_timer.start()
+
+
+def flush_volume():
+    """Write a save that is still waiting, on the way out."""
+    with _save_lock:
+        if _save_timer is not None:
+            _save_timer.cancel()
+    _save_pending_volume()
+
+
 def load_volume():
     """Persisted level, or None when there is nothing to restore."""
     try:
@@ -475,6 +512,9 @@ def mute_animation():
 # it goes out through the same chain as everything else, so it lands at the
 # level just set and you hear how loud that level actually is.
 #
+# This spacing is now only the fallback, for when the tick player below cannot
+# run; it restarts the tone on every press instead.
+#
 # It cannot simply be played once per step. The tone runs 0.384 s and a held
 # volume key repeats every 0.15 s, so one per step would stack three deep and
 # turn into noise. Instead: play immediately when the last tone is far enough
@@ -551,9 +591,134 @@ def _tone_play():
             errf.close()
 
 
+# ---------------------------------------------------------------------------
+# The tick player
+# ---------------------------------------------------------------------------
+#
+# Spawning a player per tone cost about 190 ms before the first sample reached
+# the speaker sink - connecting to PipeWire, the sink resuming from suspend,
+# and 45 ms of silence at the head of the stock tone - and the 0.45 s spacing
+# above came on top. A quick run of presses was heard well behind the fingers.
+#
+# biscuit-tick holds the decoded tone and a PipeWire stream open for as long as
+# this service runs, so a press is one line down a pipe and the tick reaches
+# the sink 6 to 10 ms later, the first press included. Started at service start
+# by warm(), and again whenever it exits - PipeWire may not be up yet at boot,
+# and a restart of PipeWire takes the stream with it.
+TICK_PLAYER = "/usr/bin/biscuit-tick"
+TICK_RETRY_S = 5.0
+# biscuit-tick exits with TICK_UNPLAYABLE when the file itself cannot be the
+# tick (unreadable, silent, or a format it refuses). It cannot say so before
+# play() has handed it the press, so the press after that, and every one for
+# TICK_FAILED_S, goes to the old player instead of to a process that will never
+# sound. Any other exit - PipeWire not up yet at boot, or restarted - is retried
+# after TICK_RETRY_S as before: judging by how soon it exited took a boot-time
+# "cannot connect" for a bad file and benched the tick for a minute.
+TICK_UNPLAYABLE = 3
+TICK_FAILED_S = 60.0
+
+
+class TickPlayer(object):
+    """biscuit-tick, kept running and told to play. See the note above."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._proc = None
+        self._path = None
+        self._failed = None      # (path, monotonic time) it was refused
+
+    def _ensure(self, path):
+        """Have a biscuit-tick running for `path`. Called with the lock held."""
+        if (self._proc is not None and self._proc.poll() is None
+                and self._path == path):
+            return
+        self._stop()
+        try:
+            os.makedirs(EARCON_RUN_DIR, exist_ok=True)
+            errf = open(os.path.join(EARCON_RUN_DIR, "tick-log"), "ab")
+        except OSError:
+            errf = None
+        try:
+            self._proc = subprocess.Popen(
+                [TICK_PLAYER, path], stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=errf if errf is not None else subprocess.DEVNULL,
+                env=dict(os.environ, XDG_RUNTIME_DIR="/run/pipewire"),
+                start_new_session=True)
+            self._path = path
+        finally:
+            if errf is not None:
+                errf.close()
+
+    def _stop(self):
+        if self._proc is not None:
+            try:
+                self._proc.stdin.close()
+            except OSError:
+                pass
+            self._proc = None
+
+    def _refused(self, path):
+        """Whether biscuit-tick recently could not play `path`. Lock held."""
+        return (self._failed is not None and self._failed[0] == path
+                and time.monotonic() - self._failed[1] < TICK_FAILED_S)
+
+    def warm(self):
+        """Keep biscuit-tick running from service start. Its own thread."""
+        while True:
+            path = tone_path()
+            proc = None
+            with self._lock:
+                if path and self._refused(path):
+                    path = None
+            if path:
+                with self._lock:
+                    try:
+                        self._ensure(path)
+                        proc = self._proc
+                    except OSError as err:
+                        log("volume tone: cannot start %s (%s)"
+                            % (TICK_PLAYER, err))
+            if proc is not None:
+                proc.wait()
+                with self._lock:
+                    current = self._proc is proc
+                    if current and proc.returncode == TICK_UNPLAYABLE:
+                        self._failed = (self._path, time.monotonic())
+                if current:
+                    log("volume tone: biscuit-tick exited (%s), see %s"
+                        % (proc.returncode,
+                           os.path.join(EARCON_RUN_DIR, "tick-log")))
+                else:
+                    continue   # replaced by a new tone, nothing went wrong
+            time.sleep(TICK_RETRY_S)
+
+    def play(self, path):
+        """Start the tone now. False means use the old player instead."""
+        with self._lock:
+            if self._refused(path):
+                return False
+            try:
+                self._ensure(path)
+                if self._proc.poll() is not None:
+                    return False
+                self._proc.stdin.write(b"play\n")
+                self._proc.stdin.flush()
+                return True
+            except (OSError, ValueError, AttributeError):
+                self._proc = None
+                return False
+
+
+_ticks = TickPlayer()
+
+
 def volume_tone():
-    """Play now, or schedule the trailing tone. See the note above."""
+    """Restart the tone now; the old spawn-and-space player is the fallback."""
     global _tone_timer
+    path = tone_path()
+    if path and _ticks.play(path):
+        return
     if _tone_timer is not None:
         _tone_timer.cancel()
         _tone_timer = None
@@ -578,14 +743,14 @@ def set_volume(level):
     # leaves its codec alone - its HP driver gain register reads 0x00 at every
     # volume. biscuit-dsp is the only writer of hw:0,0, so if it is not running
     # there is no playback at all; a unity codec cannot leak full-scale audio.
+    #
+    # main() pins the codec to unity at start and set_output() puts back what
+    # it found, so nothing here writes the mixer: amixer cost about 30 ms a
+    # step, and quick presses queued up behind it.
     reg = VOLUME_MAX_REG
-    # cset, not sset: sset cannot find these controls and fails silently.
-    subprocess.run(["amixer", "-c", CARD, "cset",
-                    "name=" + VOLUME_CONTROL, "%d,%d" % (reg, reg)],
-                   capture_output=True, check=False)
 
+    # The DSP first: it is what makes the change audible.
     dsp_volume(level)
-    save_volume(level)
     publish_volume(level)
 
     name = "volume-muted" if level <= 0 else "volume_step-%02d" % level
@@ -603,6 +768,7 @@ def set_volume(level):
 
     # After the level is applied, so the tone is heard at the new volume.
     volume_tone()
+    save_volume_later(level)
 
     log("volume level %d/%d (%s = %d)" % (level, VOLUME_STEPS,
                                           VOLUME_CONTROL, reg))
@@ -855,6 +1021,12 @@ def main():
     log("volume starts at level %d/%d (%s = %s)"
         % (level, VOLUME_STEPS, VOLUME_CONTROL, reg))
 
+    # Connect the volume tone's stream now, so the first press is as quick
+    # as the rest. See TickPlayer.
+    warm = threading.Thread(target=_ticks.warm)
+    warm.daemon = True
+    warm.start()
+
     watched = [fd]
     if jack_fd is not None:
         watched.append(jack_fd)
@@ -1025,4 +1197,5 @@ if __name__ == "__main__":
     finally:
         # SIGTERM arrives as SystemExit from the handler above, so this runs on
         # a clean stop as well as on any other way out.
+        flush_volume()
         unpublish_jack()

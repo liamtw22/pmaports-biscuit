@@ -1,0 +1,36 @@
+#!/bin/sh
+# Wait until the speaker amplifier can be heard, waking it if it is off.
+#
+#     biscuit-amp-wait && sndfile-play sound.wav
+#
+# biscuit-dsp releases the codec after ten seconds of silence, and the next
+# open brings the amplifier back only about 275 ms later (the machine driver
+# holds it off across the DAC's power-up transient). A short sound started
+# before that loses its beginning, and the amplifier switching on part way
+# through is heard as a click. biscuit-dsp publishes the state in
+# /run/biscuit-dsp/amp - off, warming or ready - and this waits for "ready".
+#
+# Returns at once when the amplifier is already up, or when biscuit-dsp is not
+# running (no state file), and gives up after 0.6 s: a sound played late or
+# clipped is still better than none. Always exits 0.
+
+STATE=/run/biscuit-dsp/amp
+CONTROL=/run/biscuit-dsp/control
+
+state=$(cat "$STATE" 2>/dev/null)
+case "$state" in
+	""|ready) exit 0 ;;
+	off)
+		# Non-blocking, bounded: with no reader a plain redirect would hang.
+		[ -p "$CONTROL" ] &&
+			timeout 1 sh -c "printf 'wake\n' > '$CONTROL'" 2>/dev/null
+		;;
+esac
+
+i=0
+while [ $i -lt 60 ]; do
+	sleep 0.01
+	[ "$(cat "$STATE" 2>/dev/null)" = ready ] && exit 0
+	i=$((i + 1))
+done
+exit 0
